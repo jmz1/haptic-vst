@@ -619,7 +619,7 @@ bincode = "1.3"
 ```toml
 # haptic-plugin/Cargo.toml
 [dependencies]
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["vst3"] }
+nih_plug = { git = "https://github.com/jmz1/nih-plug.git", features = ["vst3"] }
 ```
 
 ### 3. Build Commands
