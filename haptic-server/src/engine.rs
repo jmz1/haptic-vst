@@ -348,6 +348,7 @@ impl Stimulus for WaveStimulus {
         }
     }
     
+    // JMZTODO: explicit smoothing should be applied to server decoded MPE updates
     fn mpe_update(&mut self, mpe: MpeData) {
         self.mpe = mpe;
     }

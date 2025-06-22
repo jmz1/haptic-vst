@@ -28,6 +28,8 @@ impl Default for HapticPlugin {
     }
 }
 
+// TODO: wave speed should be calculated on the server from note velocity
+// TODO: the HapticParams structure can be kept for future use, even if empty/dummy
 impl Default for HapticParams {
     fn default() -> Self {
         Self {
