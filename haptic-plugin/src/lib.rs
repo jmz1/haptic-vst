@@ -170,18 +170,9 @@ impl Plugin for HapticPlugin {
     }
     
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        // Disable GUI on macOS standalone to avoid baseview crashes
-        #[cfg(all(target_os = "macos", feature = "standalone"))]
-        {
-            nih_log!("GUI disabled on macOS standalone due to baseview limitations");
-            None
-        }
-        #[cfg(not(all(target_os = "macos", feature = "standalone")))]
-        {
-            let params = self.params.clone();
-            let ipc_client = self.ipc_client.clone();
-            editor::create(params, ipc_client)
-        }
+        let params = self.params.clone();
+        let ipc_client = self.ipc_client.clone();
+        editor::create(params, ipc_client)
     }
 }
 

@@ -16,8 +16,8 @@ standalone = ["nih_plug/standalone"]
 
 
 [dependencies]
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["vst3", "standalone"] }
-nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug = { git = "https://github.com/jmz1/nih-plug.git", features = ["vst3", "standalone"] }
+nih_plug_egui = { git = "https://github.com/jmz1/nih-plug.git" }
 haptic-protocol = { path = "../haptic-protocol" }
 serde = { workspace = true }
 bincode = { workspace = true }
@@ -26,4 +26,4 @@ parking_lot = { workspace = true }
 ctor = "0.2"
 
 [build-dependencies]
-nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_xtask = { git = "https://github.com/jmz1/nih-plug.git" }
