@@ -82,7 +82,12 @@ cargo run --bin haptic-server
 - **MIDI/MPE Input**: Full support for expressive MIDI controllers
 - **Velocity-based Wave Speed**: Note velocity controls wave propagation (20-500 m/s)
 - **32-channel Output**: Direct control of haptic transducer arrays
+- **Enhanced Logging**: Comprehensive debug logging to `/tmp/haptic-vst.log`
 - **Cross-platform**: macOS and Linux support
+
+## Standalone Mode
+
+Note: Standalone mode is currently not supported. The plugin requires a DAW host to function.
 
 ## Supported DAWs
 
