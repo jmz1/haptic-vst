@@ -1,5 +1,6 @@
 use nih_plug_egui::{create_egui_editor, egui, EguiState};
 use nih_plug::prelude::*;
+use nih_plug::prelude::nih_log;
 use std::sync::Arc;
 use parking_lot::Mutex;
 use crate::{HapticParams, IpcClient};
@@ -8,13 +9,15 @@ pub fn create(
     params: Arc<HapticParams>,
     ipc_client: Arc<Mutex<Option<IpcClient>>>,
 ) -> Option<Box<dyn Editor>> {
+    nih_log!("Creating plugin editor UI");
     let editor_state = EguiState::from_size(800, 600);
+    nih_log!("Editor UI size: 800x600");
     
     create_egui_editor(
         editor_state,
         params.clone(),
         |_ctx, _setter| {
-            // Initialize if needed
+            nih_log!("Editor UI initialized");
         },
         move |egui_ctx, _setter, _state| {
             egui::CentralPanel::default().show(egui_ctx, |ui| {

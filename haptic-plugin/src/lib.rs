@@ -8,7 +8,7 @@ mod editor;
 
 use ipc_client::IpcClient;
 
-struct HapticPlugin {
+pub struct HapticPlugin {
     params: Arc<HapticParams>,
     ipc_client: Arc<Mutex<Option<IpcClient>>>,
 }
@@ -21,6 +21,7 @@ struct HapticParams {
 
 impl Default for HapticPlugin {
     fn default() -> Self {
+        nih_log!("Creating new HapticPlugin instance");
         Self {
             params: Arc::new(HapticParams::default()),
             ipc_client: Arc::new(Mutex::new(None)),
@@ -58,17 +59,25 @@ impl Plugin for HapticPlugin {
         self.params.clone()
     }
     
-    fn initialize(&mut self, _audio_io_layout: &AudioIOLayout, _buffer_config: &BufferConfig, _context: &mut impl InitContext<Self>) -> bool {
+    fn initialize(&mut self, audio_io_layout: &AudioIOLayout, buffer_config: &BufferConfig, _context: &mut impl InitContext<Self>) -> bool {
+        nih_log!("Initializing HapticPlugin");
+        nih_log!("Audio layout: main_output_channels={:?}", audio_io_layout.main_output_channels);
+        nih_log!("Buffer config: sample_rate={}, max_buffer_size={}", buffer_config.sample_rate, buffer_config.max_buffer_size);
+        
         // Try to connect to IPC server
+        nih_log!("Attempting to connect to haptic server");
         match IpcClient::connect() {
             Ok(client) => {
                 *self.ipc_client.lock() = Some(client);
-                nih_log!("Connected to haptic server");
+                nih_log!("Successfully connected to haptic server");
             }
             Err(e) => {
                 nih_log!("Failed to connect to haptic server: {}", e);
+                nih_log!("Plugin will continue without server connection");
             }
         }
+        
+        nih_log!("HapticPlugin initialization complete");
         true
     }
     
@@ -100,7 +109,9 @@ impl Plugin for HapticPlugin {
                                 timbre: 0.5 
                             },
                         };
-                        let _ = client.send_command(cmd);
+                        if let Err(e) = client.send_command(cmd) {
+                            nih_log!("Failed to send NoteOn command: {}", e);
+                        }
                     }
                     NoteEvent::NoteOff { note, channel, .. } => {
                         let cmd = HapticCommand::NoteOff {
@@ -108,7 +119,9 @@ impl Plugin for HapticPlugin {
                             note,
                             channel: channel as u8,
                         };
-                        let _ = client.send_command(cmd);
+                        if let Err(e) = client.send_command(cmd) {
+                            nih_log!("Failed to send NoteOff command: {}", e);
+                        }
                     }
                     NoteEvent::PolyPressure { pressure, channel, .. } => {
                         let cmd = HapticCommand::MpeUpdate {
@@ -120,7 +133,9 @@ impl Plugin for HapticPlugin {
                                 timbre: 0.5,     // TODO: Track timbre separately
                             },
                         };
-                        let _ = client.send_command(cmd);
+                        if let Err(e) = client.send_command(cmd) {
+                            nih_log!("Failed to send MpeUpdate (pressure) command: {}", e);
+                        }
                     }
                     NoteEvent::MidiPitchBend { channel, value, .. } => {
                         let cmd = HapticCommand::MpeUpdate {
@@ -132,7 +147,9 @@ impl Plugin for HapticPlugin {
                                 timbre: 0.5,     // TODO: Track timbre separately
                             },
                         };
-                        let _ = client.send_command(cmd);
+                        if let Err(e) = client.send_command(cmd) {
+                            nih_log!("Failed to send MpeUpdate (pitch bend) command: {}", e);
+                        }
                     }
                     _ => {}
                 }
@@ -172,5 +189,22 @@ impl Vst3Plugin for HapticPlugin {
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Instrument, Vst3SubCategory::Synth];
 }
 
+// Plugin exports with logging
 nih_export_clap!(HapticPlugin);
 nih_export_vst3!(HapticPlugin);
+// Note: Standalone export removed as it's not working as expected
+// nih_export_standalone!(HapticPlugin);
+
+// Initialize logging on library load
+#[ctor::ctor]
+fn init_logging() {
+    // Set default log location if NIH_LOG is not set
+    if std::env::var("NIH_LOG").is_err() {
+        std::env::set_var("NIH_LOG", "~/tmp/log/haptic-vst.log");
+    }
+    
+    nih_log!("Haptic VST plugin library loaded");
+    nih_log!("Plugin version: {}", HapticPlugin::VERSION);
+    nih_log!("Plugin vendor: {}", HapticPlugin::VENDOR);
+    nih_log!("Log output: {}", std::env::var("NIH_LOG").unwrap_or_else(|_| "STDERR".to_string()));
+}
