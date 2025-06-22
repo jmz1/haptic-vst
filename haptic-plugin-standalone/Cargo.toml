@@ -8,4 +8,4 @@ name = "haptic-plugin-standalone"
 
 [dependencies]
 haptic_plugin = { path = "../haptic-plugin", package = "haptic-plugin", features = ["standalone"] }
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["standalone"] }
+nih_plug = { git = "https://github.com/jmz1/nih-plug.git", features = ["standalone"] }
