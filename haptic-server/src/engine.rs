@@ -194,9 +194,9 @@ impl StimulusEngine {
 }
 
 // Delay line for wave propagation
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DelayLine {
-    buffer: [f32; MAX_DELAY_SAMPLES],
+    buffer: Box<[f32; MAX_DELAY_SAMPLES]>, // Move large buffer to heap
     write_pos: f32,
     size: usize,
 }
@@ -204,7 +204,7 @@ struct DelayLine {
 impl DelayLine {
     fn new() -> Self {
         Self {
-            buffer: [0.0; MAX_DELAY_SAMPLES],
+            buffer: Box::new([0.0; MAX_DELAY_SAMPLES]), // Allocate on heap
             write_pos: 0.0,
             size: MAX_DELAY_SAMPLES,
         }
@@ -237,7 +237,7 @@ impl DelayLine {
     }
     
     fn reset(&mut self) {
-        self.buffer.fill(0.0);
+        self.buffer.as_mut().fill(0.0);
         self.write_pos = 0.0;
     }
 }
