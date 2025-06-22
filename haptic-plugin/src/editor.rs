@@ -1,4 +1,4 @@
-use nih_plug_egui::{create_egui_editor, egui, EguiState, widgets::ParamSlider};
+use nih_plug_egui::{create_egui_editor, egui, EguiState};
 use nih_plug::prelude::*;
 use std::sync::Arc;
 use parking_lot::Mutex;
@@ -16,7 +16,7 @@ pub fn create(
         |_ctx, _setter| {
             // Initialize if needed
         },
-        move |egui_ctx, setter, _state| {
+        move |egui_ctx, _setter, _state| {
             egui::CentralPanel::default().show(egui_ctx, |ui| {
                 ui.heading("Haptic Controller");
                 
@@ -38,16 +38,12 @@ pub fn create(
                 
                 ui.separator();
                 
-                // Wave speed control
+                // Information display (no plugin parameters currently)
                 ui.group(|ui| {
                     ui.label("Wave Parameters");
-                    
-                    ui.horizontal(|ui| {
-                        ui.label("Wave Speed (m/s):");
-                        ui.add(
-                            ParamSlider::for_param(&params.wave_speed, setter).with_width(200.0)
-                        );
-                    });
+                    ui.label("Wave speed is automatically calculated on the server based on note velocity");
+                    ui.label("Low velocity notes: Slower wave propagation");
+                    ui.label("High velocity notes: Faster wave propagation");
                 });
                 
                 ui.separator();

@@ -15,8 +15,8 @@ struct HapticPlugin {
 
 #[derive(Params)]
 struct HapticParams {
-    #[id = "wave_speed"]
-    pub wave_speed: FloatParam,
+    // Placeholder for future plugin parameters
+    // Wave speed is now calculated on the server from note velocity
 }
 
 impl Default for HapticPlugin {
@@ -28,16 +28,10 @@ impl Default for HapticPlugin {
     }
 }
 
-// TODO: wave speed should be calculated on the server from note velocity
-// TODO: the HapticParams structure can be kept for future use, even if empty/dummy
 impl Default for HapticParams {
     fn default() -> Self {
         Self {
-            wave_speed: FloatParam::new(
-                "Wave Speed",
-                100.0,
-                FloatRange::Linear { min: 20.0, max: 500.0 }
-            ).with_smoother(SmoothingStyle::Linear(50.0)),
+            // No parameters currently - wave speed is calculated on server
         }
     }
 }
@@ -144,11 +138,8 @@ impl Plugin for HapticPlugin {
                 }
             }
             
-            // Check for parameter changes
-            if self.params.wave_speed.smoothed.is_smoothing() {
-                let cmd = HapticCommand::SetWaveSpeed(self.params.wave_speed.smoothed.next());
-                let _ = client.send_command(cmd);
-            }
+            // Note: Wave speed is now calculated on the server from note velocity
+            // No plugin parameters to process currently
         }
         
         // Clear audio output (we don't generate audio)
