@@ -97,24 +97,22 @@ target/release/haptic-plugin-standalone    # Release build
 ### Technical Details
 - **Export Function**: `nih_export_standalone::<HapticPlugin>()`
 - **Audio Backend**: Automatically detects system audio (CoreAudio on macOS, WASAPI on Windows, ALSA on Linux)
-- **GUI Behavior**: 
-  - **macOS**: Disabled (headless) to avoid baseview crashes
-  - **Other platforms**: Full GUI support
+- **GUI Support**: Full egui-based graphical interface with baseview fixes
 - **Independence**: Self-contained application, no DAW required
+- **Architecture**: Separate `haptic-plugin-standalone` package imports `haptic-plugin` as library
 
-### Platform-Specific Behavior
+### Package Structure
 ```rust
-#[cfg(all(target_os = "macos", feature = "standalone"))]
-{
-    // GUI disabled on macOS standalone
-    None
-}
-#[cfg(not(all(target_os = "macos", feature = "standalone")))]
-{
-    // Full GUI on other platforms
-    editor::create(params, ipc_client)
+// haptic-plugin-standalone/src/main.rs
+fn main() {
+    nih_export_standalone::<haptic_plugin::HapticPlugin>();
 }
 ```
+
+The standalone application uses:
+- **Dedicated Package**: `haptic-plugin-standalone` with its own `Cargo.toml`
+- **Library Import**: Imports `haptic-plugin` crate with `standalone` feature
+- **No Duplicate Targets**: Avoids filename collisions with clean separation
 
 ## 3. Server Application Target
 
@@ -283,7 +281,37 @@ cargo install cargo-watch
 - **CoreAudio**: Audio framework (system provided)
 - **Jack**: Optional audio server (`brew install jack`)
 
-## 10. Common Build Issues and Solutions
+## 10. Code Quality and Warnings
+
+### Suppressing Unused Code Warnings
+Some methods and fields are marked with `#[allow(dead_code)]` to suppress warnings:
+
+```rust
+// Example: IPC client connection status check
+#[allow(dead_code)]
+pub fn is_connected(&self) -> bool {
+    !self.command_tx.is_full()
+}
+```
+
+**Reasons for Suppression**:
+- Methods kept for future API expansion
+- Debug/diagnostic functions not used in release builds
+- Trait methods required by framework but not currently implemented
+- Enum fields used for protocol completeness but not all variants processed
+
+### Build Target Collision Prevention
+The project previously had duplicate binary targets causing warnings:
+```
+warning: output filename collision.
+The bin target `haptic-plugin-standalone` in package `haptic-plugin-standalone` 
+has the same output filename as the bin target `haptic-plugin-standalone` 
+in package `haptic-plugin`.
+```
+
+**Solution**: Removed duplicate binary target from `haptic-plugin` package, keeping only the dedicated `haptic-plugin-standalone` package.
+
+## 11. Common Build Issues and Solutions
 
 ### Issue: "Package does not contain feature"
 ```bash
@@ -296,8 +324,14 @@ cargo build --package haptic-plugin --features standalone
 
 ### Issue: Library import errors
 ```bash
-# Ensure rlib crate type is included
+# Ensure rlib crate type is included for standalone imports
 crate-type = ["cdylib", "rlib"]
+```
+
+### Issue: Duplicate build target warnings
+```bash
+# Wrong: Having binary targets with same name in multiple packages
+# Correct: Use dedicated packages for different binary targets
 ```
 
 ### Issue: macOS signing
@@ -315,7 +349,7 @@ brew install jack
 cargo run --bin haptic-server
 ```
 
-## 11. Understanding the Build Process
+## 12. Understanding the Build Process
 
 ### 1. Compilation Phases
 1. **Dependency Resolution**: Cargo downloads and compiles dependencies
@@ -335,7 +369,7 @@ haptic-server → haptic-protocol
 - **Incremental**: Only rebuilds changed code
 - **Clean**: `cargo clean` removes all build artifacts
 
-## 12. Production Deployment
+## 13. Production Deployment
 
 ### Plugin Distribution
 ```bash
@@ -355,7 +389,7 @@ cargo build --bin haptic-server --release
 target/release/haptic-server
 ```
 
-## 13. Debugging and Diagnostics
+## 14. Debugging and Diagnostics
 
 ### Build Diagnostics
 ```bash
