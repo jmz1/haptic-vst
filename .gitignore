@@ -28,5 +28,8 @@ Thumbs.db
 *.so
 *.dylib
 
+# Plugin bundles
+/target/bundled/
+
 # Logs
 *.log
