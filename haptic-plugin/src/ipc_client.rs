@@ -48,6 +48,7 @@ impl IpcClient {
         self.command_tx.try_send(cmd)
     }
     
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         !self.command_tx.is_full() // Simple heuristic
     }
