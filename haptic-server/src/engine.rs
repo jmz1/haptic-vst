@@ -12,7 +12,9 @@ pub trait Stimulus: Send + Sync {
     fn process(&mut self, context: &ProcessContext<'_>) -> [f32; TRANSDUCER_COUNT];
     fn is_active(&self) -> bool;
     fn note_on(&mut self, note: u8, velocity: u8, mpe: MpeData);
+    #[allow(dead_code)]
     fn note_off(&mut self);
+    #[allow(dead_code)]
     fn mpe_update(&mut self, mpe: MpeData);
     fn reset(&mut self);
     fn set_wave_speed(&mut self, _wave_speed: f32) {
@@ -85,9 +87,9 @@ pub struct ProcessContext<'a> {
 // Commands from IPC thread
 #[derive(Clone)]
 pub enum EngineCommand {
-    NoteOn { note: u8, velocity: u8, channel: u8, mpe: MpeData },
-    NoteOff { note: u8, channel: u8 },
-    MpeUpdate { channel: u8, mpe: MpeData },
+    NoteOn { note: u8, velocity: u8, #[allow(dead_code)] channel: u8, mpe: MpeData },
+    NoteOff { #[allow(dead_code)] note: u8, #[allow(dead_code)] channel: u8 },
+    MpeUpdate { #[allow(dead_code)] channel: u8, #[allow(dead_code)] mpe: MpeData },
     Panic,
 }
 
@@ -108,6 +110,7 @@ impl StimulusEngine {
         self.command_producer.clone()
     }
     
+    #[allow(dead_code)]
     pub fn handle_command(&self, cmd: HapticCommand) {
         let engine_cmd = match cmd {
             HapticCommand::NoteOn { note, velocity, channel, mpe, .. } => {
