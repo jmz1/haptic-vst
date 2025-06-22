@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use parking_lot::RwLock;
+// Removed unused imports: Arc and RwLock (wave speed now per-stimulus)
 use haptic_protocol::{HapticCommand, MpeData};
 
 // Constants from requirements
@@ -16,6 +15,9 @@ pub trait Stimulus: Send + Sync {
     fn note_off(&mut self);
     fn mpe_update(&mut self, mpe: MpeData);
     fn reset(&mut self);
+    fn set_wave_speed(&mut self, _wave_speed: f32) {
+        // Default implementation does nothing (for stimuli that don't use wave speed)
+    }
 }
 
 // Static allocation pool
@@ -68,8 +70,7 @@ pub struct StimulusEngine {
     command_queue: crossbeam_channel::Receiver<EngineCommand>,
     command_producer: crossbeam_channel::Sender<EngineCommand>,
     
-    // Shared parameters (atomics or RwLock for non-critical)
-    wave_speed: Arc<RwLock<f32>>,
+    // Note: Wave speed is now calculated per-stimulus from note velocity
     
     // Transducer configuration
     transducer_positions: [(f32, f32); TRANSDUCER_COUNT],
@@ -78,7 +79,6 @@ pub struct StimulusEngine {
 pub struct ProcessContext<'a> {
     pub sample_rate: f32,
     pub dt: f32,
-    pub wave_speed: f32,
     pub transducer_positions: &'a [(f32, f32); TRANSDUCER_COUNT],
 }
 
@@ -100,7 +100,6 @@ impl StimulusEngine {
             standing_pool: StimulusPool::new(),
             command_queue: receiver,
             command_producer: sender,
-            wave_speed: Arc::new(RwLock::new(100.0)), // m/s default
             transducer_positions: Self::default_grid_layout(),
         }
     }
@@ -120,8 +119,8 @@ impl StimulusEngine {
             HapticCommand::MpeUpdate { channel, mpe, .. } => {
                 EngineCommand::MpeUpdate { channel, mpe }
             }
-            HapticCommand::SetWaveSpeed(speed) => {
-                *self.wave_speed.write() = speed;
+            HapticCommand::SetWaveSpeed(_speed) => {
+                // Wave speed is now calculated per-stimulus from velocity
                 return;
             }
             HapticCommand::Panic => EngineCommand::Panic,
@@ -136,14 +135,19 @@ impl StimulusEngine {
         while let Ok(cmd) = self.command_queue.try_recv() {
             match cmd {
                 EngineCommand::NoteOn { note, velocity, channel: _, mpe } => {
-                    // Simple velocity-based routing
+                    // Calculate wave speed from velocity: 20-500 m/s based on velocity 0-127
+                    let wave_speed = 20.0 + (velocity as f32 / 127.0) * 480.0;
+                    
+                    // Route based on velocity: low velocity = wave stimuli, high velocity = standing wave
                     if velocity < 64 {
                         if let Some(stim) = self.wave_pool.allocate() {
                             stim.note_on(note, velocity, mpe);
+                            stim.set_wave_speed(wave_speed);
                         }
                     } else {
                         if let Some(stim) = self.standing_pool.allocate() {
                             stim.note_on(note, velocity, mpe);
+                            // Standing wave stimuli don't use propagation delay
                         }
                     }
                 }
@@ -166,7 +170,6 @@ impl StimulusEngine {
         let context = ProcessContext {
             sample_rate,
             dt: 1.0 / sample_rate,
-            wave_speed: *self.wave_speed.read(),
             transducer_positions: &self.transducer_positions,
         };
         
@@ -254,6 +257,7 @@ pub struct WaveStimulus {
     phase: f32,
     amplitude: f32,
     source_pos: (f32, f32),
+    wave_speed: f32, // Individual wave speed for this stimulus
     
     // Envelope
     env_state: EnvelopeState,
@@ -313,7 +317,7 @@ impl Stimulus for WaveStimulus {
             let dy = transducer_pos.1 - self.source_pos.1;
             let distance = (dx * dx + dy * dy).sqrt();
             
-            let delay_time = distance / ctx.wave_speed;
+            let delay_time = distance / self.wave_speed.max(1.0); // Use per-stimulus wave speed, min 1.0 to avoid div by zero
             let delay_samples = delay_time * ctx.sample_rate;
             
             let delayed = self.delay_lines[i].write_and_read(source, delay_samples);
@@ -339,6 +343,7 @@ impl Stimulus for WaveStimulus {
         self.mpe = mpe;
         self.env_state = EnvelopeState::Attack;
         self.env_time = 0.0;
+        self.wave_speed = 100.0; // Default wave speed, will be overridden by set_wave_speed
     }
     
     fn note_off(&mut self) {
@@ -361,6 +366,11 @@ impl Stimulus for WaveStimulus {
         self.env_state = EnvelopeState::Idle;
         self.env_level = 0.0;
         self.env_time = 0.0;
+        self.wave_speed = 100.0; // Reset to default wave speed
+    }
+    
+    fn set_wave_speed(&mut self, wave_speed: f32) {
+        self.wave_speed = wave_speed;
     }
 }
 
