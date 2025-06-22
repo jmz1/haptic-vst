@@ -1,5 +1,5 @@
 [workspace]
-members = ["haptic-protocol", "haptic-server", "haptic-plugin", "xtask"]
+members = ["haptic-protocol", "haptic-server", "haptic-plugin", "haptic-plugin-standalone", "xtask"]
 resolver = "2"
 
 [workspace.dependencies]
