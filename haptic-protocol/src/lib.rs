@@ -36,7 +36,6 @@ pub enum HapticCommand {
         channel: u8,
         mpe: MpeData,
     },
-    SetWaveSpeed(f32),  // m/s
     Panic,              // Stop all
 }
 

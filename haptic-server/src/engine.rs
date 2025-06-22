@@ -119,10 +119,6 @@ impl StimulusEngine {
             HapticCommand::MpeUpdate { channel, mpe, .. } => {
                 EngineCommand::MpeUpdate { channel, mpe }
             }
-            HapticCommand::SetWaveSpeed(_speed) => {
-                // Wave speed is now calculated per-stimulus from velocity
-                return;
-            }
             HapticCommand::Panic => EngineCommand::Panic,
         };
         

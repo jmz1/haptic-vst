@@ -90,7 +90,6 @@ pub enum HapticCommand {
         channel: u8,
         mpe: MpeData,
     },
-    SetWaveSpeed(f32),  // m/s
     Panic,              // Stop all
 }
 
@@ -665,10 +664,8 @@ impl Plugin for HapticPlugin {
                 }
             }
             
-            // Check for parameter changes
-            if self.params.wave_speed.smoothed.is_smoothing() {
-                client.send_command(HapticCommand::SetWaveSpeed(self.params.wave_speed.value()));
-            }
+            // Note: Wave speed is now calculated on server from note velocity
+            // No plugin parameters to process currently
         }
         
         // Clear audio output (we don't generate audio)

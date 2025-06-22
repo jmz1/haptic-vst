@@ -79,10 +79,6 @@ fn handle_client(stream: &mut UnixStream, command_producer: &crossbeam_channel::
                             crate::engine::EngineCommand::MpeUpdate { channel, mpe }
                         }
                         HapticCommand::Panic => crate::engine::EngineCommand::Panic,
-                        HapticCommand::SetWaveSpeed(_) => {
-                            // TODO: Handle wave speed updates
-                            return true;
-                        }
                     };
                     
                     let _ = command_producer.send(engine_cmd);
