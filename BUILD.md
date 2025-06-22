@@ -87,7 +87,17 @@ cargo run --bin haptic-server
 
 ## Standalone Mode
 
-Note: Standalone mode is currently not supported. The plugin requires a DAW host to function.
+### Build Standalone Binary
+```bash
+cargo build --package haptic-plugin-standalone --release
+```
+
+### Run Standalone
+```bash
+cargo run --package haptic-plugin-standalone
+```
+
+**Note**: The standalone version successfully initializes and connects to the haptic server, but may have GUI stability issues on macOS due to baseview library limitations. For production use, the VST3/CLAP versions in a DAW host are recommended.
 
 ## Supported DAWs
 

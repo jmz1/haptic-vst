@@ -4,8 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "haptic_plugin"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "haptic-plugin-standalone"
+required-features = ["standalone"]
+
+[features]
+default = []
+standalone = ["nih_plug/standalone"]
 
 
 [dependencies]

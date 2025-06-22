@@ -170,9 +170,18 @@ impl Plugin for HapticPlugin {
     }
     
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let ipc_client = self.ipc_client.clone();
-        editor::create(params, ipc_client)
+        // Disable GUI on macOS standalone to avoid baseview crashes
+        #[cfg(all(target_os = "macos", feature = "standalone"))]
+        {
+            nih_log!("GUI disabled on macOS standalone due to baseview limitations");
+            None
+        }
+        #[cfg(not(all(target_os = "macos", feature = "standalone")))]
+        {
+            let params = self.params.clone();
+            let ipc_client = self.ipc_client.clone();
+            editor::create(params, ipc_client)
+        }
     }
 }
 
@@ -192,8 +201,6 @@ impl Vst3Plugin for HapticPlugin {
 // Plugin exports with logging
 nih_export_clap!(HapticPlugin);
 nih_export_vst3!(HapticPlugin);
-// Note: Standalone export removed as it's not working as expected
-// nih_export_standalone!(HapticPlugin);
 
 // Initialize logging on library load
 #[ctor::ctor]
