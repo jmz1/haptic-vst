@@ -52,6 +52,9 @@ impl Plugin for HapticPlugin {
         },
     ];
     
+    const MIDI_INPUT: MidiConfig = MidiConfig::MidiCCs;
+    const MIDI_OUTPUT: MidiConfig = MidiConfig::None;
+    
     type SysExMessage = ();
     type BackgroundTask = ();
     
