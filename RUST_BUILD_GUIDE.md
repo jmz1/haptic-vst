@@ -257,7 +257,33 @@ tail -f ~/tmp/log/haptic-vst.log
 ```bash
 # Run with live reload
 cargo watch -x "run --package haptic-plugin-standalone"
+
+# Run with specific audio backend
+cargo run --package haptic-plugin-standalone -- --backend core-audio
+
+# List available MIDI devices (if any)
+cargo run --package haptic-plugin-standalone -- --midi-input ""
+
+# Run with MIDI input (once device is available)
+cargo run --package haptic-plugin-standalone -- --midi-input "IAC Driver Bus 1"
+
+# For this specific machine with VMPK (Virtual MIDI Piano Keyboard)
+target/debug/haptic-plugin-standalone --backend core-audio --midi-input 'VMPK Output'
 ```
+
+### MIDI Setup for Standalone
+On macOS without external MIDI hardware, you'll see:
+```
+Use the '--midi-input' option to select a MIDI input device.
+```
+
+To enable MIDI input:
+1. **Open Audio MIDI Setup** (in `/Applications/Utilities/`)
+2. **Enable IAC Driver**: Window → Show MIDI Studio → IAC Driver → Device is online
+3. **Create virtual MIDI ports** for testing
+4. **Run standalone with MIDI**: `--midi-input "IAC Driver Bus 1"`
+
+The standalone will work without MIDI input but won't receive note events.
 
 ## 9. Dependencies and External Tools
 

@@ -95,12 +95,17 @@ impl Plugin for HapticPlugin {
         let client_guard = self.ipc_client.lock();
         if let Some(ref client) = *client_guard {
             // Process MIDI events
+            let mut event_count = 0;
             while let Some(event) = context.next_event() {
+                event_count += 1;
                 let timing_offset = event.timing() as u64 * 1000; // Convert samples to microseconds (rough estimate)
                 let timestamp_us = base_timestamp + timing_offset;
                 
+                nih_log!("Processing MIDI event #{}: {:?} at timing offset {}", event_count, event, event.timing());
+                
                 match event {
                     NoteEvent::NoteOn { note, velocity, channel, .. } => {
+                        nih_log!("NoteOn: note={}, velocity={:.3}, channel={}", note, velocity, channel);
                         let cmd = HapticCommand::NoteOn {
                             timestamp_us,
                             note,
@@ -112,21 +117,29 @@ impl Plugin for HapticPlugin {
                                 timbre: 0.5 
                             },
                         };
+                        nih_log!("Sending HapticCommand::NoteOn with velocity_u8={}, timestamp={}", (velocity * 127.0) as u8, timestamp_us);
                         if let Err(e) = client.send_command(cmd) {
                             nih_log!("Failed to send NoteOn command: {}", e);
+                        } else {
+                            nih_log!("Successfully sent NoteOn command to haptic server");
                         }
                     }
                     NoteEvent::NoteOff { note, channel, .. } => {
+                        nih_log!("NoteOff: note={}, channel={}", note, channel);
                         let cmd = HapticCommand::NoteOff {
                             timestamp_us,
                             note,
                             channel: channel as u8,
                         };
+                        nih_log!("Sending HapticCommand::NoteOff with timestamp={}", timestamp_us);
                         if let Err(e) = client.send_command(cmd) {
                             nih_log!("Failed to send NoteOff command: {}", e);
+                        } else {
+                            nih_log!("Successfully sent NoteOff command to haptic server");
                         }
                     }
                     NoteEvent::PolyPressure { pressure, channel, .. } => {
+                        nih_log!("PolyPressure: pressure={:.3}, channel={}", pressure, channel);
                         let cmd = HapticCommand::MpeUpdate {
                             timestamp_us,
                             channel: channel as u8,
@@ -136,11 +149,15 @@ impl Plugin for HapticPlugin {
                                 timbre: 0.5,     // TODO: Track timbre separately
                             },
                         };
+                        nih_log!("Sending HapticCommand::MpeUpdate (pressure) with timestamp={}", timestamp_us);
                         if let Err(e) = client.send_command(cmd) {
                             nih_log!("Failed to send MpeUpdate (pressure) command: {}", e);
+                        } else {
+                            nih_log!("Successfully sent MpeUpdate (pressure) command to haptic server");
                         }
                     }
                     NoteEvent::MidiPitchBend { channel, value, .. } => {
+                        nih_log!("MidiPitchBend: value={:.3}, channel={}", value, channel);
                         let cmd = HapticCommand::MpeUpdate {
                             timestamp_us,
                             channel: channel as u8,
@@ -150,16 +167,34 @@ impl Plugin for HapticPlugin {
                                 timbre: 0.5,     // TODO: Track timbre separately
                             },
                         };
+                        nih_log!("Sending HapticCommand::MpeUpdate (pitch bend) with timestamp={}", timestamp_us);
                         if let Err(e) = client.send_command(cmd) {
                             nih_log!("Failed to send MpeUpdate (pitch bend) command: {}", e);
+                        } else {
+                            nih_log!("Successfully sent MpeUpdate (pitch bend) command to haptic server");
                         }
                     }
-                    _ => {}
+                    _ => {
+                        nih_log!("Unhandled MIDI event: {:?}", event);
+                    }
                 }
+            }
+            
+            if event_count > 0 {
+                nih_log!("Processed {} MIDI events in this buffer", event_count);
             }
             
             // Note: Wave speed is now calculated on the server from note velocity
             // No plugin parameters to process currently
+        } else {
+            // Log when no IPC client is available but only occasionally to avoid spam
+            static mut LOG_COUNTER: u32 = 0;
+            unsafe {
+                LOG_COUNTER += 1;
+                if LOG_COUNTER % 4800 == 0 { // Log every ~100ms at 48kHz
+                    nih_log!("No IPC client available for MIDI processing (logged every ~100ms)");
+                }
+            }
         }
         
         // Clear audio output (we don't generate audio)
