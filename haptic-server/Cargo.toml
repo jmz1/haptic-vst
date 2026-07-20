@@ -8,5 +8,6 @@ haptic-protocol = { path = "../haptic-protocol" }
 serde = { workspace = true }
 bincode = { workspace = true }
 rtrb = { workspace = true }
+toml = "0.8"
 cpal = "0.15"
 ctrlc = "3.4"

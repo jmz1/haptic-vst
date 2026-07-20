@@ -1,7 +1,8 @@
 use haptic_protocol::{HapticCommand, MpeData, Parameter, StimulusType};
+use crate::config::TransducerLayout;
 
 // Constants from requirements
-const TRANSDUCER_COUNT: usize = 32;
+pub const TRANSDUCER_COUNT: usize = 32;
 const MAX_WAVE_STIMULI: usize = 8;
 const MAX_STANDING_STIMULI: usize = 4;
 const MAX_DELAY_SAMPLES: usize = 4800; // ~100ms at 48kHz
@@ -153,11 +154,13 @@ pub struct StimulusEngine {
     wave_speed: f32,
     stimulus_type: StimulusType,
 
-    // Lock-free SPSC command queue, consumer end (IPC thread holds the producer)
+    // Lock-free SPSC command queues, consumer ends (IPC thread holds the
+    // command producer, the config watcher holds the layout producer)
     command_queue: rtrb::Consumer<EngineCommand>,
+    layout_queue: rtrb::Consumer<Box<TransducerLayout>>,
 
-    // Transducer configuration
-    transducer_positions: [(f32, f32); TRANSDUCER_COUNT],
+    // Transducer configuration (hot-swappable via layout_queue)
+    layout: TransducerLayout,
 }
 
 pub struct ProcessContext<'a> {
@@ -197,10 +200,14 @@ impl From<HapticCommand> for EngineCommand {
 }
 
 impl StimulusEngine {
-    /// Returns the engine (owned by the audio callback) and the producer
-    /// end of the command queue (owned by the IPC thread).
-    pub fn new() -> (Self, rtrb::Producer<EngineCommand>) {
+    /// Returns the engine (owned by the audio callback), the command
+    /// producer (owned by the IPC thread), and the layout producer (owned
+    /// by the config watcher thread). Two rings keep both paths SPSC.
+    pub fn new(
+        layout: TransducerLayout,
+    ) -> (Self, rtrb::Producer<EngineCommand>, rtrb::Producer<Box<TransducerLayout>>) {
         let (producer, consumer) = rtrb::RingBuffer::new(COMMAND_QUEUE_CAPACITY);
+        let (layout_producer, layout_consumer) = rtrb::RingBuffer::new(4);
 
         let engine = Self {
             wave_pool: StimulusPool::new(),
@@ -211,9 +218,10 @@ impl StimulusEngine {
             wave_speed: DEFAULT_WAVE_SPEED,
             stimulus_type: StimulusType::Wave,
             command_queue: consumer,
-            transducer_positions: Self::default_grid_layout(),
+            layout_queue: layout_consumer,
+            layout,
         };
-        (engine, producer)
+        (engine, producer, layout_producer)
     }
 
     fn note_on(&mut self, note: u8, velocity: u8, channel: u8, mpe: MpeData) {
@@ -335,6 +343,12 @@ impl StimulusEngine {
         while let Ok(cmd) = self.command_queue.pop() {
             self.apply_command(cmd);
         }
+        // Hot config reload: copy the new layout in place. Dropping the Box
+        // deallocates on the audio thread, but only on the rare occasion a
+        // human edits the config file - accepted.
+        while let Ok(layout) = self.layout_queue.pop() {
+            self.layout = *layout;
+        }
     }
 
     /// Synthesize one frame of all active stimuli into `output`.
@@ -343,9 +357,9 @@ impl StimulusEngine {
         self.wave_pool.process_all(context, output);
         self.standing_pool.process_all(context, output);
 
-        // Apply safety limiting
-        for sample in output.iter_mut() {
-            *sample = sample.clamp(-1.0, 1.0);
+        // Per-transducer gain, then safety limiting
+        for (sample, &gain) in output.iter_mut().zip(self.layout.gains.iter()) {
+            *sample = (*sample * gain).clamp(-1.0, 1.0);
         }
     }
 
@@ -364,7 +378,7 @@ impl StimulusEngine {
         self.drain_commands();
 
         // Copy so the context doesn't hold a borrow of self across render_frame
-        let positions = self.transducer_positions;
+        let positions = self.layout.positions;
         let context = ProcessContext {
             sample_rate,
             dt: 1.0 / sample_rate,
@@ -402,7 +416,7 @@ impl StimulusEngine {
     #[cfg(test)]
     pub fn process(&mut self, output: &mut [f32; TRANSDUCER_COUNT], sample_rate: f32) {
         self.drain_commands();
-        let positions = self.transducer_positions;
+        let positions = self.layout.positions;
         let context = ProcessContext {
             sample_rate,
             dt: 1.0 / sample_rate,
@@ -412,15 +426,6 @@ impl StimulusEngine {
         self.reap_finished_voices();
     }
 
-    fn default_grid_layout() -> [(f32, f32); TRANSDUCER_COUNT] {
-        let mut positions = [(0.0, 0.0); TRANSDUCER_COUNT];
-        for i in 0..32 {
-            let row = i / 8;
-            let col = i % 8;
-            positions[i] = (col as f32 * 0.05, row as f32 * 0.05); // 5cm spacing
-        }
-        positions
-    }
 }
 
 /// One-pole toward `target`; coeff derived from dt and MPE_SMOOTHING_TAU.
@@ -759,7 +764,7 @@ mod tests {
 
     #[test]
     fn note_on_produces_output_and_note_off_releases() {
-        let (mut engine, mut producer) = StimulusEngine::new();
+        let (mut engine, mut producer, _layout_producer) = StimulusEngine::new(TransducerLayout::default());
         send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
 
         // 200ms: through the attack, into sustain
@@ -778,7 +783,7 @@ mod tests {
 
     #[test]
     fn note_off_only_affects_matching_note_and_channel() {
-        let (mut engine, mut producer) = StimulusEngine::new();
+        let (mut engine, mut producer, _layout_producer) = StimulusEngine::new(TransducerLayout::default());
         send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
         send(&mut producer, EngineCommand::NoteOn { note: 64, velocity: 100, channel: 2, mpe: full_mpe() });
         run_samples(&mut engine, 256);
@@ -796,7 +801,7 @@ mod tests {
 
     #[test]
     fn voice_stealing_prefers_releasing_then_oldest() {
-        let (mut engine, mut producer) = StimulusEngine::new();
+        let (mut engine, mut producer, _layout_producer) = StimulusEngine::new(TransducerLayout::default());
         for note in 0..MAX_WAVE_STIMULI as u8 {
             send(&mut producer, EngineCommand::NoteOn { note: 40 + note, velocity: 100, channel: note, mpe: full_mpe() });
         }
@@ -824,7 +829,7 @@ mod tests {
 
     #[test]
     fn mpe_update_reaches_owning_stimulus_smoothly() {
-        let (mut engine, mut producer) = StimulusEngine::new();
+        let (mut engine, mut producer, _layout_producer) = StimulusEngine::new(TransducerLayout::default());
         let mut quiet = full_mpe();
         quiet.pressure = 0.0;
         send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 3, mpe: quiet });
@@ -833,9 +838,11 @@ mod tests {
         let peak = run_samples(&mut engine, (0.2 * SAMPLE_RATE) as usize);
         assert_eq!(peak, 0.0, "zero pressure should be silent");
 
-        // Press: output should fade in via smoothing
+        // Press: output should fade in via smoothing. The window must cover
+        // wave propagation to the nearest transducer (~0.13 m at 100 m/s
+        // with the default cell-centred layout ≈ 1.3 ms).
         send(&mut producer, EngineCommand::MpeUpdate { channel: 3, mpe: full_mpe() });
-        let early = run_samples(&mut engine, 48); // 1 ms
+        let early = run_samples(&mut engine, (0.01 * SAMPLE_RATE) as usize); // 10 ms
         let later = run_samples(&mut engine, (0.1 * SAMPLE_RATE) as usize);
         assert!(early > 0.0, "pressure should start taking effect");
         assert!(later > early, "smoothed pressure should keep rising");
@@ -851,7 +858,7 @@ mod tests {
 
     #[test]
     fn set_parameter_switches_pool_and_wave_speed() {
-        let (mut engine, mut producer) = StimulusEngine::new();
+        let (mut engine, mut producer, _layout_producer) = StimulusEngine::new(TransducerLayout::default());
         send(&mut producer, EngineCommand::SetParameter { parameter: Parameter::StimulusType(StimulusType::Standing) });
         send(&mut producer, EngineCommand::SetParameter { parameter: Parameter::WaveSpeed(250.0) });
         send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
@@ -869,8 +876,24 @@ mod tests {
     }
 
     #[test]
+    fn layout_gains_apply_and_hot_swap_takes_effect() {
+        let mut muted = TransducerLayout::default();
+        muted.gains = [0.0; TRANSDUCER_COUNT];
+        let (mut engine, mut producer, mut layout_producer) = StimulusEngine::new(muted);
+
+        send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
+        let peak = run_samples(&mut engine, (0.2 * SAMPLE_RATE) as usize);
+        assert_eq!(peak, 0.0, "zero gains must mute all output");
+
+        // Hot-swap to unity gains: same note keeps sounding, now audible
+        layout_producer.push(Box::new(TransducerLayout::default())).unwrap();
+        let peak = run_samples(&mut engine, (0.2 * SAMPLE_RATE) as usize);
+        assert!(peak > 0.0, "restored gains must un-mute the running voice");
+    }
+
+    #[test]
     fn panic_silences_everything() {
-        let (mut engine, mut producer) = StimulusEngine::new();
+        let (mut engine, mut producer, _layout_producer) = StimulusEngine::new(TransducerLayout::default());
         for note in 60..64u8 {
             send(&mut producer, EngineCommand::NoteOn { note, velocity: 100, channel: note - 60, mpe: full_mpe() });
         }

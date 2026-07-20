@@ -66,13 +66,15 @@ pub fn create(
                 ui.group(|ui| {
                     ui.label("Transducer Array (32 channels, live RMS)");
                     
-                    let size = egui::Vec2::new(400.0, 200.0);
+                    let size = egui::Vec2::new(240.0, 480.0);
                     let (response, painter) = ui.allocate_painter(size, egui::Sense::hover());
                     
-                    // Draw 32 transducer indicators in 4x8 grid
+                    // Draw 32 transducer indicators matching the server's
+                    // default layout: 4 across the 1 m width, 8 along the
+                    // 2 m length, channels running across the width first
                     let rect = response.rect;
-                    let grid_cols = 8;
-                    let grid_rows = 4;
+                    let grid_cols = 4;
+                    let grid_rows = 8;
                     
                     for i in 0..32 {
                         let row = i / grid_cols;
@@ -130,7 +132,7 @@ pub fn create(
                     }
                     
                     // Add grid labels
-                    ui.label("Grid spacing: 5cm × 5cm");
+                    ui.label("Default layout: 4 × 8 over 1 m × 2 m (see haptic.toml)");
                 });
                 
                 ui.separator();

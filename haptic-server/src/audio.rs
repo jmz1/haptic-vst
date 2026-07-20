@@ -2,9 +2,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
-use crate::engine::StimulusEngine;
-
-const TRANSDUCER_COUNT: usize = 32;
+use crate::engine::{StimulusEngine, TRANSDUCER_COUNT};
 
 /// Lock-free callback statistics, written by the audio thread and read by
 /// the monitor thread. Durations land in log2(ns) histogram buckets so

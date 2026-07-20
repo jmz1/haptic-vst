@@ -1,0 +1,32 @@
+# Haptic table transducer layout.
+#
+# All distances are physical METRES. The wave-propagation model computes
+# per-transducer delays from real distances and the wave-speed parameter
+# (m/s), so coordinates must be real dimensions, not normalised units.
+# Origin is one corner of the table; x runs across the width, y along the
+# length.
+#
+# The server loads this file at startup (./haptic.toml by default, or
+# --config <path>) and hot-reloads it whenever it changes on disk. An
+# invalid edit is rejected with a message and the running layout is kept.
+
+[table]
+width_m = 1.0    # x extent
+length_m = 2.0   # y extent
+
+# Cell-centred grid layout. cols x rows must equal 32. Channels run across
+# the width first: channel = row * cols + col, so channel 0 is at the
+# origin corner cell and channel 31 at the far corner cell.
+[grid]
+cols = 4         # across the width (x)
+rows = 8         # along the length (y)
+# gain = 1.0     # optional gain applied to every transducer
+
+# Optional per-transducer overrides, applied after the grid. Use these for
+# irregular placements or per-transducer calibration gains.
+#
+# [[transducer]]
+# channel = 0
+# x = 0.125
+# y = 0.125
+# gain = 0.9
