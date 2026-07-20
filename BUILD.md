@@ -2,6 +2,14 @@
 
 This project uses `nih_plug_xtask` for easy plugin building and bundling.
 
+> **PATH note:** `cargo` lives in `~/.cargo/bin`, which is not on the
+> default shell PATH on this machine. Run
+> `echo 'source "$HOME/.cargo/env"' >> ~/.zshrc` once (new terminal after),
+> or prefix sessions with `export PATH="$HOME/.cargo/bin:$PATH"`.
+
+> **Testing:** build instructions are here; how to *run and test* the
+> system (server, viewer, plugin, scripted clients) is in `TESTING.md`.
+
 ## Quick Start
 
 ### Build Development Plugin
@@ -24,29 +32,25 @@ cargo xtask bundle-universal haptic-plugin --release
 Built plugins are placed in:
 ```
 target/bundled/
-├── haptic-plugin.clap    # CLAP format plugin
 └── haptic-plugin.vst3    # VST3 format plugin
 ```
+
+(CLAP export is currently disabled in `haptic-plugin/src/lib.rs`; a stale
+`haptic-plugin.clap` may remain in `target/bundled/` from older builds.)
 
 ## Installation
 
 ### macOS
-Copy the plugin bundles to your DAW's plugin directory:
+Copy the plugin bundle to your DAW's plugin directory:
 
-**VST3:**
 ```bash
+mkdir -p ~/Library/Audio/Plug-Ins/VST3
 cp -r target/bundled/haptic-plugin.vst3 ~/Library/Audio/Plug-Ins/VST3/
 ```
 
-**CLAP:**
-```bash
-cp -r target/bundled/haptic-plugin.clap ~/Library/Audio/Plug-Ins/CLAP/
-```
-
 ### System Directories (macOS)
-- VST3: `/Library/Audio/Plug-Ins/VST3/` (system-wide)
-- CLAP: `/Library/Audio/Plug-Ins/CLAP/` (system-wide)
-- User: `~/Library/Audio/Plug-Ins/VST3/` or `~/Library/Audio/Plug-Ins/CLAP/`
+- User: `~/Library/Audio/Plug-Ins/VST3/`
+- System-wide: `/Library/Audio/Plug-Ins/VST3/`
 
 ## Running the Server
 
@@ -75,14 +79,19 @@ cargo run --bin haptic-server
 
 4. **Load in your DAW** and send MIDI notes to test haptic feedback
 
+5. **Optionally start the visualiser** (`cargo run -p haptic-viewer
+   --release`) — see `TESTING.md` for the full testing workflow
+
 ## Features
 
-- **VST3 & CLAP Support**: Works with most modern DAWs
-- **Real-time Processing**: Zero-allocation audio processing
-- **MIDI/MPE Input**: Full support for expressive MIDI controllers
-- **Velocity-based Wave Speed**: Note velocity controls wave propagation (20-500 m/s)
+- **VST3 Support**: Works with most modern DAWs (CLAP currently disabled)
+- **Real-time Processing**: Lock-free audio path in the server
+- **MIDI/MPE Input**: Velocity → amplitude, bend/pressure/slide → source
+  position and intensity
+- **DAW-automatable parameters**: Wave Speed (20–500 m/s) and Stimulus Type
 - **32-channel Output**: Direct control of haptic transducer arrays
-- **Enhanced Logging**: Comprehensive debug logging to `/tmp/haptic-vst.log`
+- **Logging**: Plugin log at `/Users/jmz/tmp/log/haptic-vst.log`
+  (override with `NIH_LOG`)
 - **Cross-platform**: macOS and Linux support
 
 ## Standalone Mode

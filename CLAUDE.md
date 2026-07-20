@@ -6,7 +6,7 @@
 
 - **Current state & priorities**: `ROADMAP.md` — the single source of truth for what is done, in progress, and next. Read it at the start of any session.
 - **Planning & architecture history**: `docs/planning/` (see its README for reading order). Frozen reference; do not edit.
-- **Architecture / Rust reference**: `ARCHITECTURE.md`. Build instructions: `BUILD.md`, `RUST_BUILD_GUIDE.md`.
+- **Architecture / Rust reference**: `ARCHITECTURE.md`. Build instructions: `BUILD.md`, `RUST_BUILD_GUIDE.md`. Running & testing the system: `TESTING.md`.
 
 ## Session conventions
 
