@@ -1,0 +1,9 @@
+[package]
+name = "haptic-viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+haptic-protocol = { path = "../haptic-protocol" }
+parking_lot = { workspace = true }
+eframe = "0.31"

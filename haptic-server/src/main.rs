@@ -51,18 +51,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create shared shutdown flag
     let running = Arc::new(AtomicBool::new(true));
 
-    // Create stimulus engine - the IPC thread gets the command producer,
-    // the config watcher gets the layout producer
-    let (engine, command_producer, layout_producer) = StimulusEngine::new(layout);
+    // Create stimulus engine - the IPC thread gets the command producer and
+    // voice-snapshot consumer, the config watcher gets the layout producer
+    let (engine, command_producer, engine_layout_producer, voice_consumer) =
+        StimulusEngine::new(layout);
 
     // Levels path: audio callback → IPC thread → connected clients
     let (levels_producer, levels_consumer) = rtrb::RingBuffer::new(256);
+
+    // Layout path to the IPC thread (for broadcast to clients); the engine
+    // has its own ring, so the watcher feeds both
+    let (ipc_layout_producer, ipc_layout_consumer) = rtrb::RingBuffer::new(4);
 
     // Start IPC listener thread
     let ipc_handle = {
         let running = running.clone();
         thread::spawn(move || {
-            if let Err(e) = ipc::listen_loop(running, command_producer, levels_consumer) {
+            if let Err(e) = ipc::listen_loop(
+                running,
+                command_producer,
+                levels_consumer,
+                voice_consumer,
+                layout,
+                ipc_layout_consumer,
+            ) {
                 eprintln!("IPC error: {}", e);
             }
         })
@@ -71,7 +83,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Config watcher: hot-reload the layout when the file's mtime changes
     let watcher_handle = {
         let running = running.clone();
-        thread::spawn(move || config_watcher(running, config_path, layout_producer))
+        thread::spawn(move || {
+            config_watcher(running, config_path, engine_layout_producer, ipc_layout_producer)
+        })
     };
 
     // Set up signal handler for graceful shutdown
@@ -101,7 +115,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn config_watcher(
     running: Arc<AtomicBool>,
     path: PathBuf,
-    mut layout_producer: rtrb::Producer<Box<TransducerLayout>>,
+    mut engine_producer: rtrb::Producer<Box<TransducerLayout>>,
+    mut ipc_producer: rtrb::Producer<TransducerLayout>,
 ) {
     let mtime_of = |path: &std::path::Path| -> Option<SystemTime> {
         std::fs::metadata(path).and_then(|m| m.modified()).ok()
@@ -115,9 +130,10 @@ fn config_watcher(
             last_mtime = mtime;
             match config::load_layout(&path) {
                 Ok(layout) => {
-                    if layout_producer.push(Box::new(layout)).is_ok() {
+                    if engine_producer.push(Box::new(layout)).is_ok() {
                         eprintln!("Config reloaded from {}", path.display());
                     }
+                    let _ = ipc_producer.push(layout);
                 }
                 Err(e) => {
                     eprintln!("Config reload failed (keeping current layout): {}", e);

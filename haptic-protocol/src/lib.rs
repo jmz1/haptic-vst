@@ -69,6 +69,28 @@ pub enum ServerStatus {
         active_stimuli: u8,
         cpu_percent: u8,
     },
+    /// The server's resolved transducer layout, sent to each client on
+    /// connect and rebroadcast on config hot-reload. Distances in metres.
+    Layout {
+        positions: [(f32, f32); 32],
+        gains: [f32; 32],
+        table_m: (f32, f32),
+    },
+    /// Snapshot of the most recently started active delay-line (wave)
+    /// voice, for phase visualisation. `delay_samples` are the actual
+    /// per-transducer propagation delays in use; relative phase at
+    /// transducer i is 2*pi * frequency * delay_samples[i] / sample_rate.
+    VoiceState {
+        timestamp_us: u64,
+        seq: u64,
+        note: u8,
+        frequency: f32,
+        wave_speed: f32,
+        source_pos: (f32, f32),
+        amplitude: f32,
+        sample_rate: f32,
+        delay_samples: [f32; 32],
+    },
 }
 
 pub const SOCKET_PATH: &str = "/tmp/haptic-vst.sock";

@@ -7,9 +7,15 @@ use std::time::Duration;
 use std::io::Write;
 use std::time::Instant;
 use haptic_protocol::{encode_frame, FrameDecoder, FrameError, HapticCommand, ServerStatus, SOCKET_PATH};
+use crate::config::TransducerLayout;
+use crate::engine::VoiceSnapshot;
 
 /// Minimum interval between TransducerLevels broadcasts (~60 Hz).
 const LEVELS_BROADCAST_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Minimum interval between VoiceState broadcasts. 4 ms (~250 Hz) keeps the
+/// socket well ahead of a 120 Hz display without flooding slow clients.
+const VOICE_BROADCAST_INTERVAL: Duration = Duration::from_millis(4);
 
 /// A connected plugin instance with its stream-reassembly state.
 struct Client {
@@ -21,6 +27,9 @@ pub fn listen_loop(
     running: Arc<AtomicBool>,
     mut command_producer: rtrb::Producer<crate::engine::EngineCommand>,
     mut levels_consumer: rtrb::Consumer<[f32; 32]>,
+    mut voice_consumer: rtrb::Consumer<VoiceSnapshot>,
+    mut layout: TransducerLayout,
+    mut layout_consumer: rtrb::Consumer<TransducerLayout>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Remove existing socket file if it exists
     let _ = std::fs::remove_file(SOCKET_PATH);
@@ -33,16 +42,25 @@ pub fn listen_loop(
     let mut clients: Vec<Client> = Vec::new();
     let mut latest_levels: Option<[f32; 32]> = None;
     let mut last_broadcast = Instant::now();
-    let mut status_frame = Vec::with_capacity(256);
+    let mut last_voice_broadcast = Instant::now();
+    let mut status_frame = Vec::with_capacity(512);
 
     while running.load(Ordering::Relaxed) {
         // Accept new connections
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((mut stream, _)) => {
                 eprintln!("New client connected");
                 if let Err(e) = stream.set_nonblocking(true) {
                     eprintln!("Failed to set stream nonblocking: {}", e);
                     continue;
+                }
+                // Greet each client with the resolved layout so viewers
+                // mirror the running config without reading haptic.toml
+                if encode_frame(&layout_status(&layout), &mut status_frame).is_ok() {
+                    if let Err(e) = stream.write_all(&status_frame) {
+                        eprintln!("Dropping client on layout write failure: {}", e);
+                        continue;
+                    }
                 }
                 clients.push(Client { stream, decoder: FrameDecoder::new() });
             }
@@ -59,32 +77,51 @@ pub fn listen_loop(
             handle_client(client, &mut command_producer)
         });
 
+        // Hot reload: adopt and rebroadcast the layout to every client
+        while let Ok(new_layout) = layout_consumer.pop() {
+            layout = new_layout;
+            if encode_frame(&layout_status(&layout), &mut status_frame).is_ok() {
+                broadcast(&mut clients, &status_frame);
+            }
+        }
+
         // Keep only the freshest levels frame from the audio thread
         while let Ok(levels) = levels_consumer.pop() {
             latest_levels = Some(levels);
+        }
+
+        // Forward the freshest voice snapshot for phase visualisation
+        let mut latest_voice: Option<VoiceSnapshot> = None;
+        while let Ok(snapshot) = voice_consumer.pop() {
+            latest_voice = Some(snapshot);
+        }
+        if let Some(v) = latest_voice {
+            if last_voice_broadcast.elapsed() >= VOICE_BROADCAST_INTERVAL {
+                last_voice_broadcast = Instant::now();
+                let status = ServerStatus::VoiceState {
+                    timestamp_us: now_us(),
+                    seq: v.seq,
+                    note: v.note,
+                    frequency: v.frequency,
+                    wave_speed: v.wave_speed,
+                    source_pos: v.source_pos,
+                    amplitude: v.amplitude,
+                    sample_rate: v.sample_rate,
+                    delay_samples: v.delay_samples,
+                };
+                if encode_frame(&status, &mut status_frame).is_ok() {
+                    broadcast(&mut clients, &status_frame);
+                }
+            }
         }
 
         // Broadcast levels to all clients at ~60 Hz
         if last_broadcast.elapsed() >= LEVELS_BROADCAST_INTERVAL {
             if let Some(levels) = latest_levels.take() {
                 last_broadcast = Instant::now();
-                let timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros() as u64;
-                let status = ServerStatus::TransducerLevels { timestamp_us, levels };
+                let status = ServerStatus::TransducerLevels { timestamp_us: now_us(), levels };
                 if encode_frame(&status, &mut status_frame).is_ok() {
-                    clients.retain_mut(|client| {
-                        // A client that can't keep up (WouldBlock mid-frame
-                        // would corrupt its stream) is dropped
-                        match client.stream.write_all(&status_frame) {
-                            Ok(()) => true,
-                            Err(e) => {
-                                eprintln!("Dropping client on status write failure: {}", e);
-                                false
-                            }
-                        }
-                    });
+                    broadcast(&mut clients, &status_frame);
                 }
             }
         }
@@ -97,6 +134,33 @@ pub fn listen_loop(
     eprintln!("IPC server stopped");
 
     Ok(())
+}
+
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
+fn layout_status(layout: &TransducerLayout) -> ServerStatus {
+    ServerStatus::Layout {
+        positions: layout.positions,
+        gains: layout.gains,
+        table_m: layout.table_m,
+    }
+}
+
+/// Write a frame to every client, dropping clients whose stream fails
+/// (a partial write would corrupt their framing anyway).
+fn broadcast(clients: &mut Vec<Client>, frame: &[u8]) {
+    clients.retain_mut(|client| match client.stream.write_all(frame) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("Dropping client on status write failure: {}", e);
+            false
+        }
+    });
 }
 
 /// Drain all available bytes from the client and dispatch every complete
@@ -158,10 +222,12 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let (tx, mut rx) = rtrb::RingBuffer::new(64);
         let (_levels_tx, levels_rx) = rtrb::RingBuffer::new(64);
+        let (_voice_tx, voice_rx) = rtrb::RingBuffer::new(64);
+        let (_layout_tx, layout_rx) = rtrb::RingBuffer::new(4);
         let listener = {
             let running = running.clone();
             thread::spawn(move || {
-                let _ = listen_loop(running, tx, levels_rx);
+                let _ = listen_loop(running, tx, levels_rx, voice_rx, TransducerLayout::default(), layout_rx);
             })
         };
 

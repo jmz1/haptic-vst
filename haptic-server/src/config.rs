@@ -19,6 +19,8 @@ pub struct TransducerLayout {
     pub positions: [(f32, f32); TRANSDUCER_COUNT],
     /// Linear output gain per transducer (1.0 = unity).
     pub gains: [f32; TRANSDUCER_COUNT],
+    /// (width, length) of the table in metres, for visualisation.
+    pub table_m: (f32, f32),
 }
 
 impl Default for TransducerLayout {
@@ -51,7 +53,11 @@ impl TransducerLayout {
                 (row as f32 + 0.5) * length_m / rows as f32,
             );
         }
-        Ok(Self { positions, gains: [gain; TRANSDUCER_COUNT] })
+        Ok(Self {
+            positions,
+            gains: [gain; TRANSDUCER_COUNT],
+            table_m: (width_m, length_m),
+        })
     }
 }
 
