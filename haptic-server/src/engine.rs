@@ -5,7 +5,11 @@ use crate::config::TransducerLayout;
 pub const TRANSDUCER_COUNT: usize = 32;
 const MAX_WAVE_STIMULI: usize = 8;
 const MAX_STANDING_STIMULI: usize = 4;
-const MAX_DELAY_SAMPLES: usize = 4800; // ~100ms at 48kHz
+// Sized for worst-case propagation delay: table diagonal (~2.24 m for the
+// default 1m x 2m layout, plus MPE source excursion) at the minimum wave
+// speed (20 m/s) is ~115 ms; 16384 samples covers ~341 ms at 48 kHz and
+// ~171 ms at 96 kHz. Delays beyond capacity are clamped, not wrapped.
+const MAX_DELAY_SAMPLES: usize = 16384;
 
 // Haptic frequency band of the transducers
 const MIN_HAPTIC_FREQ: f32 = 20.0;
@@ -14,11 +18,28 @@ const MAX_HAPTIC_FREQ: f32 = 200.0;
 // One-pole smoothing time constant for incoming MPE dimensions
 const MPE_SMOOTHING_TAU: f32 = 0.015; // 15 ms
 
-const DEFAULT_WAVE_SPEED: f32 = 100.0; // m/s
+const DEFAULT_WAVE_SPEED: f32 = 20.0; // m/s
 
 /// Capacity of the IPC → audio thread command ring buffer. Sized for a
 /// worst-case burst of MPE traffic within one audio callback.
 const COMMAND_QUEUE_CAPACITY: usize = 1024;
+
+/// Per-block snapshot of the most recently started active wave voice,
+/// exported to the IPC thread for phase visualisation.
+#[derive(Clone, Copy)]
+pub struct VoiceSnapshot {
+    pub seq: u64,
+    pub note: u8,
+    pub frequency: f32,
+    pub wave_speed: f32,
+    pub source_pos: (f32, f32),
+    /// Current perceived source level: velocity amplitude x envelope x
+    /// smoothed MPE pressure.
+    pub amplitude: f32,
+    pub sample_rate: f32,
+    /// The propagation delays the delay lines are using this block.
+    pub delay_samples: [f32; TRANSDUCER_COUNT],
+}
 
 /// Map a MIDI note onto the transducers' haptic band. Equal-temperament
 /// ratios are preserved but transposed two octaves down so middle C (60)
@@ -159,6 +180,9 @@ pub struct StimulusEngine {
     command_queue: rtrb::Consumer<EngineCommand>,
     layout_queue: rtrb::Consumer<Box<TransducerLayout>>,
 
+    // Voice snapshots out to the IPC thread (drops when full)
+    voice_producer: rtrb::Producer<VoiceSnapshot>,
+
     // Transducer configuration (hot-swappable via layout_queue)
     layout: TransducerLayout,
 }
@@ -201,13 +225,20 @@ impl From<HapticCommand> for EngineCommand {
 
 impl StimulusEngine {
     /// Returns the engine (owned by the audio callback), the command
-    /// producer (owned by the IPC thread), and the layout producer (owned
-    /// by the config watcher thread). Two rings keep both paths SPSC.
+    /// producer (owned by the IPC thread), the layout producer (owned by
+    /// the config watcher thread), and the voice-snapshot consumer (owned
+    /// by the IPC thread). Separate rings keep every path SPSC.
     pub fn new(
         layout: TransducerLayout,
-    ) -> (Self, rtrb::Producer<EngineCommand>, rtrb::Producer<Box<TransducerLayout>>) {
+    ) -> (
+        Self,
+        rtrb::Producer<EngineCommand>,
+        rtrb::Producer<Box<TransducerLayout>>,
+        rtrb::Consumer<VoiceSnapshot>,
+    ) {
         let (producer, consumer) = rtrb::RingBuffer::new(COMMAND_QUEUE_CAPACITY);
         let (layout_producer, layout_consumer) = rtrb::RingBuffer::new(4);
+        let (voice_producer, voice_consumer) = rtrb::RingBuffer::new(256);
 
         let engine = Self {
             wave_pool: StimulusPool::new(),
@@ -219,9 +250,10 @@ impl StimulusEngine {
             stimulus_type: StimulusType::Wave,
             command_queue: consumer,
             layout_queue: layout_consumer,
+            voice_producer,
             layout,
         };
-        (engine, producer, layout_producer)
+        (engine, producer, layout_producer, voice_consumer)
     }
 
     fn note_on(&mut self, note: u8, velocity: u8, channel: u8, mpe: MpeData) {
@@ -409,7 +441,44 @@ impl StimulusEngine {
             *level = (sum * inv_frames).sqrt();
         }
 
+        self.publish_latest_voice(sample_rate);
         self.reap_finished_voices();
+    }
+
+    /// Push a snapshot of the most recently started active wave voice for
+    /// the visualiser. No-op (and no allocation) when nothing is playing.
+    fn publish_latest_voice(&mut self, sample_rate: f32) {
+        let mut latest: Option<(usize, VoiceOwner)> = None;
+        for (slot, owner) in self.wave_owners.iter().enumerate() {
+            if let Some(o) = owner {
+                if self.wave_pool.slot_active(slot)
+                    && latest.map_or(true, |(_, best)| o.seq > best.seq)
+                {
+                    latest = Some((slot, *o));
+                }
+            }
+        }
+        let Some((slot, owner)) = latest else { return };
+        let stim = &self.wave_pool.stimuli[slot];
+
+        let mut delay_samples = [0.0f32; TRANSDUCER_COUNT];
+        for (delay, &(tx, ty)) in delay_samples.iter_mut().zip(self.layout.positions.iter()) {
+            let dx = tx - stim.source_pos.0;
+            let dy = ty - stim.source_pos.1;
+            let distance = (dx * dx + dy * dy).sqrt();
+            *delay = distance / stim.wave_speed.max(1.0) * sample_rate;
+        }
+
+        let _ = self.voice_producer.push(VoiceSnapshot {
+            seq: owner.seq,
+            note: owner.note,
+            frequency: stim.frequency,
+            wave_speed: stim.wave_speed,
+            source_pos: stim.source_pos,
+            amplitude: stim.amplitude * stim.env_level * stim.mpe.pressure,
+            sample_rate,
+            delay_samples,
+        });
     }
 
     /// Single-frame variant used by tests.
@@ -458,6 +527,11 @@ impl DelayLine {
         // Write current input
         let write_idx = self.write_pos as usize;
         self.buffer[write_idx] = input;
+
+        // A delay beyond capacity would make read_pos negative even after
+        // the wrap correction; the negative-to-usize cast then reads index 0
+        // (i.e. the sample just written - no delay at all). Clamp instead.
+        let delay_samples = delay_samples.clamp(0.0, (self.size - 2) as f32);
 
         // Read with fractional delay
         let read_pos = self.write_pos - delay_samples;
@@ -764,7 +838,7 @@ mod tests {
 
     #[test]
     fn note_on_produces_output_and_note_off_releases() {
-        let (mut engine, mut producer, _layout_producer) = StimulusEngine::new(TransducerLayout::default());
+        let (mut engine, mut producer, _layout_producer, _voices) = StimulusEngine::new(TransducerLayout::default());
         send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
 
         // 200ms: through the attack, into sustain
@@ -783,7 +857,7 @@ mod tests {
 
     #[test]
     fn note_off_only_affects_matching_note_and_channel() {
-        let (mut engine, mut producer, _layout_producer) = StimulusEngine::new(TransducerLayout::default());
+        let (mut engine, mut producer, _layout_producer, _voices) = StimulusEngine::new(TransducerLayout::default());
         send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
         send(&mut producer, EngineCommand::NoteOn { note: 64, velocity: 100, channel: 2, mpe: full_mpe() });
         run_samples(&mut engine, 256);
@@ -801,7 +875,7 @@ mod tests {
 
     #[test]
     fn voice_stealing_prefers_releasing_then_oldest() {
-        let (mut engine, mut producer, _layout_producer) = StimulusEngine::new(TransducerLayout::default());
+        let (mut engine, mut producer, _layout_producer, _voices) = StimulusEngine::new(TransducerLayout::default());
         for note in 0..MAX_WAVE_STIMULI as u8 {
             send(&mut producer, EngineCommand::NoteOn { note: 40 + note, velocity: 100, channel: note, mpe: full_mpe() });
         }
@@ -829,7 +903,7 @@ mod tests {
 
     #[test]
     fn mpe_update_reaches_owning_stimulus_smoothly() {
-        let (mut engine, mut producer, _layout_producer) = StimulusEngine::new(TransducerLayout::default());
+        let (mut engine, mut producer, _layout_producer, _voices) = StimulusEngine::new(TransducerLayout::default());
         let mut quiet = full_mpe();
         quiet.pressure = 0.0;
         send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 3, mpe: quiet });
@@ -858,7 +932,7 @@ mod tests {
 
     #[test]
     fn set_parameter_switches_pool_and_wave_speed() {
-        let (mut engine, mut producer, _layout_producer) = StimulusEngine::new(TransducerLayout::default());
+        let (mut engine, mut producer, _layout_producer, _voices) = StimulusEngine::new(TransducerLayout::default());
         send(&mut producer, EngineCommand::SetParameter { parameter: Parameter::StimulusType(StimulusType::Standing) });
         send(&mut producer, EngineCommand::SetParameter { parameter: Parameter::WaveSpeed(250.0) });
         send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
@@ -876,10 +950,39 @@ mod tests {
     }
 
     #[test]
+    fn long_propagation_delays_are_delayed_not_wrapped() {
+        // Source pushed to (-0.2, 0.0) by full negative bend, zero timbre;
+        // the far corner transducer (ch 31 at (0.875, 1.875)) is ~2.16 m
+        // away -> ~108 ms at the default 20 m/s = ~5188 samples. The old
+        // 4800-sample delay line overflowed here and read the just-written
+        // sample instead (zero delay).
+        let mpe = MpeData { pressure: 1.0, pitch_bend: -1.0, timbre: 0.0 };
+        let (mut engine, mut producer, _lp, _voices) = StimulusEngine::new(TransducerLayout::default());
+        send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 1, mpe });
+
+        let mut output = [0.0f32; TRANSDUCER_COUNT];
+        let mut near_peak = 0.0f32;
+        let mut far_early_peak = 0.0f32;
+        let mut far_late_peak = 0.0f32;
+        for n in 0..(0.3 * SAMPLE_RATE) as usize {
+            engine.process(&mut output, SAMPLE_RATE);
+            near_peak = near_peak.max(output[0].abs());
+            if n < 4800 {
+                far_early_peak = far_early_peak.max(output[31].abs());
+            } else {
+                far_late_peak = far_late_peak.max(output[31].abs());
+            }
+        }
+        assert!(near_peak > 0.0, "near transducer should sound quickly");
+        assert_eq!(far_early_peak, 0.0, "far corner must stay silent until the wave arrives (~108 ms)");
+        assert!(far_late_peak > 0.0, "far corner should sound once the wave arrives");
+    }
+
+    #[test]
     fn layout_gains_apply_and_hot_swap_takes_effect() {
         let mut muted = TransducerLayout::default();
         muted.gains = [0.0; TRANSDUCER_COUNT];
-        let (mut engine, mut producer, mut layout_producer) = StimulusEngine::new(muted);
+        let (mut engine, mut producer, mut layout_producer, _voices) = StimulusEngine::new(muted);
 
         send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
         let peak = run_samples(&mut engine, (0.2 * SAMPLE_RATE) as usize);
@@ -893,7 +996,7 @@ mod tests {
 
     #[test]
     fn panic_silences_everything() {
-        let (mut engine, mut producer, _layout_producer) = StimulusEngine::new(TransducerLayout::default());
+        let (mut engine, mut producer, _layout_producer, _voices) = StimulusEngine::new(TransducerLayout::default());
         for note in 60..64u8 {
             send(&mut producer, EngineCommand::NoteOn { note, velocity: 100, channel: note - 60, mpe: full_mpe() });
         }

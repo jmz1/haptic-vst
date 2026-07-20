@@ -67,7 +67,7 @@ impl Default for HapticParams {
         Self {
             wave_speed: FloatParam::new(
                 "Wave Speed",
-                100.0,
+                20.0,
                 FloatRange::Skewed { min: 20.0, max: 500.0, factor: FloatRange::skew_factor(-1.0) },
             )
             .with_unit(" m/s")
