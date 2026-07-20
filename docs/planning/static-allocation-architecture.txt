@@ -1,0 +1,682 @@
+// Haptic VST Plugin - Static Allocation Architecture
+// Core constants and configuration
+
+const TRANSDUCER_COUNT: usize = 32;
+const MAX_WAVE_STIMULI: usize = 8;
+const MAX_SWEEP_STIMULI: usize = 4;
+const MAX_CHAOTIC_STIMULI: usize = 4;
+const MAX_DELAY_SAMPLES: usize = 4800; // ~100ms at 48kHz
+
+// Error handling
+#[derive(Debug)]
+enum AllocError {
+    PoolExhausted,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StimulusType {
+    DelayLineWave,
+    SpatialSweep,
+    ChaoticNetwork,
+}
+
+impl StimulusType {
+    fn from_velocity(velocity: u8) -> Option<Self> {
+        match velocity {
+            1..=42 => Some(Self::DelayLineWave),
+            43..=84 => Some(Self::SpatialSweep),
+            85..=127 => Some(Self::ChaoticNetwork),
+            _ => None,
+        }
+    }
+}
+
+// Core trait for all stimulus types
+trait Stimulus: Send + Sync + Clone {
+    fn process(&mut self, context: &ProcessContext) -> SpatialField;
+    fn is_active(&self) -> bool;
+    fn should_deallocate(&self) -> bool;
+
+    // Lifecycle with explicit reset
+    fn note_on(&mut self, event: &MpeNoteEvent);
+    fn note_off(&mut self, event: &MpeNoteEvent);
+    fn reset(&mut self); // Clean slate for reuse
+
+    // MPE handling
+    fn mpe_update(&mut self, event: &MpeUpdateEvent);
+}
+
+// Processing context passed to all stimuli
+struct ProcessContext {
+    sample_rate: f32,
+    delta_time: f32,
+    transducer_config: &TransducerConfig,
+    frame_index: u64,
+}
+
+// MPE event types
+#[derive(Debug, Clone)]
+struct MpeNoteEvent {
+    note: u8,
+    velocity: u8,
+    channel: u8,
+    pressure: f32,
+    pitch_bend: f32,
+    timbre: f32,
+}
+
+#[derive(Debug, Clone)]
+struct MpeUpdateEvent {
+    channel: u8,
+    pressure: Option<f32>,
+    pitch_bend: Option<f32>,
+    timbre: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MpeState {
+    note: u8,
+    velocity: f32,
+    pressure: f32,      // Universal: maps to amplitude
+    pitch_bend: f32,
+    timbre: f32,
+}
+
+// Parameter mapping system for MPE->stimulus parameter conversion
+#[derive(Clone)]
+struct ParameterMapping {
+    input_range: (f32, f32),
+    output_range: (f32, f32),
+    curve: MappingCurve,
+}
+
+#[derive(Clone)]
+enum MappingCurve {
+    Linear,
+    Exponential(f32),
+    Logarithmic,
+}
+
+impl ParameterMapping {
+    fn new(output_min: f32, output_max: f32) -> Self {
+        Self {
+            input_range: (0.0, 1.0),
+            output_range: (output_min, output_max),
+            curve: MappingCurve::Linear,
+        }
+    }
+
+    fn map(&self, input: f32) -> f32 {
+        // Normalize input to 0-1
+        let normalized = (input - self.input_range.0) / (self.input_range.1 - self.input_range.0);
+        let clamped = normalized.clamp(0.0, 1.0);
+
+        // Apply curve
+        let curved = match self.curve {
+            MappingCurve::Linear => clamped,
+            MappingCurve::Exponential(exp) => clamped.powf(exp),
+            MappingCurve::Logarithmic => clamped.ln().abs(), // Simplified
+        };
+
+        // Scale to output range
+        self.output_range.0 + curved * (self.output_range.1 - self.output_range.0)
+    }
+}
+
+// ADSR envelope for stimulus lifecycle
+#[derive(Clone)]
+struct AdsrEnvelope {
+    attack_time: f32,
+    decay_time: f32,
+    sustain_level: f32,
+    release_time: f32,
+
+    state: EnvelopeState,
+    current_level: f32,
+    time_in_state: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum EnvelopeState {
+    Idle,
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+}
+
+impl Default for AdsrEnvelope {
+    fn default() -> Self {
+        Self {
+            attack_time: 0.1,
+            decay_time: 0.2,
+            sustain_level: 0.7,
+            release_time: 0.5,
+            state: EnvelopeState::Idle,
+            current_level: 0.0,
+            time_in_state: 0.0,
+        }
+    }
+}
+
+impl AdsrEnvelope {
+    fn trigger(&mut self) {
+        self.state = EnvelopeState::Attack;
+        self.time_in_state = 0.0;
+    }
+
+    fn release(&mut self) {
+        self.state = EnvelopeState::Release;
+        self.time_in_state = 0.0;
+    }
+
+    fn reset(&mut self) {
+        self.state = EnvelopeState::Idle;
+        self.current_level = 0.0;
+        self.time_in_state = 0.0;
+    }
+
+    fn process(&mut self, delta_time: f32) -> f32 {
+        self.time_in_state += delta_time;
+
+        match self.state {
+            EnvelopeState::Idle => 0.0,
+            EnvelopeState::Attack => {
+                if self.time_in_state >= self.attack_time {
+                    self.state = EnvelopeState::Decay;
+                    self.time_in_state = 0.0;
+                    self.current_level = 1.0;
+                } else {
+                    self.current_level = self.time_in_state / self.attack_time;
+                }
+                self.current_level
+            },
+            EnvelopeState::Decay => {
+                if self.time_in_state >= self.decay_time {
+                    self.state = EnvelopeState::Sustain;
+                    self.current_level = self.sustain_level;
+                } else {
+                    let decay_progress = self.time_in_state / self.decay_time;
+                    self.current_level = 1.0 - decay_progress * (1.0 - self.sustain_level);
+                }
+                self.current_level
+            },
+            EnvelopeState::Sustain => {
+                self.current_level = self.sustain_level;
+                self.current_level
+            },
+            EnvelopeState::Release => {
+                if self.time_in_state >= self.release_time {
+                    self.state = EnvelopeState::Idle;
+                    self.current_level = 0.0;
+                } else {
+                    let release_progress = self.time_in_state / self.release_time;
+                    self.current_level = self.sustain_level * (1.0 - release_progress);
+                }
+                self.current_level
+            },
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.state != EnvelopeState::Idle
+    }
+}
+
+// Spatial field representation
+#[derive(Clone)]
+struct SpatialField {
+    transducer_outputs: [f32; TRANSDUCER_COUNT],
+}
+
+impl SpatialField {
+    fn new() -> Self {
+        Self {
+            transducer_outputs: [0.0; TRANSDUCER_COUNT],
+        }
+    }
+
+    fn zero() -> Self {
+        Self::new()
+    }
+
+    fn set_transducer(&mut self, index: usize, value: f32) {
+        if index < TRANSDUCER_COUNT {
+            self.transducer_outputs[index] = value;
+        }
+    }
+
+    fn add(&mut self, other: &SpatialField) {
+        for i in 0..TRANSDUCER_COUNT {
+            self.transducer_outputs[i] += other.transducer_outputs[i];
+        }
+    }
+
+    fn get_outputs(&self) -> &[f32; TRANSDUCER_COUNT] {
+        &self.transducer_outputs
+    }
+}
+
+// Transducer configuration
+struct TransducerConfig {
+    positions: [(f32, f32); TRANSDUCER_COUNT],
+    gain_reductions_db: [f32; TRANSDUCER_COUNT],
+}
+
+impl TransducerConfig {
+    fn apply_gain_reduction(&self, field: &SpatialField) -> [f32; TRANSDUCER_COUNT] {
+        let mut output = [0.0; TRANSDUCER_COUNT];
+        for i in 0..TRANSDUCER_COUNT {
+            let gain_linear = 10.0_f32.powf(-self.gain_reductions_db[i] / 20.0);
+            output[i] = field.transducer_outputs[i] * gain_linear;
+        }
+        output
+    }
+}
+
+// Delay line for wave simulation
+#[derive(Clone, Copy)]
+struct DelayLine {
+    buffer: [f32; MAX_DELAY_SAMPLES],
+    write_index: f32,
+    size: usize,
+}
+
+impl DelayLine {
+    fn new(size: usize) -> Self {
+        Self {
+            buffer: [0.0; MAX_DELAY_SAMPLES],
+            write_index: 0.0,
+            size: size.min(MAX_DELAY_SAMPLES),
+        }
+    }
+
+    fn write_fractional(&mut self, sample: f32, delay_samples: f32) {
+        let delayed_write_pos = self.write_index - delay_samples;
+        let wrapped_pos = if delayed_write_pos < 0.0 {
+            delayed_write_pos + self.size as f32
+        } else {
+            delayed_write_pos % self.size as f32
+        };
+
+        // Linear interpolation for fractional delay
+        let index_floor = wrapped_pos.floor() as usize % self.size;
+        let index_ceil = (index_floor + 1) % self.size;
+        let frac = wrapped_pos.fract();
+
+        self.buffer[index_floor] += sample * (1.0 - frac);
+        self.buffer[index_ceil] += sample * frac;
+    }
+
+    fn read(&mut self) -> f32 {
+        let current_index = self.write_index as usize % self.size;
+        let output = self.buffer[current_index];
+        self.buffer[current_index] = 0.0; // Clear after reading
+
+        self.write_index = (self.write_index + 1.0) % self.size as f32;
+        output
+    }
+
+    fn clear(&mut self) {
+        self.buffer = [0.0; MAX_DELAY_SAMPLES];
+        self.write_index = 0.0;
+    }
+}
+
+// Generic stimulus pool manager
+struct StimulusPool<T: Stimulus, const N: usize> {
+    stimuli: [T; N],
+    active_mask: [bool; N],
+    next_search_index: usize,
+}
+
+impl<T: Stimulus + Default + Copy, const N: usize> StimulusPool<T, N> {
+    fn new() -> Self {
+        Self {
+            stimuli: [T::default(); N],
+            active_mask: [false; N],
+            next_search_index: 0,
+        }
+    }
+
+    fn allocate(&mut self) -> Option<&mut T> {
+        for i in 0..N {
+            let idx = (self.next_search_index + i) % N;
+            if !self.active_mask[idx] {
+                self.active_mask[idx] = true;
+                self.next_search_index = (idx + 1) % N;
+                self.stimuli[idx].reset();
+                return Some(&mut self.stimuli[idx]);
+            }
+        }
+        None // Pool exhausted
+    }
+
+    fn process_all(&mut self, context: &ProcessContext) -> Vec<SpatialField> {
+        let mut fields = Vec::new();
+        for i in 0..N {
+            if self.active_mask[i] {
+                if self.stimuli[i].should_deallocate() {
+                    self.active_mask[i] = false;
+                } else {
+                    fields.push(self.stimuli[i].process(context));
+                }
+            }
+        }
+        fields
+    }
+
+    fn handle_mpe_update(&mut self, event: &MpeUpdateEvent) {
+        for i in 0..N {
+            if self.active_mask[i] {
+                self.stimuli[i].mpe_update(event);
+            }
+        }
+    }
+}
+
+// Wave stimulus implementation
+#[derive(Clone, Copy)]
+struct DelayLineWave {
+    // Fixed-size delay lines for each transducer
+    delay_lines: [DelayLine; TRANSDUCER_COUNT],
+    delay_distances: [f32; TRANSDUCER_COUNT],
+
+    // Wave simulation state
+    source_position: (f32, f32),
+    source_velocity: (f32, f32),
+    wave_speed: f32,
+    frequency: f32,
+    phase: f32,
+
+    // MPE and envelope
+    envelope: AdsrEnvelope,
+    mpe_state: MpeState,
+    is_active: bool,
+
+    // MPE parameter mappings
+    timbre_to_vertical: ParameterMapping,
+    pitch_bend_to_lateral: ParameterMapping,
+    pressure_to_amplitude: ParameterMapping,
+}
+
+impl Default for DelayLineWave {
+    fn default() -> Self {
+        let max_delay_samples = Self::calculate_max_delay_samples();
+
+        Self {
+            delay_lines: [DelayLine::new(max_delay_samples); TRANSDUCER_COUNT],
+            delay_distances: [0.0; TRANSDUCER_COUNT],
+            source_position: (0.0, 0.0),
+            source_velocity: (0.0, 0.0),
+            wave_speed: 100.0, // m/s default
+            frequency: 40.0,   // Hz default
+            phase: 0.0,
+            envelope: AdsrEnvelope::default(),
+            mpe_state: MpeState::default(),
+            is_active: false,
+            timbre_to_vertical: ParameterMapping::new(-0.5, 0.5), // ±0.5m
+            pitch_bend_to_lateral: ParameterMapping::new(-0.5, 0.5),
+            pressure_to_amplitude: ParameterMapping::new(0.0, 1.0),
+        }
+    }
+}
+
+impl DelayLineWave {
+    fn calculate_max_delay_samples() -> usize {
+        // Conservative: 2m max distance, 20 m/s min wave speed, 48kHz sample rate
+        let max_distance = 2.0; // meters
+        let min_wave_speed = 20.0; // m/s
+        let sample_rate = 48000.0; // Hz
+
+        ((max_distance / min_wave_speed) * sample_rate).ceil() as usize
+    }
+
+    fn update_delay_distances(&mut self, transducer_positions: &[(f32, f32); TRANSDUCER_COUNT]) {
+        for (i, &transducer_pos) in transducer_positions.iter().enumerate() {
+            let dx = transducer_pos.0 - self.source_position.0;
+            let dy = transducer_pos.1 - self.source_position.1;
+            self.delay_distances[i] = (dx * dx + dy * dy).sqrt();
+        }
+    }
+
+    fn update_position_from_mpe(&mut self) {
+        let y_offset = self.timbre_to_vertical.map(self.mpe_state.timbre);
+        let x_offset = self.pitch_bend_to_lateral.map(self.mpe_state.pitch_bend);
+
+        self.source_position = (x_offset, y_offset);
+    }
+
+    fn calculate_doppler_factor(&self, transducer_index: usize) -> f32 {
+        // Simplified Doppler calculation
+        // TODO: Implement proper Doppler based on source velocity and receiver position
+        1.0 // Placeholder
+    }
+}
+
+impl Stimulus for DelayLineWave {
+    fn process(&mut self, context: &ProcessContext) -> SpatialField {
+        if !self.is_active {
+            return SpatialField::zero();
+        }
+
+        // Update position from MPE
+        self.update_position_from_mpe();
+
+        // Update delay distances
+        self.update_delay_distances(&context.transducer_config.positions);
+
+        // Generate source signal with envelope
+        let envelope_amp = self.envelope.process(context.delta_time);
+        let mpe_amp = self.pressure_to_amplitude.map(self.mpe_state.pressure);
+        let source_signal = (self.phase * 2.0 * std::f32::consts::PI).sin()
+                          * envelope_amp * mpe_amp;
+
+        // Process through delay lines with Doppler
+        let mut field = SpatialField::new();
+        for i in 0..TRANSDUCER_COUNT {
+            let delay_time = self.delay_distances[i] / self.wave_speed;
+            let doppler_factor = self.calculate_doppler_factor(i);
+
+            // Write to delay line with Doppler-shifted frequency
+            self.delay_lines[i].write_fractional(source_signal, delay_time * doppler_factor);
+
+            // Read delayed/attenuated signal
+            let distance_attenuation = 1.0 / (1.0 + self.delay_distances[i]);
+            let output = self.delay_lines[i].read() * distance_attenuation;
+
+            field.set_transducer(i, output);
+        }
+
+        // Update phase
+        self.phase += self.frequency * context.delta_time;
+        if self.phase >= 1.0 { self.phase -= 1.0; }
+
+        field
+    }
+
+    fn is_active(&self) -> bool {
+        self.is_active && self.envelope.is_active()
+    }
+
+    fn should_deallocate(&self) -> bool {
+        !self.envelope.is_active()
+    }
+
+    fn note_on(&mut self, event: &MpeNoteEvent) {
+        self.mpe_state.note = event.note;
+        self.mpe_state.velocity = event.velocity as f32 / 127.0;
+        self.mpe_state.pressure = event.pressure;
+        self.mpe_state.pitch_bend = event.pitch_bend;
+        self.mpe_state.timbre = event.timbre;
+
+        // Convert MIDI note to frequency
+        self.frequency = 440.0 * 2.0_f32.powf((event.note as f32 - 69.0) / 12.0);
+
+        self.envelope.trigger();
+        self.is_active = true;
+    }
+
+    fn note_off(&mut self, _event: &MpeNoteEvent) {
+        self.envelope.release();
+    }
+
+    fn reset(&mut self) {
+        for delay_line in &mut self.delay_lines {
+            delay_line.clear();
+        }
+        self.phase = 0.0;
+        self.envelope.reset();
+        self.is_active = false;
+        self.mpe_state = MpeState::default();
+    }
+
+    fn mpe_update(&mut self, event: &MpeUpdateEvent) {
+        if let Some(pressure) = event.pressure {
+            self.mpe_state.pressure = pressure;
+        }
+        if let Some(pitch_bend) = event.pitch_bend {
+            self.mpe_state.pitch_bend = pitch_bend;
+        }
+        if let Some(timbre) = event.timbre {
+            self.mpe_state.timbre = timbre;
+        }
+    }
+}
+
+// Stub stimulus types
+#[derive(Clone, Copy, Default)]
+struct SpatialSweep {
+    is_active: bool,
+    envelope: AdsrEnvelope,
+    mpe_state: MpeState,
+    // TODO: Path definition, sweep parameters
+}
+
+impl Stimulus for SpatialSweep {
+    fn process(&mut self, _context: &ProcessContext) -> SpatialField {
+        // TODO: Implement spatial sweep logic
+        SpatialField::zero()
+    }
+
+    fn is_active(&self) -> bool { self.is_active }
+    fn should_deallocate(&self) -> bool { !self.envelope.is_active() }
+    fn note_on(&mut self, _event: &MpeNoteEvent) { self.is_active = true; }
+    fn note_off(&mut self, _event: &MpeNoteEvent) { self.envelope.release(); }
+    fn reset(&mut self) { self.is_active = false; self.envelope.reset(); }
+    fn mpe_update(&mut self, _event: &MpeUpdateEvent) {}
+}
+
+#[derive(Clone, Copy, Default)]
+struct ChaoticNetwork {
+    is_active: bool,
+    envelope: AdsrEnvelope,
+    mpe_state: MpeState,
+    // TODO: Oscillator network, coupling parameters
+}
+
+impl Stimulus for ChaoticNetwork {
+    fn process(&mut self, _context: &ProcessContext) -> SpatialField {
+        // TODO: Implement chaotic network logic
+        SpatialField::zero()
+    }
+
+    fn is_active(&self) -> bool { self.is_active }
+    fn should_deallocate(&self) -> bool { !self.envelope.is_active() }
+    fn note_on(&mut self, _event: &MpeNoteEvent) { self.is_active = true; }
+    fn note_off(&mut self, _event: &MpeNoteEvent) { self.envelope.release(); }
+    fn reset(&mut self) { self.is_active = false; self.envelope.reset(); }
+    fn mpe_update(&mut self, _event: &MpeUpdateEvent) {}
+}
+
+// Main stimulus engine
+struct StimulusEngine {
+    // Static pools for each type
+    wave_pool: StimulusPool<DelayLineWave, MAX_WAVE_STIMULI>,
+    sweep_pool: StimulusPool<SpatialSweep, MAX_SWEEP_STIMULI>,
+    chaotic_pool: StimulusPool<ChaoticNetwork, MAX_CHAOTIC_STIMULI>,
+
+    transducer_config: TransducerConfig,
+}
+
+impl StimulusEngine {
+    fn new(transducer_config: TransducerConfig) -> Self {
+        Self {
+            wave_pool: StimulusPool::new(),
+            sweep_pool: StimulusPool::new(),
+            chaotic_pool: StimulusPool::new(),
+            transducer_config,
+        }
+    }
+
+    fn allocate_stimulus(&mut self, stimulus_type: StimulusType, mpe_event: &MpeNoteEvent) -> Result<(), AllocError> {
+        match stimulus_type {
+            StimulusType::DelayLineWave => {
+                if let Some(stimulus) = self.wave_pool.allocate() {
+                    stimulus.note_on(mpe_event);
+                    Ok(())
+                } else {
+                    log::error!("Wave stimulus pool exhausted");
+                    Err(AllocError::PoolExhausted)
+                }
+            }
+            StimulusType::SpatialSweep => {
+                if let Some(stimulus) = self.sweep_pool.allocate() {
+                    stimulus.note_on(mpe_event);
+                    Ok(())
+                } else {
+                    log::error!("Sweep stimulus pool exhausted");
+                    Err(AllocError::PoolExhausted)
+                }
+            }
+            StimulusType::ChaoticNetwork => {
+                if let Some(stimulus) = self.chaotic_pool.allocate() {
+                    stimulus.note_on(mpe_event);
+                    Ok(())
+                } else {
+                    log::error!("Chaotic stimulus pool exhausted");
+                    Err(AllocError::PoolExhausted)
+                }
+            }
+        }
+    }
+
+    fn handle_note_on(&mut self, event: MpeNoteEvent) -> Result<(), AllocError> {
+        if let Some(stimulus_type) = StimulusType::from_velocity(event.velocity) {
+            self.allocate_stimulus(stimulus_type, &event)
+        } else {
+            log::warn!("Invalid velocity for stimulus selection: {}", event.velocity);
+            Ok(()) // Not an error, just ignore
+        }
+    }
+
+    fn handle_note_off(&mut self, event: MpeNoteEvent) {
+        // Send note_off to all active stimuli on this channel
+        // TODO: Implement channel-specific note tracking
+    }
+
+    fn handle_mpe_update(&mut self, event: MpeUpdateEvent) {
+        self.wave_pool.handle_mpe_update(&event);
+        self.sweep_pool.handle_mpe_update(&event);
+        self.chaotic_pool.handle_mpe_update(&event);
+    }
+
+    fn process_frame(&mut self, context: &ProcessContext) -> [f32; TRANSDUCER_COUNT] {
+        let mut combined_field = SpatialField::new();
+
+        // Process all active stimuli from all pools
+        let wave_fields = self.wave_pool.process_all(context);
+        let sweep_fields = self.sweep_pool.process_all(context);
+        let chaotic_fields = self.chaotic_pool.process_all(context);
+
+        // Superimpose all fields
+        for field in wave_fields.into_iter()
+            .chain(sweep_fields.into_iter())
+            .chain(chaotic_fields.into_iter()) {
+            combined_field.add(&field);
+        }
+
+        // Apply gain reduction and return final output
+        self.transducer_config.apply_gain_reduction(&combined_field)
+    }
+}
