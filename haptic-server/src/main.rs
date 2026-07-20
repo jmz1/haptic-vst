@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -63,7 +63,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // has its own ring, so the watcher feeds both
     let (ipc_layout_producer, ipc_layout_consumer) = rtrb::RingBuffer::new(4);
 
+    // Device output channel count, published by the audio loop once the
+    // device is opened, broadcast to clients by the IPC thread
+    let device_channels = Arc::new(AtomicU16::new(0));
+
     // Start IPC listener thread
+    let device_channels_for_ipc = device_channels.clone();
     let ipc_handle = {
         let running = running.clone();
         thread::spawn(move || {
@@ -74,6 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 voice_consumer,
                 layout,
                 ipc_layout_consumer,
+                device_channels_for_ipc,
             ) {
                 eprintln!("IPC error: {}", e);
             }
@@ -96,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // Run audio loop on main thread (highest priority)
-    if let Err(e) = audio::run_audio_loop(engine, running.clone(), test_tone, levels_producer) {
+    if let Err(e) = audio::run_audio_loop(engine, running.clone(), test_tone, levels_producer, device_channels) {
         eprintln!("Audio error: {}", e);
     }
 

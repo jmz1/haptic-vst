@@ -24,13 +24,17 @@ pub enum StimulusType {
     Standing,
 }
 
-/// Engine parameters settable from the plugin (DAW-automatable).
+/// Engine parameters settable from clients (plugin or viewer).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub enum Parameter {
     /// Wave propagation speed in m/s.
     WaveSpeed(f32),
     /// Which stimulus pool new notes are allocated from.
     StimulusType(StimulusType),
+    /// Connect physical device output `output` to logical transducer
+    /// channel `source` — lets a stereo test device audition any of the
+    /// 32 logical channels. Default routing is identity.
+    MonitorRoute { output: u8, source: u8 },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -75,6 +79,13 @@ pub enum ServerStatus {
         positions: [(f32, f32); 32],
         gains: [f32; 32],
         table_m: (f32, f32),
+    },
+    /// Physical-output → logical-channel monitor routing currently in
+    /// effect, plus how many output channels the audio device has.
+    /// Sent on connect and whenever the routing changes.
+    MonitorRouting {
+        device_channels: u16,
+        routes: [u8; 32],
     },
     /// Snapshot of the most recently started active delay-line (wave)
     /// voice, for phase visualisation. `delay_samples` are the actual

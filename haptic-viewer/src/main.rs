@@ -1,25 +1,33 @@
-//! Standalone phase visualiser for the haptic server.
+//! Standalone phase visualiser and test console for the haptic server.
 //!
-//! Connects to the server's Unix socket as a read-only status client and
-//! renders the configured transducer layout as coloured circles. In
-//! per-note mode each circle's OKLCH hue encodes the phase of the most
-//! recent delay-line voice at that transducer, relative to the source
-//! oscillator: zero phase difference maps to blue, and phase lag rotates
-//! the hue around the wheel. Lightness/chroma follow local amplitude, with
-//! chroma clamped into the sRGB gamut so the sweep never clips.
+//! Connects to the server's Unix socket and renders the configured
+//! transducer layout as coloured circles. In per-note mode each circle's
+//! OKLCH hue encodes the phase of the most recent delay-line voice at that
+//! transducer, relative to the source oscillator: zero phase difference
+//! maps to blue, and phase lag rotates the hue around the wheel.
+//! Lightness/chroma follow local amplitude, with chroma clamped into the
+//! sRGB gamut so the sweep never clips.
+//!
+//! The viewer is also a test console: it can start/stop a test note, set
+//! its parameters, move the source by dragging on the table (or orbit it
+//! automatically), and route any logical channel to the audio device's
+//! physical outputs by clicking circles (left-click → output 1/L,
+//! right-click → output 2/R).
 //!
 //! Rendering repaints continuously under vsync, so a 120 Hz display
 //! renders at 120 fps (see the on-screen fps counter).
 
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use haptic_protocol::{FrameDecoder, ServerStatus, SOCKET_PATH};
+use haptic_protocol::{
+    encode_frame, FrameDecoder, HapticCommand, MpeData, Parameter, ServerStatus, SOCKET_PATH,
+};
 use parking_lot::Mutex;
 
 const TRANSDUCERS: usize = 32;
@@ -30,6 +38,13 @@ const ZERO_PHASE_HUE_DEG: f32 = 264.0;
 /// A voice older than this is considered ended (the server stops sending
 /// snapshots when nothing is active).
 const VOICE_STALE: Duration = Duration::from_millis(300);
+
+/// MIDI channel used for the viewer's test note (avoids the low channels
+/// a DAW/MPE zone will typically use first).
+const TEST_CHANNEL: u8 = 15;
+
+/// Minimum interval between outgoing MPE position updates.
+const MPE_SEND_INTERVAL: Duration = Duration::from_millis(8);
 
 // ---------------------------------------------------------------------------
 // Shared state between the socket reader thread and the UI thread
@@ -53,11 +68,20 @@ struct VoiceView {
     delay_samples: [f32; TRANSDUCERS],
 }
 
+#[derive(Clone, Copy)]
+struct RoutingView {
+    device_channels: u16,
+    routes: [u8; TRANSDUCERS],
+}
+
 #[derive(Default)]
 struct Shared {
     connected: bool,
+    /// Writable clone of the socket for sending commands from the UI.
+    writer: Option<UnixStream>,
     layout: Option<LayoutView>,
     voice: Option<(VoiceView, Instant)>,
+    routing: Option<RoutingView>,
     voice_rate: RateCounter,
 }
 
@@ -85,6 +109,21 @@ impl RateCounter {
     }
 }
 
+/// Send a command over the shared writer; on failure the connection is
+/// considered dead (the reader thread will re-establish it).
+fn send_command(shared: &Mutex<Shared>, cmd: &HapticCommand) {
+    let mut frame = Vec::with_capacity(64);
+    if encode_frame(cmd, &mut frame).is_err() {
+        return;
+    }
+    let mut state = shared.lock();
+    if let Some(writer) = state.writer.as_mut() {
+        if writer.write_all(&frame).is_err() {
+            state.writer = None;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Socket reader
 // ---------------------------------------------------------------------------
@@ -95,7 +134,11 @@ fn reader_thread(shared: Arc<Mutex<Shared>>) {
             thread::sleep(Duration::from_millis(500));
             continue;
         };
-        shared.lock().connected = true;
+        {
+            let mut state = shared.lock();
+            state.connected = true;
+            state.writer = stream.try_clone().ok();
+        }
 
         let mut decoder = FrameDecoder::new();
         let mut buffer = [0u8; 8192];
@@ -119,6 +162,7 @@ fn reader_thread(shared: Arc<Mutex<Shared>>) {
 
         let mut state = shared.lock();
         state.connected = false;
+        state.writer = None;
         state.voice = None;
         drop(state);
         thread::sleep(Duration::from_millis(500));
@@ -129,6 +173,9 @@ fn apply_message(shared: &Mutex<Shared>, msg: ServerStatus) {
     match msg {
         ServerStatus::Layout { positions, gains, table_m } => {
             shared.lock().layout = Some(LayoutView { positions, gains, table_m });
+        }
+        ServerStatus::MonitorRouting { device_channels, routes } => {
+            shared.lock().routing = Some(RoutingView { device_channels, routes });
         }
         ServerStatus::VoiceState {
             note,
@@ -206,18 +253,108 @@ fn oklch_to_color(l: f32, c: f32, h_deg: f32) -> egui::Color32 {
 }
 
 // ---------------------------------------------------------------------------
+// Test stimulus state
+// ---------------------------------------------------------------------------
+
+struct TestControls {
+    playing: Option<u8>, // note currently sounding
+    note: u8,
+    velocity: u8,
+    wave_speed: f32,
+    orbit: bool,
+    orbit_period_s: f32,
+    orbit_phase: f32,
+    /// Desired source position in metres.
+    source: (f32, f32),
+    last_mpe_sent: Instant,
+}
+
+impl Default for TestControls {
+    fn default() -> Self {
+        Self {
+            playing: None,
+            note: 60,
+            velocity: 100,
+            wave_speed: 20.0,
+            orbit: false,
+            orbit_period_s: 6.0,
+            orbit_phase: 0.0,
+            source: (0.5, 1.0),
+            last_mpe_sent: Instant::now(),
+        }
+    }
+}
+
+impl TestControls {
+    fn mpe(&self, table: (f32, f32)) -> MpeData {
+        MpeData {
+            pressure: 1.0,
+            pitch_bend: (2.0 * self.source.0 / table.0.max(1e-6) - 1.0).clamp(-1.0, 1.0),
+            timbre: (self.source.1 / table.1.max(1e-6)).clamp(0.0, 1.0),
+        }
+    }
+
+    fn start(&mut self, shared: &Mutex<Shared>, table: (f32, f32)) {
+        send_command(shared, &HapticCommand::SetParameter {
+            timestamp_us: 0,
+            parameter: Parameter::WaveSpeed(self.wave_speed),
+        });
+        send_command(shared, &HapticCommand::NoteOn {
+            timestamp_us: 0,
+            note: self.note,
+            velocity: self.velocity,
+            channel: TEST_CHANNEL,
+            mpe: self.mpe(table),
+        });
+        self.playing = Some(self.note);
+    }
+
+    fn stop(&mut self, shared: &Mutex<Shared>) {
+        if let Some(note) = self.playing.take() {
+            send_command(shared, &HapticCommand::NoteOff {
+                timestamp_us: 0,
+                note,
+                channel: TEST_CHANNEL,
+            });
+        }
+    }
+
+    fn send_position(&mut self, shared: &Mutex<Shared>, table: (f32, f32)) {
+        if self.playing.is_some() && self.last_mpe_sent.elapsed() >= MPE_SEND_INTERVAL {
+            self.last_mpe_sent = Instant::now();
+            send_command(shared, &HapticCommand::MpeUpdate {
+                timestamp_us: 0,
+                channel: TEST_CHANNEL,
+                mpe: self.mpe(table),
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
 struct ViewerApp {
     shared: Arc<Mutex<Shared>>,
     fps: RateCounter,
+    test: TestControls,
+    /// Parameter values in effect for the sounding note, to retrigger when
+    /// the user lands on new slider values.
+    sounding_params: (u8, u8, f32),
 }
 
 const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
 fn note_name(note: u8) -> String {
     format!("{}{}", NOTE_NAMES[note as usize % 12], note as i16 / 12 - 1)
+}
+
+/// What the table area reported this frame.
+#[derive(Default)]
+struct TableInteraction {
+    route_to_output: Option<(u8, usize)>, // (physical output, logical channel)
+    drag_world: Option<(f32, f32)>,
 }
 
 impl eframe::App for ViewerApp {
@@ -228,12 +365,13 @@ impl eframe::App for ViewerApp {
         self.fps.tick();
         let fps = self.fps.rate();
 
-        let (connected, layout, voice, voice_rate) = {
+        let (connected, layout, voice, routing, voice_rate) = {
             let mut state = self.shared.lock();
             let rate = state.voice_rate.rate();
-            (state.connected, state.layout, state.voice, rate)
+            (state.connected, state.layout, state.voice, state.routing, rate)
         };
         let fresh_voice = voice.and_then(|(v, at)| (at.elapsed() < VOICE_STALE).then_some(v));
+        let table = layout.map(|l| l.table_m).unwrap_or((1.0, 2.0));
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -241,6 +379,10 @@ impl eframe::App for ViewerApp {
                     ui.colored_label(egui::Color32::from_rgb(64, 200, 120), "● connected");
                 } else {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), "● waiting for server");
+                }
+                if let Some(r) = routing {
+                    ui.separator();
+                    ui.label(format!("device: {} ch", r.device_channels));
                 }
                 ui.separator();
                 match fresh_voice {
@@ -259,6 +401,12 @@ impl eframe::App for ViewerApp {
             });
         });
 
+        egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
+            ui.add_enabled_ui(connected, |ui| self.test_controls_ui(ui, table));
+            ui.label("drag on table: move source   ·   left-click a cell: monitor on output 1 (L)   ·   right-click: output 2 (R)");
+        });
+
+        let mut interaction = TableInteraction::default();
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(layout) = layout else {
                 ui.centered_and_justified(|ui| {
@@ -266,17 +414,103 @@ impl eframe::App for ViewerApp {
                 });
                 return;
             };
-            draw_table(ui, &layout, fresh_voice.as_ref());
+            interaction = draw_table(ui, &layout, fresh_voice.as_ref(), routing.as_ref());
+        });
+
+        // Apply table interactions
+        if let Some((output, source)) = interaction.route_to_output {
+            send_command(&self.shared, &HapticCommand::SetParameter {
+                timestamp_us: 0,
+                parameter: Parameter::MonitorRoute { output, source: source as u8 },
+            });
+        }
+        if let Some(world) = interaction.drag_world {
+            self.test.orbit = false;
+            self.test.source = (
+                world.0.clamp(0.0, table.0),
+                world.1.clamp(0.0, table.1),
+            );
+            self.test.send_position(&self.shared, table);
+        }
+
+        // Orbit: circle the source around the table centre
+        if self.test.orbit && self.test.playing.is_some() {
+            let dt = ctx.input(|i| i.stable_dt).min(0.1);
+            self.test.orbit_phase +=
+                std::f32::consts::TAU * dt / self.test.orbit_period_s.max(0.5);
+            let radius = 0.35 * table.0.min(table.1);
+            self.test.source = (
+                0.5 * table.0 + radius * self.test.orbit_phase.cos(),
+                0.5 * table.1 + radius * self.test.orbit_phase.sin(),
+            );
+            self.test.send_position(&self.shared, table);
+        }
+
+        // Retrigger when slider values settle on something new mid-note
+        let desired = (self.test.note, self.test.velocity, self.test.wave_speed);
+        let pointer_down = ctx.input(|i| i.pointer.any_down());
+        if self.test.playing.is_some() && desired != self.sounding_params && !pointer_down {
+            self.test.stop(&self.shared);
+            self.test.start(&self.shared, table);
+            self.sounding_params = desired;
+        }
+        if !connected {
+            self.test.playing = None;
+        }
+    }
+}
+
+impl ViewerApp {
+    fn test_controls_ui(&mut self, ui: &mut egui::Ui, table: (f32, f32)) {
+        ui.horizontal(|ui| {
+            let playing = self.test.playing.is_some();
+            let button = if playing { "■ stop test note" } else { "▶ start test note" };
+            if ui.button(button).clicked() {
+                if playing {
+                    self.test.stop(&self.shared);
+                } else {
+                    self.test.start(&self.shared, table);
+                    self.sounding_params =
+                        (self.test.note, self.test.velocity, self.test.wave_speed);
+                }
+            }
+            ui.separator();
+            ui.label("note");
+            ui.add(egui::Slider::new(&mut self.test.note, 24..=96).custom_formatter(
+                |v, _| note_name(v as u8),
+            ));
+            ui.label("velocity");
+            ui.add(egui::Slider::new(&mut self.test.velocity, 1..=127));
+            ui.label("wave speed");
+            ui.add(
+                egui::Slider::new(&mut self.test.wave_speed, 20.0..=500.0)
+                    .logarithmic(true)
+                    .suffix(" m/s"),
+            );
+            ui.separator();
+            ui.checkbox(&mut self.test.orbit, "orbit");
+            ui.add(
+                egui::Slider::new(&mut self.test.orbit_period_s, 1.0..=30.0)
+                    .logarithmic(true)
+                    .suffix(" s"),
+            );
         });
     }
 }
 
-fn draw_table(ui: &mut egui::Ui, layout: &LayoutView, voice: Option<&VoiceView>) {
-    let avail = ui.available_rect_before_wrap().shrink(12.0);
-    let painter = ui.painter_at(ui.available_rect_before_wrap());
+fn draw_table(
+    ui: &mut egui::Ui,
+    layout: &LayoutView,
+    voice: Option<&VoiceView>,
+    routing: Option<&RoutingView>,
+) -> TableInteraction {
+    let mut interaction = TableInteraction::default();
+    let size = ui.available_size();
+    let (response, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
+    let avail = response.rect.shrink(12.0);
 
     // World bounds: the table extent, padded so overridden transducers and
-    // the MPE source excursion stay visible
+    // the source marker stay visible
     let pad = 0.10;
     let (mut min_x, mut min_y) = (-pad, -pad);
     let (mut max_x, mut max_y) = (layout.table_m.0 + pad, layout.table_m.1 + pad);
@@ -295,6 +529,9 @@ fn draw_table(ui: &mut egui::Ui, layout: &LayoutView, voice: Option<&VoiceView>)
     );
     let to_screen =
         |x: f32, y: f32| egui::pos2(origin.x + (x - min_x) * scale, origin.y + (y - min_y) * scale);
+    let to_world = |p: egui::Pos2| {
+        ((p.x - origin.x) / scale + min_x, (p.y - origin.y) / scale + min_y)
+    };
 
     // Table outline
     let table_rect = egui::Rect::from_two_pos(
@@ -310,6 +547,17 @@ fn draw_table(ui: &mut egui::Ui, layout: &LayoutView, voice: Option<&VoiceView>)
 
     // Transducer circles
     let radius = (0.09 * scale).clamp(5.0, 40.0);
+    let pointer = response.interact_pointer_pos();
+    let circle_under = |p: egui::Pos2| {
+        layout
+            .positions
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y))| (i, to_screen(x, y)))
+            .find(|(_, c)| c.distance(p) <= radius + 2.0)
+            .map(|(i, _)| i)
+    };
+
     for (i, &(x, y)) in layout.positions.iter().enumerate() {
         let center = to_screen(x, y);
         let color = match voice {
@@ -345,6 +593,29 @@ fn draw_table(ui: &mut egui::Ui, layout: &LayoutView, voice: Option<&VoiceView>)
         }
     }
 
+    // Monitor-routing badges: which physical output plays which circle
+    if let Some(r) = routing {
+        let outputs = (r.device_channels as usize).min(TRANSDUCERS).min(4);
+        for output in 0..outputs {
+            let source = r.routes[output] as usize % TRANSDUCERS;
+            let (x, y) = layout.positions[source];
+            let center = to_screen(x, y) + egui::vec2(radius * 0.9, -radius * 0.9);
+            let label = match output {
+                0 => "L".to_string(),
+                1 => "R".to_string(),
+                n => format!("{}", n + 1),
+            };
+            painter.circle_filled(center, 7.0, egui::Color32::from_gray(235));
+            painter.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(10.0),
+                egui::Color32::BLACK,
+            );
+        }
+    }
+
     // MPE-driven source position
     if let Some(v) = voice {
         let src = to_screen(v.source_pos.0, v.source_pos.1);
@@ -353,6 +624,26 @@ fn draw_table(ui: &mut egui::Ui, layout: &LayoutView, voice: Option<&VoiceView>)
         painter.line_segment([src - egui::vec2(arm, 0.0), src + egui::vec2(arm, 0.0)], stroke);
         painter.line_segment([src - egui::vec2(0.0, arm), src + egui::vec2(0.0, arm)], stroke);
     }
+
+    // Interactions: clicks on circles select monitor routing; drags move
+    // the test source
+    if let Some(p) = pointer {
+        if response.clicked() {
+            if let Some(i) = circle_under(p) {
+                interaction.route_to_output = Some((0, i));
+            }
+        }
+        if response.secondary_clicked() {
+            if let Some(i) = circle_under(p) {
+                interaction.route_to_output = Some((1, i));
+            }
+        }
+        if response.dragged_by(egui::PointerButton::Primary) {
+            interaction.drag_world = Some(to_world(p));
+        }
+    }
+
+    interaction
 }
 
 fn main() -> eframe::Result<()> {
@@ -364,7 +655,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([560.0, 980.0])
+            .with_inner_size([620.0, 1020.0])
             .with_title("Haptic Viewer"),
         vsync: true,
         multisampling: 4,
@@ -373,6 +664,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Haptic Viewer",
         options,
-        Box::new(|_cc| Ok(Box::new(ViewerApp { shared, fps: RateCounter::default() }))),
+        Box::new(|_cc| {
+            Ok(Box::new(ViewerApp {
+                shared,
+                fps: RateCounter::default(),
+                test: TestControls::default(),
+                sounding_params: (60, 100, 20.0),
+            }))
+        }),
     )
 }

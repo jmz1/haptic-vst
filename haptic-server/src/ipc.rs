@@ -1,12 +1,12 @@
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::io::Read;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::thread;
 use std::time::Duration;
 use std::io::Write;
 use std::time::Instant;
-use haptic_protocol::{encode_frame, FrameDecoder, FrameError, HapticCommand, ServerStatus, SOCKET_PATH};
+use haptic_protocol::{encode_frame, FrameDecoder, FrameError, HapticCommand, Parameter, ServerStatus, SOCKET_PATH};
 use crate::config::TransducerLayout;
 use crate::engine::VoiceSnapshot;
 
@@ -30,6 +30,7 @@ pub fn listen_loop(
     mut voice_consumer: rtrb::Consumer<VoiceSnapshot>,
     mut layout: TransducerLayout,
     mut layout_consumer: rtrb::Consumer<TransducerLayout>,
+    device_channels: Arc<AtomicU16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Remove existing socket file if it exists
     let _ = std::fs::remove_file(SOCKET_PATH);
@@ -45,6 +46,12 @@ pub fn listen_loop(
     let mut last_voice_broadcast = Instant::now();
     let mut status_frame = Vec::with_capacity(512);
 
+    // Mirror of the engine's monitor routing (commands pass through this
+    // thread, so a snoop keeps this authoritative for clients)
+    let mut routes: [u8; 32] = std::array::from_fn(|i| i as u8);
+    let mut routing_dirty = false;
+    let mut last_device_channels = 0u16;
+
     while running.load(Ordering::Relaxed) {
         // Accept new connections
         match listener.accept() {
@@ -54,15 +61,22 @@ pub fn listen_loop(
                     eprintln!("Failed to set stream nonblocking: {}", e);
                     continue;
                 }
-                // Greet each client with the resolved layout so viewers
-                // mirror the running config without reading haptic.toml
-                if encode_frame(&layout_status(&layout), &mut status_frame).is_ok() {
-                    if let Err(e) = stream.write_all(&status_frame) {
-                        eprintln!("Dropping client on layout write failure: {}", e);
-                        continue;
+                // Greet each client with the resolved layout and current
+                // monitor routing so viewers mirror the running state
+                let routing = routing_status(&routes, device_channels.load(Ordering::Relaxed));
+                let mut greeted = true;
+                for status in [layout_status(&layout), routing] {
+                    if encode_frame(&status, &mut status_frame).is_ok() {
+                        if let Err(e) = stream.write_all(&status_frame) {
+                            eprintln!("Dropping client on greeting write failure: {}", e);
+                            greeted = false;
+                            break;
+                        }
                     }
                 }
-                clients.push(Client { stream, decoder: FrameDecoder::new() });
+                if greeted {
+                    clients.push(Client { stream, decoder: FrameDecoder::new() });
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // No new connections, continue
@@ -74,8 +88,21 @@ pub fn listen_loop(
 
         // Handle existing clients
         clients.retain_mut(|client| {
-            handle_client(client, &mut command_producer)
+            handle_client(client, &mut command_producer, &mut routes, &mut routing_dirty)
         });
+
+        // Broadcast routing when it changes or once the device is known
+        let dc = device_channels.load(Ordering::Relaxed);
+        if dc != last_device_channels {
+            last_device_channels = dc;
+            routing_dirty = true;
+        }
+        if routing_dirty {
+            routing_dirty = false;
+            if encode_frame(&routing_status(&routes, dc), &mut status_frame).is_ok() {
+                broadcast(&mut clients, &status_frame);
+            }
+        }
 
         // Hot reload: adopt and rebroadcast the layout to every client
         while let Ok(new_layout) = layout_consumer.pop() {
@@ -151,6 +178,10 @@ fn layout_status(layout: &TransducerLayout) -> ServerStatus {
     }
 }
 
+fn routing_status(routes: &[u8; 32], device_channels: u16) -> ServerStatus {
+    ServerStatus::MonitorRouting { device_channels, routes: *routes }
+}
+
 /// Write a frame to every client, dropping clients whose stream fails
 /// (a partial write would corrupt their framing anyway).
 fn broadcast(clients: &mut Vec<Client>, frame: &[u8]) {
@@ -165,7 +196,12 @@ fn broadcast(clients: &mut Vec<Client>, frame: &[u8]) {
 
 /// Drain all available bytes from the client and dispatch every complete
 /// frame. Returns `false` when the connection should be dropped.
-fn handle_client(client: &mut Client, command_producer: &mut rtrb::Producer<crate::engine::EngineCommand>) -> bool {
+fn handle_client(
+    client: &mut Client,
+    command_producer: &mut rtrb::Producer<crate::engine::EngineCommand>,
+    routes: &mut [u8; 32],
+    routing_dirty: &mut bool,
+) -> bool {
     let mut buffer = [0u8; 1024];
 
     loop {
@@ -188,6 +224,17 @@ fn handle_client(client: &mut Client, command_producer: &mut rtrb::Producer<crat
     loop {
         match client.decoder.next_frame::<HapticCommand>() {
             Ok(Some(command)) => {
+                // Track routing changes for rebroadcast to all clients
+                if let HapticCommand::SetParameter {
+                    parameter: Parameter::MonitorRoute { output, source },
+                    ..
+                } = &command
+                {
+                    if (*output as usize) < routes.len() {
+                        routes[*output as usize] = (*source).min(31);
+                        *routing_dirty = true;
+                    }
+                }
                 if command_producer.push(command.into()).is_err() {
                     // Ring buffer full: the audio thread is not draining or
                     // the client is flooding; drop the command
@@ -227,7 +274,15 @@ mod tests {
         let listener = {
             let running = running.clone();
             thread::spawn(move || {
-                let _ = listen_loop(running, tx, levels_rx, voice_rx, TransducerLayout::default(), layout_rx);
+                let _ = listen_loop(
+                    running,
+                    tx,
+                    levels_rx,
+                    voice_rx,
+                    TransducerLayout::default(),
+                    layout_rx,
+                    Arc::new(AtomicU16::new(2)),
+                );
             })
         };
 

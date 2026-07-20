@@ -183,6 +183,9 @@ pub struct StimulusEngine {
     // Voice snapshots out to the IPC thread (drops when full)
     voice_producer: rtrb::Producer<VoiceSnapshot>,
 
+    // Physical output p plays logical channel monitor_routes[p]
+    monitor_routes: [u8; TRANSDUCER_COUNT],
+
     // Transducer configuration (hot-swappable via layout_queue)
     layout: TransducerLayout,
 }
@@ -191,6 +194,8 @@ pub struct ProcessContext<'a> {
     pub sample_rate: f32,
     pub dt: f32,
     pub transducer_positions: &'a [(f32, f32); TRANSDUCER_COUNT],
+    /// (width, length) of the table, for MPE -> source-position mapping.
+    pub table_m: (f32, f32),
 }
 
 // Commands from IPC thread
@@ -251,6 +256,7 @@ impl StimulusEngine {
             command_queue: consumer,
             layout_queue: layout_consumer,
             voice_producer,
+            monitor_routes: std::array::from_fn(|i| i as u8),
             layout,
         };
         (engine, producer, layout_producer, voice_consumer)
@@ -361,6 +367,12 @@ impl StimulusEngine {
                 Parameter::StimulusType(kind) => {
                     self.stimulus_type = kind;
                 }
+                Parameter::MonitorRoute { output, source } => {
+                    if (output as usize) < TRANSDUCER_COUNT {
+                        self.monitor_routes[output as usize] =
+                            source.min(TRANSDUCER_COUNT as u8 - 1);
+                    }
+                }
             },
             EngineCommand::Panic => {
                 self.wave_pool.reset_all();
@@ -415,18 +427,24 @@ impl StimulusEngine {
             sample_rate,
             dt: 1.0 / sample_rate,
             transducer_positions: &positions,
+            table_m: self.layout.table_m,
         };
 
         let mut output = [0.0f32; TRANSDUCER_COUNT];
         let mut sum_squares = [0.0f32; TRANSDUCER_COUNT];
         let frames = data.len() / channels;
+        let routes = self.monitor_routes;
         for frame in data[..frames * channels].chunks_exact_mut(channels) {
             self.render_frame(&context, &mut output);
             for (sum, &sample) in sum_squares.iter_mut().zip(output.iter()) {
                 *sum += sample * sample;
             }
+            // Physical outputs play their routed logical channel (identity
+            // by default; a stereo device can audition any of the 32)
             let n = channels.min(TRANSDUCER_COUNT);
-            frame[..n].copy_from_slice(&output[..n]);
+            for (p, sample) in frame[..n].iter_mut().enumerate() {
+                *sample = output[routes[p] as usize];
+            }
             for sample in frame[n..].iter_mut() {
                 *sample = 0.0;
             }
@@ -490,6 +508,7 @@ impl StimulusEngine {
             sample_rate,
             dt: 1.0 / sample_rate,
             transducer_positions: &positions,
+            table_m: self.layout.table_m,
         };
         self.render_frame(&context, output);
         self.reap_finished_voices();
@@ -625,9 +644,12 @@ impl Stimulus for WaveStimulus {
         // Smooth MPE toward the latest controller values
         smooth_mpe(&mut self.mpe, &self.mpe_target, ctx.dt);
 
-        // Update source position from MPE
-        self.source_pos.0 = self.mpe.pitch_bend * 0.2; // ±20cm
-        self.source_pos.1 = self.mpe.timbre * 0.2;
+        // Update source position from MPE, spanning the whole table:
+        // pitch bend -1..1 -> x across the width, timbre 0..1 -> y along
+        // the length (bend 0 / timbre 0.5 is the table centre)
+        let (width, length) = ctx.table_m;
+        self.source_pos.0 = (0.5 + 0.5 * self.mpe.pitch_bend.clamp(-1.0, 1.0)) * width;
+        self.source_pos.1 = self.mpe.timbre.clamp(0.0, 1.0) * length;
 
         // Generate source signal
         let source = (self.phase * 2.0 * std::f32::consts::PI).sin()
@@ -951,11 +973,11 @@ mod tests {
 
     #[test]
     fn long_propagation_delays_are_delayed_not_wrapped() {
-        // Source pushed to (-0.2, 0.0) by full negative bend, zero timbre;
-        // the far corner transducer (ch 31 at (0.875, 1.875)) is ~2.16 m
-        // away -> ~108 ms at the default 20 m/s = ~5188 samples. The old
-        // 4800-sample delay line overflowed here and read the just-written
-        // sample instead (zero delay).
+        // Full negative bend + zero timbre puts the source at the table
+        // origin (0, 0); the far corner transducer (ch 31 at (0.875,
+        // 1.875)) is ~2.07 m away -> ~103 ms at the default 20 m/s =
+        // ~4966 samples. The old 4800-sample delay line overflowed here
+        // and read the just-written sample instead (zero delay).
         let mpe = MpeData { pressure: 1.0, pitch_bend: -1.0, timbre: 0.0 };
         let (mut engine, mut producer, _lp, _voices) = StimulusEngine::new(TransducerLayout::default());
         send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 1, mpe });
@@ -992,6 +1014,35 @@ mod tests {
         layout_producer.push(Box::new(TransducerLayout::default())).unwrap();
         let peak = run_samples(&mut engine, (0.2 * SAMPLE_RATE) as usize);
         assert!(peak > 0.0, "restored gains must un-mute the running voice");
+    }
+
+    #[test]
+    fn monitor_routing_selects_logical_channel_for_physical_output() {
+        // Same geometry as the delay test: source at origin, ch0 near
+        // (~12 ms away), ch31 far (~103 ms away). Route physical L <- 31
+        // and R <- 0 on a stereo "device": L must stay silent early while
+        // R sounds, proving outputs follow the routing.
+        let mpe = MpeData { pressure: 1.0, pitch_bend: -1.0, timbre: 0.0 };
+        let (mut engine, mut producer, _lp, _voices) = StimulusEngine::new(TransducerLayout::default());
+        send(&mut producer, EngineCommand::SetParameter {
+            parameter: Parameter::MonitorRoute { output: 0, source: 31 },
+        });
+        send(&mut producer, EngineCommand::SetParameter {
+            parameter: Parameter::MonitorRoute { output: 1, source: 0 },
+        });
+        send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 1, mpe });
+
+        // 60 ms stereo block: past ch0's delay, well before ch31's
+        let frames = (0.06 * SAMPLE_RATE) as usize;
+        let mut data = vec![0.0f32; frames * 2];
+        let mut levels = [0.0f32; TRANSDUCER_COUNT];
+        engine.process_block(&mut data, 2, SAMPLE_RATE, &mut levels);
+
+        let left_peak = data.iter().step_by(2).fold(0.0f32, |m, &s| m.max(s.abs()));
+        let right_peak = data.iter().skip(1).step_by(2).fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert_eq!(left_peak, 0.0, "L is routed to the far channel; its wave hasn't arrived yet");
+        assert!(right_peak > 0.0, "R is routed to the near channel and should sound");
+        assert!(levels[0] > 0.0, "logical levels stay pre-routing");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::time::Instant;
 use crate::engine::{StimulusEngine, TRANSDUCER_COUNT};
 
@@ -119,6 +119,7 @@ pub fn run_audio_loop(
     running: Arc<AtomicBool>,
     test_tone: bool,
     mut levels_producer: rtrb::Producer<[f32; TRANSDUCER_COUNT]>,
+    device_channels: Arc<AtomicU16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let host = cpal::default_host();
 
@@ -159,6 +160,7 @@ pub fn run_audio_loop(
 
     let sample_rate = config.sample_rate().0 as f32;
     let channels = config.channels() as usize;
+    device_channels.store(config.channels(), Ordering::Relaxed);
 
     let stats = Arc::new(AudioStats::new());
     let stats_for_callback = stats.clone();
