@@ -1,4 +1,4 @@
-use nih_plug_egui::{create_egui_editor, egui, EguiState};
+use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
 use nih_plug::prelude::*;
 use nih_plug::prelude::nih_log;
 use std::sync::Arc;
@@ -19,16 +19,22 @@ pub fn create(
         |_ctx, _setter| {
             nih_log!("Editor UI initialized");
         },
-        move |egui_ctx, _setter, _state| {
+        move |egui_ctx, setter, _state| {
             egui::CentralPanel::default().show(egui_ctx, |ui| {
                 ui.heading("Haptic Controller");
                 
                 ui.separator();
                 
-                // Connection status
+                // Connection status and latest server levels
                 let client_guard = ipc_client.lock();
                 let connected = client_guard.as_ref().map_or(false, |c| c.is_connected());
+                let levels = client_guard.as_ref().map(|c| c.levels()).unwrap_or_default();
                 drop(client_guard);
+
+                // Live levels arrive at ~60 Hz; keep the UI repainting
+                if connected {
+                    egui_ctx.request_repaint();
+                }
                 
                 ui.horizontal(|ui| {
                     ui.label("Server Status:");
@@ -41,19 +47,24 @@ pub fn create(
                 
                 ui.separator();
                 
-                // Information display (no plugin parameters currently)
+                // Plugin parameters (pushed to the server on change)
                 ui.group(|ui| {
-                    ui.label("Wave Parameters");
-                    ui.label("Wave speed is automatically calculated on the server based on note velocity");
-                    ui.label("Low velocity notes: Slower wave propagation");
-                    ui.label("High velocity notes: Faster wave propagation");
+                    ui.label("Stimulus Parameters");
+                    ui.horizontal(|ui| {
+                        ui.label("Wave speed:");
+                        ui.add(widgets::ParamSlider::for_param(&params.wave_speed, setter));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Stimulus type:");
+                        ui.add(widgets::ParamSlider::for_param(&params.stimulus_type, setter));
+                    });
                 });
                 
                 ui.separator();
                 
-                // Transducer visualization
+                // Transducer visualization (live RMS levels from the server)
                 ui.group(|ui| {
-                    ui.label("Transducer Array (32 channels)");
+                    ui.label("Transducer Array (32 channels, live RMS)");
                     
                     let size = egui::Vec2::new(400.0, 200.0);
                     let (response, painter) = ui.allocate_painter(size, egui::Sense::hover());
@@ -69,14 +80,22 @@ pub fn create(
                         let x = rect.left() + (col as f32 + 0.5) * rect.width() / grid_cols as f32;
                         let y = rect.top() + (row as f32 + 0.5) * rect.height() / grid_rows as f32;
                         
-                        // Draw transducer as circle
+                        // Draw transducer as circle, brightness following its level.
+                        // RMS of a full-scale sine is ~0.707; headroom factor 3
+                        // makes typical levels visible.
                         let radius = 8.0;
                         let color = if connected {
-                            egui::Color32::from_gray(100)
+                            let intensity = (levels[i] * 3.0).clamp(0.0, 1.0);
+                            let base = 70.0;
+                            egui::Color32::from_rgb(
+                                base as u8,
+                                (base + (255.0 - base) * intensity) as u8,
+                                (base + (160.0 - base) * intensity) as u8,
+                            )
                         } else {
                             egui::Color32::from_gray(64)
                         };
-                        
+
                         painter.circle_filled(
                             egui::pos2(x, y),
                             radius,
@@ -132,8 +151,8 @@ pub fn create(
                     ui.label("1. Start the haptic-server executable");
                     ui.label("2. Load this plugin in your DAW");
                     ui.label("3. Send MIDI notes to trigger haptic stimuli");
-                    ui.label("4. Low velocity notes → Wave stimuli");
-                    ui.label("5. High velocity notes → Standing wave stimuli");
+                    ui.label("4. Stimulus type and wave speed are set by the parameters above");
+                    ui.label("5. Velocity controls intensity; MPE pressure/bend/slide modulate the voice");
                 });
             });
         },

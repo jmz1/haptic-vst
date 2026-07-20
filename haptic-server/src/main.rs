@@ -10,19 +10,23 @@ use engine::StimulusEngine;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Starting Haptic VST Server");
-    
+
+    let test_tone = std::env::args().any(|arg| arg == "--test-tone");
+
     // Create shared shutdown flag
     let running = Arc::new(AtomicBool::new(true));
-    
-    // Create stimulus engine - the IPC thread will get a handle to send commands
-    let engine = StimulusEngine::new();
-    let command_producer = engine.get_command_producer();
-    
+
+    // Create stimulus engine - the IPC thread gets the command producer
+    let (engine, command_producer) = StimulusEngine::new();
+
+    // Levels path: audio callback → IPC thread → connected clients
+    let (levels_producer, levels_consumer) = rtrb::RingBuffer::new(256);
+
     // Start IPC listener thread
     let ipc_handle = {
         let running = running.clone();
         thread::spawn(move || {
-            if let Err(e) = ipc::listen_loop(running, command_producer) {
+            if let Err(e) = ipc::listen_loop(running, command_producer, levels_consumer) {
                 eprintln!("IPC error: {}", e);
             }
         })
@@ -36,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     
     // Run audio loop on main thread (highest priority)
-    if let Err(e) = audio::run_audio_loop(engine, running.clone()) {
+    if let Err(e) = audio::run_audio_loop(engine, running.clone(), test_tone, levels_producer) {
         eprintln!("Audio error: {}", e);
     }
     

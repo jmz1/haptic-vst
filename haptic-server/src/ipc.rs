@@ -4,22 +4,37 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
-use haptic_protocol::{HapticCommand, SOCKET_PATH};
+use std::io::Write;
+use std::time::Instant;
+use haptic_protocol::{encode_frame, FrameDecoder, FrameError, HapticCommand, ServerStatus, SOCKET_PATH};
+
+/// Minimum interval between TransducerLevels broadcasts (~60 Hz).
+const LEVELS_BROADCAST_INTERVAL: Duration = Duration::from_millis(16);
+
+/// A connected plugin instance with its stream-reassembly state.
+struct Client {
+    stream: UnixStream,
+    decoder: FrameDecoder,
+}
 
 pub fn listen_loop(
     running: Arc<AtomicBool>,
-    command_producer: crossbeam_channel::Sender<crate::engine::EngineCommand>
+    mut command_producer: rtrb::Producer<crate::engine::EngineCommand>,
+    mut levels_consumer: rtrb::Consumer<[f32; 32]>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Remove existing socket file if it exists
     let _ = std::fs::remove_file(SOCKET_PATH);
-    
+
     let listener = UnixListener::bind(SOCKET_PATH)?;
     listener.set_nonblocking(true)?;
-    
+
     eprintln!("IPC server listening on {}", SOCKET_PATH);
-    
-    let mut clients = Vec::new();
-    
+
+    let mut clients: Vec<Client> = Vec::new();
+    let mut latest_levels: Option<[f32; 32]> = None;
+    let mut last_broadcast = Instant::now();
+    let mut status_frame = Vec::with_capacity(256);
+
     while running.load(Ordering::Relaxed) {
         // Accept new connections
         match listener.accept() {
@@ -29,7 +44,7 @@ pub fn listen_loop(
                     eprintln!("Failed to set stream nonblocking: {}", e);
                     continue;
                 }
-                clients.push(stream);
+                clients.push(Client { stream, decoder: FrameDecoder::new() });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // No new connections, continue
@@ -38,65 +53,175 @@ pub fn listen_loop(
                 eprintln!("Error accepting connection: {}", e);
             }
         }
-        
+
         // Handle existing clients
         clients.retain_mut(|client| {
-            handle_client(client, &command_producer)
+            handle_client(client, &mut command_producer)
         });
-        
-        thread::sleep(Duration::from_millis(1));
-    }
-    
-    // Cleanup
-    let _ = std::fs::remove_file(SOCKET_PATH);
-    eprintln!("IPC server stopped");
-    
-    Ok(())
-}
 
-fn handle_client(stream: &mut UnixStream, command_producer: &crossbeam_channel::Sender<crate::engine::EngineCommand>) -> bool {
-    let mut buffer = [0u8; 1024];
-    
-    match stream.read(&mut buffer) {
-        Ok(0) => {
-            // Client disconnected
-            eprintln!("Client disconnected");
-            false
+        // Keep only the freshest levels frame from the audio thread
+        while let Ok(levels) = levels_consumer.pop() {
+            latest_levels = Some(levels);
         }
-        Ok(n) => {
-            // Try to deserialize command
-            match bincode::deserialize::<HapticCommand>(&buffer[..n]) {
-                Ok(command) => {
-                    // Convert to engine command and send
-                    let engine_cmd = match command {
-                        HapticCommand::NoteOn { note, velocity, channel, mpe, .. } => {
-                            crate::engine::EngineCommand::NoteOn { note, velocity, channel, mpe }
+
+        // Broadcast levels to all clients at ~60 Hz
+        if last_broadcast.elapsed() >= LEVELS_BROADCAST_INTERVAL {
+            if let Some(levels) = latest_levels.take() {
+                last_broadcast = Instant::now();
+                let timestamp_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as u64;
+                let status = ServerStatus::TransducerLevels { timestamp_us, levels };
+                if encode_frame(&status, &mut status_frame).is_ok() {
+                    clients.retain_mut(|client| {
+                        // A client that can't keep up (WouldBlock mid-frame
+                        // would corrupt its stream) is dropped
+                        match client.stream.write_all(&status_frame) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                eprintln!("Dropping client on status write failure: {}", e);
+                                false
+                            }
                         }
-                        HapticCommand::NoteOff { note, channel, .. } => {
-                            crate::engine::EngineCommand::NoteOff { note, channel }
-                        }
-                        HapticCommand::MpeUpdate { channel, mpe, .. } => {
-                            crate::engine::EngineCommand::MpeUpdate { channel, mpe }
-                        }
-                        HapticCommand::Panic => crate::engine::EngineCommand::Panic,
-                    };
-                    
-                    let _ = command_producer.send(engine_cmd);
-                    true
-                }
-                Err(e) => {
-                    eprintln!("Failed to deserialize command: {}", e);
-                    true // Keep connection alive
+                    });
                 }
             }
         }
-        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            // No data available, keep connection
-            true
+
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // Cleanup
+    let _ = std::fs::remove_file(SOCKET_PATH);
+    eprintln!("IPC server stopped");
+
+    Ok(())
+}
+
+/// Drain all available bytes from the client and dispatch every complete
+/// frame. Returns `false` when the connection should be dropped.
+fn handle_client(client: &mut Client, command_producer: &mut rtrb::Producer<crate::engine::EngineCommand>) -> bool {
+    let mut buffer = [0u8; 1024];
+
+    loop {
+        match client.stream.read(&mut buffer) {
+            Ok(0) => {
+                eprintln!("Client disconnected");
+                return false;
+            }
+            Ok(n) => {
+                client.decoder.extend(&buffer[..n]);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                eprintln!("Error reading from client: {}", e);
+                return false;
+            }
         }
-        Err(e) => {
-            eprintln!("Error reading from client: {}", e);
-            false
+    }
+
+    loop {
+        match client.decoder.next_frame::<HapticCommand>() {
+            Ok(Some(command)) => {
+                if command_producer.push(command.into()).is_err() {
+                    // Ring buffer full: the audio thread is not draining or
+                    // the client is flooding; drop the command
+                    eprintln!("Command queue full, dropping command");
+                }
+            }
+            Ok(None) => break,
+            Err(FrameError::Deserialize(e)) => {
+                // Frame boundary is intact; skip the bad frame and continue
+                eprintln!("Dropping undecodable frame: {}", e);
+            }
+            Err(e @ FrameError::Oversized(_)) => {
+                eprintln!("Protocol error, dropping client: {}", e);
+                return false;
+            }
         }
+    }
+
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::EngineCommand;
+    use haptic_protocol::MpeData;
+
+    /// End-to-end over the real Unix socket: coalesced and fragmented
+    /// frames must all arrive intact on the engine's command queue.
+    #[test]
+    fn framed_commands_over_socket_reach_engine_queue() {
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, mut rx) = rtrb::RingBuffer::new(64);
+        let (_levels_tx, levels_rx) = rtrb::RingBuffer::new(64);
+        let listener = {
+            let running = running.clone();
+            thread::spawn(move || {
+                let _ = listen_loop(running, tx, levels_rx);
+            })
+        };
+
+        // Retry until the listener is accepting (a stale socket file from a
+        // killed server may exist before the fresh bind, so probing the
+        // path is not enough)
+        let mut stream = None;
+        for _ in 0..200 {
+            match UnixStream::connect(SOCKET_PATH) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        let mut stream = stream.expect("connect to listener");
+
+        // Two frames coalesced into a single write
+        let mut coalesced = Vec::new();
+        let mut frame = Vec::new();
+        encode_frame(&HapticCommand::NoteOn {
+            timestamp_us: 0,
+            note: 60,
+            velocity: 100,
+            channel: 1,
+            mpe: MpeData::default(),
+        }, &mut frame).unwrap();
+        coalesced.extend_from_slice(&frame);
+        encode_frame(&HapticCommand::MpeUpdate {
+            timestamp_us: 0,
+            channel: 1,
+            mpe: MpeData { pressure: 0.9, pitch_bend: 0.1, timbre: 0.4 },
+        }, &mut frame).unwrap();
+        coalesced.extend_from_slice(&frame);
+        stream.write_all(&coalesced).unwrap();
+
+        // One frame fragmented across two delayed writes
+        encode_frame(&HapticCommand::NoteOff { timestamp_us: 0, note: 60, channel: 1 }, &mut frame).unwrap();
+        let (head, tail) = frame.split_at(3);
+        stream.write_all(head).unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        stream.write_all(tail).unwrap();
+
+        let mut pop_with_timeout = || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(cmd) = rx.pop() {
+                    return cmd;
+                }
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for command");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        assert!(matches!(pop_with_timeout(), EngineCommand::NoteOn { note: 60, channel: 1, .. }));
+        assert!(matches!(pop_with_timeout(), EngineCommand::MpeUpdate { channel: 1, .. }));
+        assert!(matches!(pop_with_timeout(), EngineCommand::NoteOff { note: 60, channel: 1 }));
+
+        running.store(false, Ordering::Relaxed);
+        listener.join().unwrap();
     }
 }

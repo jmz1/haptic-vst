@@ -7,8 +7,6 @@ edition = "2021"
 haptic-protocol = { path = "../haptic-protocol" }
 serde = { workspace = true }
 bincode = { workspace = true }
-crossbeam-channel = { workspace = true }
-parking_lot = { workspace = true }
 rtrb = { workspace = true }
 cpal = "0.15"
 ctrlc = "3.4"

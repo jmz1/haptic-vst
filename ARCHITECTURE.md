@@ -43,9 +43,34 @@ The system converts MIDI notes into spatial haptic stimuli with wave propagation
 
 ### Components
 
-1. **haptic-protocol**: Shared data structures and communication protocol
+1. **haptic-protocol**: Shared data structures, message framing, and communication protocol
 2. **haptic-plugin**: VST3 plugin with GUI and MIDI processing
 3. **haptic-server**: Real-time audio engine with haptic stimulus generation
+
+### Data flow (current)
+
+- **MIDI → plugin**: The plugin keeps a per-channel `MpeData` cache (16 entries). Each
+  incoming event (note on/off, poly/channel pressure, pitch bend, CC74 timbre) merges one
+  dimension into the cache, and the full merged struct is sent so no dimension is ever
+  overwritten with defaults. Strike velocity seeds the pressure at note-on.
+- **Plugin → server IPC**: `HapticCommand`s are bincode-serialized into length-prefixed
+  (u32 LE) frames over a Unix socket. A dedicated worker thread owns the socket; the audio
+  thread hands it commands through a bounded channel (drops when full, never blocks).
+  The server reassembles frames with `FrameDecoder`, so coalesced or fragmented reads are
+  handled correctly.
+- **Parameters**: Stimulus type (wave/standing) and wave speed are DAW-automatable plugin
+  parameters, pushed to the server as `SetParameter` commands on change. Velocity maps to
+  amplitude only.
+- **Server engine**: The IPC thread pushes `EngineCommand`s into an `rtrb` SPSC ring
+  buffer. The `StimulusEngine` is owned by the cpal audio callback (no locks on the audio
+  path) and drains the queue once per callback. A `(channel, note) → pool slot` ownership
+  map routes note-off and MPE updates to the owning stimulus and implements voice stealing
+  (oldest-in-release first, else oldest). MIDI notes map to the 20–200 Hz haptic band
+  (equal temperament transposed so middle C ≈ 65 Hz); MPE values are one-pole smoothed
+  inside each stimulus (~15 ms).
+- **Health**: the audio callback records timing into lock-free histogram stats, reported
+  every 5 s by a monitor thread; `--test-tone` plays a channel-cycling burst pattern for
+  interface bring-up.
 
 ## Rust Fundamentals Used
 
@@ -55,8 +80,8 @@ The system converts MIDI notes into spatial haptic stimuli with wave propagation
 
 ```rust
 // Ownership transfer (move)
-let engine = StimulusEngine::new();
-let wrapped_engine = Arc::new(Mutex::new(engine)); // engine is moved
+let (engine, command_producer) = StimulusEngine::new();
+// `engine` is later moved into the audio callback closure
 
 // Borrowing (references)
 fn process_audio(engine: &mut StimulusEngine) { // Mutable borrow
@@ -80,7 +105,6 @@ fn read_config(config: &Config) { // Immutable borrow
 pub struct ProcessContext<'a> {
     pub sample_rate: f32,
     pub dt: f32,
-    pub wave_speed: f32,
     pub transducer_positions: &'a [(f32, f32); TRANSDUCER_COUNT],
     //                        ^^^ Lifetime annotation
 }
@@ -97,10 +121,12 @@ pub struct ProcessContext<'a> {
 pub trait Stimulus: Send + Sync {
     fn process(&mut self, context: &ProcessContext<'_>) -> [f32; TRANSDUCER_COUNT];
     fn is_active(&self) -> bool;
-    fn note_on(&mut self, note: u8, velocity: u8, mpe: MpeData);
+    fn is_releasing(&self) -> bool;
+    fn note_on(&mut self, frequency: f32, velocity: u8, mpe: MpeData);
     fn note_off(&mut self);
     fn mpe_update(&mut self, mpe: MpeData);
     fn reset(&mut self);
+    fn set_wave_speed(&mut self, wave_speed: f32) {}
 }
 ```
 
@@ -156,7 +182,7 @@ match event {
 // From haptic-server/src/ipc.rs
 pub fn listen_loop(
     running: Arc<AtomicBool>,
-    command_producer: crossbeam_channel::Sender<crate::engine::EngineCommand>
+    mut command_producer: rtrb::Producer<crate::engine::EngineCommand>
 ) -> Result<(), Box<dyn std::error::Error>> {
     //   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Result type
     
@@ -172,10 +198,11 @@ pub fn listen_loop(
 
 ```rust
 // Arc: Atomic Reference Counter for shared ownership across threads
-let command_producer: Arc<Sender<EngineCommand>> = Arc::new(sender);
+let stats = Arc::new(AudioStats::new());
 
-// Mutex: Mutual exclusion for thread-safe access
-let engine = Arc::new(Mutex::new(stimulus_engine));
+// Mutex: Mutual exclusion for thread-safe access (plugin side only;
+// the server audio path is lock-free)
+let ipc_client = Arc::new(Mutex::new(Option::<IpcClient>::None));
 
 // Box: Heap allocation (similar to malloc/new)
 let error: Box<dyn std::error::Error> = Box::new(io_error);
@@ -236,9 +263,12 @@ pub struct MpeData {
 
 1. **Struct with trait implementations**:
 ```rust
-struct HapticPlugin {
+pub struct HapticPlugin {
     params: Arc<HapticParams>,
     ipc_client: Arc<Mutex<Option<IpcClient>>>,
+    mpe_state: [MpeData; 16],                 // per-channel MPE merge cache
+    last_sent_wave_speed: Option<f32>,        // parameter push tracking
+    last_sent_stimulus_type: Option<StimulusTypeParam>,
 }
 
 impl Plugin for HapticPlugin {
@@ -358,11 +388,11 @@ impl<T: Stimulus + Default, const N: usize> StimulusPool<T, N> {
 }
 ```
 
-5. **Channel-based communication**:
+5. **Lock-free SPSC ring buffer** (IPC thread → audio thread):
 ```rust
-let (sender, receiver) = crossbeam_channel::unbounded();
-// sender: crossbeam_channel::Sender<EngineCommand>
-// receiver: crossbeam_channel::Receiver<EngineCommand>
+let (producer, consumer) = rtrb::RingBuffer::new(COMMAND_QUEUE_CAPACITY);
+// producer: rtrb::Producer<EngineCommand>  (owned by the IPC thread)
+// consumer: rtrb::Consumer<EngineCommand>  (owned by the engine / audio callback)
 ```
 
 ### haptic-server/src/audio.rs
@@ -401,15 +431,18 @@ let device = host.output_devices()?
     })
 ```
 
-3. **Thread-safe shared state**:
+3. **Callback-owned engine (no locks on the audio path)**:
 ```rust
-let engine = Arc::new(Mutex::new(engine));
-let engine_clone = engine.clone();  // Clone the Arc, not the data
-
-// In audio callback:
-if let Some(mut engine_guard) = engine_clone.try_lock() {
-    engine_guard.process(&mut output, sample_rate);
-}
+// The engine is moved into the callback closure; commands arrive via rtrb
+let mut engine = engine;
+let stream = device.build_output_stream(
+    &config.into(),
+    move |data: &mut [f32], _| {
+        engine.process_block(data, channels, sample_rate);
+    },
+    /* error callback */,
+    None,
+)?;
 ```
 
 ## Key Rust Patterns and Idioms
@@ -486,16 +519,16 @@ let is_running = running.load(Ordering::Relaxed);
 ### 3. Channel Communication
 
 ```rust
-// Multiple producer, single consumer
-let (sender, receiver) = crossbeam_channel::unbounded();
-
-// Producer thread
-sender.send(command)?;
-
-// Consumer thread  
-while let Ok(cmd) = receiver.try_recv() {
-    process_command(cmd);
+// Server: single-producer single-consumer ring buffer, no allocation on send
+let (mut producer, mut consumer) = rtrb::RingBuffer::new(1024);
+producer.push(command).ok();          // IPC thread; drops when full
+while let Ok(cmd) = consumer.pop() {  // audio callback, once per block
+    apply_command(cmd);
 }
+
+// Plugin: bounded MPMC channel from audio thread to the IPC worker thread
+let (tx, rx) = crossbeam_channel::bounded(256);
+tx.try_send(command).ok();            // never blocks the audio thread
 ```
 
 ### 4. Mutex for Shared Mutable State
@@ -604,7 +637,7 @@ if let Some(stimulus) = pool.find_stimulus() {
 ```toml
 # Root Cargo.toml
 [workspace]
-members = ["haptic-protocol", "haptic-server", "haptic-plugin"]
+members = ["haptic-protocol", "haptic-server", "haptic-plugin", "haptic-plugin-standalone", "xtask"]
 resolver = "2"
 
 [workspace.dependencies]
