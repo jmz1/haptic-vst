@@ -33,3 +33,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Personal notes (not for the repo)
+JMZ-NOTES.md
