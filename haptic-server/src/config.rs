@@ -12,6 +12,14 @@ use crate::engine::TRANSDUCER_COUNT;
 pub const DEFAULT_TABLE_WIDTH_M: f32 = 1.0;
 pub const DEFAULT_TABLE_LENGTH_M: f32 = 2.0;
 
+/// Default per-transducer output gain when none is configured. Trimmed to 0.5
+/// (−6 dB) for headroom against the delay line's Doppler amplitude gain: an
+/// advancing source at the SOURCE_SPEED_FRACTION = 0.5·c speed limit bunches
+/// arrivals by up to 1/(1 − 0.5) = 2×, which — stacked on a unity source at
+/// a coincident transducer (near-field `1/(1+2d)` → 1) — would otherwise rail
+/// the ±1 output clamp. An explicit `gain` in the layout overrides this.
+pub const DEFAULT_TRANSDUCER_GAIN: f32 = 0.5;
+
 /// Resolved layout consumed by the engine.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TransducerLayout {
@@ -27,7 +35,7 @@ impl Default for TransducerLayout {
     /// 4 columns across the 1 m width, 8 rows along the 2 m length,
     /// cell-centred. Channels run across the width first: channel = row*4+col.
     fn default() -> Self {
-        Self::grid(4, 8, DEFAULT_TABLE_WIDTH_M, DEFAULT_TABLE_LENGTH_M, 1.0)
+        Self::grid(4, 8, DEFAULT_TABLE_WIDTH_M, DEFAULT_TABLE_LENGTH_M, DEFAULT_TRANSDUCER_GAIN)
             .expect("default grid is valid")
     }
 }
@@ -110,8 +118,8 @@ pub fn parse_layout(text: &str) -> Result<TransducerLayout, String> {
     };
 
     let mut layout = match &raw.grid {
-        Some(g) => TransducerLayout::grid(g.cols, g.rows, width_m, length_m, g.gain.unwrap_or(1.0))?,
-        None => TransducerLayout::grid(4, 8, width_m, length_m, 1.0)?,
+        Some(g) => TransducerLayout::grid(g.cols, g.rows, width_m, length_m, g.gain.unwrap_or(DEFAULT_TRANSDUCER_GAIN))?,
+        None => TransducerLayout::grid(4, 8, width_m, length_m, DEFAULT_TRANSDUCER_GAIN)?,
     };
 
     for t in &raw.transducers {
@@ -157,7 +165,7 @@ mod tests {
         assert_eq!(layout.positions[0], (0.125, 0.125));
         assert_eq!(layout.positions[3], (0.875, 0.125)); // end of first row
         assert_eq!(layout.positions[31], (0.875, 1.875));
-        assert!(layout.gains.iter().all(|&g| g == 1.0));
+        assert!(layout.gains.iter().all(|&g| g == DEFAULT_TRANSDUCER_GAIN));
         // All positions inside the table
         for &(x, y) in layout.positions.iter() {
             assert!(x > 0.0 && x < DEFAULT_TABLE_WIDTH_M);
@@ -205,9 +213,9 @@ mod tests {
         .unwrap();
         assert_eq!(layout.positions[5], (0.42, 1.0));
         assert_eq!(layout.gains[5], 0.25);
-        // Other channels untouched
+        // Other channels untouched (grid default gain)
         assert_eq!(layout.positions[0], TransducerLayout::default().positions[0]);
-        assert_eq!(layout.gains[0], 1.0);
+        assert_eq!(layout.gains[0], DEFAULT_TRANSDUCER_GAIN);
     }
 
     #[test]

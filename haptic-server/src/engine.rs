@@ -29,6 +29,21 @@ pub const RENDER_DECIMATION: usize = 32;
 const FIR_TAPS_PER_PHASE: usize = 16;
 const FIR_LEN: usize = FIR_TAPS_PER_PHASE * RENDER_DECIMATION;
 
+/// Bandlimited scatter (deposit) kernel for the delay line. Each emitted
+/// sample is splatted across `SPLAT_TAPS` ring cells straddling its fractional
+/// arrival index, weighted by a windowed sinc. A naive 2-tap linear splat has
+/// a frequency-domain gain that varies with the fractional phase; as the delay
+/// sweeps (a moving source) that variation amplitude-modulates the signal into
+/// an audible granulation warble (~frac(da/dn)·f_internal). A windowed-sinc
+/// deposit has near-flat in-band gain regardless of phase, removing it. The
+/// kernel is precomputed at `SPLAT_PHASES` fractional phases and each phase is
+/// normalised to unit sum (flat DC, so bunched arrivals still give the correct
+/// Doppler amplitude gain — the deposit is bandlimited, not attenuated).
+const SPLAT_TAPS: usize = 8;
+const SPLAT_HALF: usize = SPLAT_TAPS / 2; // taps cover cells base-(HALF-1)..=base+HALF
+const SPLAT_PHASES: usize = 128;
+const SPLAT_LEN: usize = SPLAT_TAPS * SPLAT_PHASES;
+
 // Haptic frequency band of the transducers
 const MIN_HAPTIC_FREQ: f32 = 20.0;
 const MAX_HAPTIC_FREQ: f32 = 200.0;
@@ -239,6 +254,9 @@ pub struct StimulusEngine {
     history_pos: usize,
     interp_phase: usize,
     fir: Box<[f32; FIR_LEN]>,
+
+    // Bandlimited scatter kernel for the delay lines (see design_splat_kernel)
+    splat_kernel: Box<[f32; SPLAT_LEN]>,
 }
 
 pub struct ProcessContext<'a> {
@@ -247,6 +265,8 @@ pub struct ProcessContext<'a> {
     pub transducer_positions: &'a [(f32, f32); TRANSDUCER_COUNT],
     /// (width, length) of the table, for MPE -> source-position mapping.
     pub table_m: (f32, f32),
+    /// Bandlimited scatter kernel shared by the voices' delay lines.
+    pub splat_kernel: &'a [f32; SPLAT_LEN],
 }
 
 // Commands from IPC thread
@@ -314,6 +334,7 @@ impl StimulusEngine {
             // Force a render on the very first device frame
             interp_phase: RENDER_DECIMATION - 1,
             fir: design_reconstruction_fir(),
+            splat_kernel: design_splat_kernel(),
         };
         (engine, producer, layout_producer, voice_consumer)
     }
@@ -482,12 +503,15 @@ impl StimulusEngine {
 
         let engine_rate = sample_rate / RENDER_DECIMATION as f32;
         // Copy so the context doesn't hold a borrow of self across render_frame
+        // (the kernel is Copy — a 4 KB stack copy once per block, no alloc).
         let positions = self.layout.positions;
+        let splat_kernel = *self.splat_kernel;
         let context = ProcessContext {
             sample_rate: engine_rate,
             dt: 1.0 / engine_rate,
             transducer_positions: &positions,
             table_m: self.layout.table_m,
+            splat_kernel: &splat_kernel,
         };
 
         let mut sum_squares = [0.0f32; TRANSDUCER_COUNT];
@@ -583,11 +607,13 @@ impl StimulusEngine {
     pub fn process(&mut self, output: &mut [f32; TRANSDUCER_COUNT], sample_rate: f32) {
         self.drain_commands();
         let positions = self.layout.positions;
+        let splat_kernel = *self.splat_kernel;
         let context = ProcessContext {
             sample_rate,
             dt: 1.0 / sample_rate,
             transducer_positions: &positions,
             table_m: self.layout.table_m,
+            splat_kernel: &splat_kernel,
         };
         self.render_frame(&context, output);
         self.reap_finished_voices();
@@ -633,6 +659,38 @@ fn design_reconstruction_fir() -> Box<[f32; FIR_LEN]> {
         *tap = (2.0 * fc * RENDER_DECIMATION as f64 * sinc * window) as f32;
     }
     h
+}
+
+/// Design the bandlimited scatter kernel (see `SPLAT_TAPS`): for each of
+/// `SPLAT_PHASES` fractional arrival positions, a Kaiser-windowed sinc sampled
+/// onto the `SPLAT_TAPS` integer cells straddling that position, normalised so
+/// the deposit sums to unity. Cutoff is the internal Nyquist (unit sample
+/// spacing → normalised 0.5), i.e. the full internal band. Runs once at
+/// engine construction.
+fn design_splat_kernel() -> Box<[f32; SPLAT_LEN]> {
+    let beta = 9.0f64;
+    let denom = bessel_i0(beta);
+    let half = SPLAT_HALF as f64;
+    let mut k = Box::new([0.0f32; SPLAT_LEN]);
+    for p in 0..SPLAT_PHASES {
+        let frac = p as f64 / SPLAT_PHASES as f64;
+        let mut row = [0.0f64; SPLAT_TAPS];
+        let mut sum = 0.0f64;
+        for (t, w) in row.iter_mut().enumerate() {
+            // Signed distance from the fractional arrival to cell base + (t − (HALF−1))
+            let x = (t as f64 - (SPLAT_HALF - 1) as f64) - frac;
+            let px = std::f64::consts::PI * x;
+            let sinc = if px.abs() < 1e-9 { 1.0 } else { px.sin() / px };
+            let r = x / half;
+            let window = if r.abs() >= 1.0 { 0.0 } else { bessel_i0(beta * (1.0 - r * r).sqrt()) / denom };
+            *w = sinc * window;
+            sum += *w;
+        }
+        for (t, &w) in row.iter().enumerate() {
+            k[p * SPLAT_TAPS + t] = (w / sum) as f32; // unit-sum: flat DC, no phase-dependent gain
+        }
+    }
+    k
 }
 
 /// One-pole toward `target`; coeff derived from dt and MPE_SMOOTHING_TAU.
@@ -730,9 +788,15 @@ impl MpeInterp {
 /// merely bunches writes (the physically correct energy/Doppler concentration,
 /// giving amplitude gain as well as the frequency shift). With `source_pos`
 /// held to ≤ SOURCE_SPEED_FRACTION·c (0.5·c), the arrival index advances by
-/// da/dn = 1 + v_r/c ∈ [0.5, 1.5] per frame, so arrivals never invert (no
-/// order reversal on approach) and never skip a cell (no dropout gaps on
-/// recession) — a plain 2-tap accumulate suffices, no special-casing.
+/// da/dn = 1 + v_r/c ∈ [0.5, 1.5] per frame, so arrivals never invert on
+/// approach and never skip a cell on recession.
+///
+/// Each emission is deposited with a bandlimited windowed-sinc kernel (see
+/// `SPLAT_TAPS`), not a 2-tap linear splat: the linear splat's gain varies
+/// with the fractional arrival phase, and as the delay sweeps that variation
+/// amplitude-modulates the output into an audible granulation warble. The sinc
+/// deposit has near-flat in-band gain at every phase, so the only amplitude
+/// variation left is the genuine Doppler bunching gain.
 struct DelayLine {
     buffer: Box<[f32; MAX_DELAY_SAMPLES]>, // Move large buffer to heap
     /// Clock / read pointer, advances exactly 1 per frame.
@@ -749,23 +813,33 @@ impl DelayLine {
         }
     }
 
-    /// Scatter `input` into its arrival slot `delay_samples` ahead of the read
-    /// pointer, then read (and consume) the sample arriving at the current
-    /// frame. Write-then-read so a near-zero delay is heard this frame.
-    fn write_and_read(&mut self, input: f32, delay_samples: f32) -> f32 {
-        // Beyond capacity the scatter would lap the read pointer; clamp so the
-        // longest propagation is delayed at the capacity limit, never wrapped.
-        let delay_samples = delay_samples.clamp(0.0, (self.size - 2) as f32);
+    /// Scatter `input` (bandlimited, `kernel`) into its arrival slot
+    /// `delay_samples` ahead of the read pointer, then read and consume the
+    /// sample arriving at the current frame.
+    fn write_and_read(&mut self, input: f32, delay_samples: f32, kernel: &[f32; SPLAT_LEN]) -> f32 {
+        // Lower clamp keeps the whole SPLAT_TAPS-wide kernel strictly ahead of
+        // the read pointer (nothing deposited into already-read cells, which a
+        // sub-SPLAT_HALF delay would otherwise do — the read pointer is always
+        // integer, advancing exactly one cell per frame). Upper clamp keeps the
+        // longest propagation delayed at the capacity limit, never wrapped past
+        // the read pointer. The floor costs SPLAT_HALF internal samples (~2.7 ms
+        // @ 1.5 kHz) of latency on a coincident transducer — negligible.
+        let delay_samples = delay_samples.clamp(SPLAT_HALF as f32, (self.size - SPLAT_TAPS - 2) as f32);
 
-        // Scatter-write: deposit the emission linearly across the two cells
-        // straddling its fractional arrival index, accumulating so bunched
-        // arrivals (an approaching source) superpose correctly.
+        // Bandlimited scatter: deposit `input` across SPLAT_TAPS cells straddling
+        // its fractional arrival index, weighted by the windowed-sinc kernel for
+        // this fractional phase (unit-sum → flat gain, no granulation ripple).
+        // Accumulates, so bunched arrivals (an approaching source) superpose
+        // into the correct Doppler amplitude gain.
         let arrival = self.pos + delay_samples;
-        let a0 = arrival.floor() as usize % self.size;
-        let a1 = (a0 + 1) % self.size;
-        let frac = arrival.fract();
-        self.buffer[a0] += input * (1.0 - frac);
-        self.buffer[a1] += input * frac;
+        let base = arrival.floor() as usize;
+        let frac = arrival - arrival.floor();
+        let phase = ((frac * SPLAT_PHASES as f32) as usize).min(SPLAT_PHASES - 1);
+        let koff = phase * SPLAT_TAPS;
+        for t in 0..SPLAT_TAPS {
+            let cell = (base + t + self.size - (SPLAT_HALF - 1)) % self.size;
+            self.buffer[cell] += input * kernel[koff + t];
+        }
 
         // Sequential read: the sample scheduled to arrive at this frame. Zero
         // the slot after reading so the ring cell is clean for its next lap.
@@ -773,7 +847,7 @@ impl DelayLine {
         let output = self.buffer[read_idx];
         self.buffer[read_idx] = 0.0;
 
-        // Advance the clock
+        // Advance the clock (integer-valued, wraps at capacity)
         self.pos = (self.pos + 1.0) % self.size as f32;
 
         output
@@ -904,7 +978,7 @@ impl Stimulus for WaveStimulus {
             // the sequential read is then raw. Doppler amplitude gain from
             // bunched arrivals rides on top of this geometric spreading loss.
             let emitted = source / (1.0 + distance * 2.0);
-            output[i] = self.delay_lines[i].write_and_read(emitted, delay_samples);
+            output[i] = self.delay_lines[i].write_and_read(emitted, delay_samples, ctx.splat_kernel);
         }
 
         // Update phase
@@ -1290,6 +1364,7 @@ mod tests {
 
         // Returns (zero_crossings, peak_abs, rms) of the delay-line output for
         // a delay that ramps at `slope` samples/sample from `d_start`.
+        let kernel = design_splat_kernel();
         let run = |slope: f32| -> (usize, f32, f32) {
             let mut line = DelayLine::new();
             let mut prev = 0.0f32;
@@ -1301,7 +1376,7 @@ mod tests {
                 let phase = 2.0 * std::f32::consts::PI * f0 * i as f32 / fs;
                 let input = phase.sin();
                 let delay = d_start + slope * i as f32;
-                let out = line.write_and_read(input, delay);
+                let out = line.write_and_read(input, delay, &kernel);
                 // Skip the initial fill (until the read pointer reaches the
                 // first scattered arrivals ~d_start frames in).
                 if i > d_start as usize + 50 {
@@ -1339,6 +1414,36 @@ mod tests {
 
         // No dropout gaps on recession: the signal thins but stays live.
         assert!(recede_rms > 0.2 * stationary_rms, "receding output collapsed: rms {recede_rms}");
+    }
+
+    #[test]
+    fn splat_kernel_has_unit_dc_and_flat_in_band_gain_across_phases() {
+        // The scatter kernel's defining property (the one that removes the
+        // 2-tap linear splat's granulation warble): every fractional phase has
+        // unit DC gain AND near-flat in-band gain, so sweeping the fractional
+        // arrival position introduces no amplitude ripple.
+        let k = design_splat_kernel();
+        let w_norm = 2.0 * std::f64::consts::PI * 200.0 / 1500.0; // 200 Hz at the 1.5 kHz internal rate
+        let mut min_g = f64::MAX;
+        let mut max_g = f64::MIN;
+        for p in 0..SPLAT_PHASES {
+            let row = &k[p * SPLAT_TAPS..(p + 1) * SPLAT_TAPS];
+            let dc: f64 = row.iter().map(|&x| x as f64).sum();
+            assert!((dc - 1.0).abs() < 1e-4, "phase {p} DC gain {dc} != 1");
+            // Magnitude response at the in-band test frequency
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (t, &c) in row.iter().enumerate() {
+                let d = t as f64 - (SPLAT_HALF - 1) as f64;
+                re += c as f64 * (w_norm * d).cos();
+                im -= c as f64 * (w_norm * d).sin();
+            }
+            let g = (re * re + im * im).sqrt();
+            min_g = min_g.min(g);
+            max_g = max_g.max(g);
+        }
+        // Peak-to-peak in-band gain variation across all phases < 0.1 dB
+        let ripple_db = 20.0 * (max_g / min_g).log10();
+        assert!(ripple_db < 0.1, "in-band gain ripple across phases is {ripple_db:.3} dB (min {min_g:.4}, max {max_g:.4})");
     }
 
     #[test]

@@ -60,22 +60,25 @@ Everything inside the audio callback is allocation- and lock-free: the engine is
 
 Each `WaveStimulus` owns 32 independent delay lines — one per transducer — because each transducer sits at a different distance and needs its own tap. A delay line is a heap-allocated ring buffer (`Box<[f32; 16384]>`).
 
-The arrangement matters. For a **moving source and fixed listener**, the delay is a function of *emission* time: a sample emitted at frame *n*, when the source is at `xₛ(n)`, arrives at the fixed transducer at frame `a(n) = n + τᵢ(n)`. The line therefore uses **interpolating writes and a fixed (sequential) read** — each emitted sample is *scattered* into its fractional arrival slot (split linearly across the two straddling cells, **accumulating**), and a read pointer advancing exactly one cell per frame consumes whatever has arrived at the current frame, zeroing the slot behind it:
+The arrangement matters. For a **moving source and fixed listener**, the delay is a function of *emission* time: a sample emitted at frame *n*, when the source is at `xₛ(n)`, arrives at the fixed transducer at frame `a(n) = n + τᵢ(n)`. The line therefore uses **interpolating writes and a fixed (sequential) read** — each emitted sample is *scattered* into its fractional arrival slot, and a read pointer advancing exactly one cell per frame consumes whatever has arrived at the current frame, zeroing the slot behind it:
 
 ```
-   read pointer (advances 1/frame,               scatter-write:
-   consumes & zeroes this slot)                  emission n lands at
-           ▼                                      arrival a(n) = n + τᵢ(n)
-  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐   ▲       ▲
-  │  │  │  │▒▒│  │  │  │  │▓▓│▓▓│  │  │  │  │  │   split across
-  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘   two cells, +=
-     read side ←───── τᵢ·rate ─────→ write side    (bunches when the
-                                                    source approaches)
+   read pointer (advances 1/frame,               scatter-write: emission n
+   consumes & zeroes this slot)                  splatted (windowed sinc)
+           ▼                                      around a(n) = n + τᵢ(n)
+  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐        ▲
+  │  │  │  │▒▒│  │  │  │▁▃▅█▅▃▁│  │  │  │  │  │   SPLAT_TAPS-wide kernel
+  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘   accumulated (+=); denser
+     read side ←───── τᵢ·rate ─────→ write side    when the source approaches
 ```
 
-This is the physically correct model, and it is *not* what a single fractional **read** tap behind a fixed write head does — that evaluates τ at *reception* time (the moving-*listener* model) and, on a fast approach, drives the read tap into the write head, reading the line backwards. Scatter-writes have no such failure: an approaching source simply bunches successive arrivals into adjacent cells — the physically correct concentration of energy, which yields a Doppler **amplitude** gain as well as the frequency shift (verified in capture: channel RMS swings ~2.4× over an orbit as the source nears and recedes). A receding source thins the arrivals out.
+This is the physically correct model, and it is *not* what a single fractional **read** tap behind a fixed write head does — that evaluates τ at *reception* time (the moving-*listener* model) and, on a fast approach, drives the read tap into the write head, reading the line backwards. Scatter-writes have no such failure: an approaching source simply bunches successive arrivals — the physically correct concentration of energy, which yields a Doppler **amplitude** gain as well as the frequency shift (verified in capture: channel RMS swings ~2.4× over an orbit). A receding source thins the arrivals out.
 
-Per frame each line does one two-cell scatter-write and one sequential read. Distance attenuation `1 / (1 + 2d)` is applied *at the write* (each wavefront carries its own emission-time spreading loss into the line); the read is raw. Delays beyond capacity are **clamped, never wrapped** — a wrap would lap the read pointer and collapse the delay, which is precisely the latent bug the 1×2 m table exposed (see §6).
+**The deposit kernel must be bandlimited.** The natural first cut — splatting each emission linearly across the two cells straddling `a(n)` — sounds bad: the 2-tap kernel's gain depends on the fractional arrival phase, so as the delay sweeps (a moving source) that phase-dependent gain amplitude-modulates the output into an audible granulation warble (measured at ~−20 dB of spurs on a spreading source — a receding note). The fix is a **windowed-sinc deposit** (`SPLAT_TAPS = 8`, Kaiser β = 9, precomputed at 128 fractional phases, each phase normalised to unit sum): its in-band gain is flat to < 0.1 dB across all phases, so the only amplitude variation left is the genuine Doppler bunching. This drops the granulation spurs by ~20 dB in both directions (spreading −20 → −41 dB, bunching −35 → −56 dB) while a stationary source stays at the −138 dB f32 floor. This is the standard cost of push-resampling: read-side (pull) interpolation reconstructs a smooth output for free, whereas write-side (push) needs a proper anti-imaging kernel — which the two-rate render's 32× cost headroom easily affords.
+
+Per frame each line does one `SPLAT_TAPS`-wide scatter-write and one sequential read. The deposit is held ≥ `SPLAT_HALF` samples ahead of the read pointer (a ~2.7 ms latency floor on a coincident transducer) so the whole kernel lands in unread cells. Distance attenuation `1 / (1 + 2d)` is applied *at the write* (each wavefront carries its own emission-time spreading loss into the line); the read is raw. Delays beyond capacity are **clamped, never wrapped** — a wrap would lap the read pointer and collapse the delay, which is precisely the latent bug the 1×2 m table exposed (see §6).
+
+**Output headroom.** The Doppler bunching gain is real level: an advancing source at the 0.5·c speed limit concentrates arrivals by up to 1/(1 − 0.5) = 2×. Stacked on a unity source at a coincident transducer (near-field `1/(1+2d) → 1`) that would rail the ±1 output clamp, so the default per-transducer gain is trimmed to 0.5 (−6 dB, `DEFAULT_TRANSDUCER_GAIN`). An explicit layout `gain` overrides it.
 
 ## 4. Keeping the model stable: three protective layers
 
@@ -130,8 +133,10 @@ Each protective mechanism above earned its place by a concrete, captured failure
 | Sideband comb around the carrier at the audio-block/MPE-send rate | Stepped position targets frequency-modulating the delay lines | Measured-spacing ramp + double one-pole (§4, layer 1) |
 | Garbled output on fast MPE jumps | Source moving supersonically: under the old read-tap line the read tap overtook the write head (line read backwards) | Scatter-write line (§3) removes the overtake failure entirely; 0.5 × c source velocity limit keeps scatter arrivals monotonic and gap-free (§4, layer 2) |
 | Audible high-frequency images on monitors | Linear-interp upsampler images at ~−50 dB | Polyphase Kaiser-sinc reconstruction, images at −107 dB (§5) |
+| High-frequency warble on a moving source (worst at low c / tight orbits) | 2-tap linear scatter kernel: its gain varies with the fractional arrival phase, amplitude-modulating the output as the delay sweeps (granulation spurs ~−20 dB) | Bandlimited windowed-sinc deposit, flat gain across phases, spurs −20 dB lower (§3) |
+| Popping / clipping bursts as the source passes close to a transducer | Doppler bunching gain (new, real level) stacking on the near-field `1/(1+2d)` gain and railing the ±1 clamp | Default per-transducer gain trimmed to 0.5 for 2× bunching headroom (§3) |
 
-The debugging instrument for all of these is the headless capture harness (`orbit_capture_writes_debug_buffers` in `engine.rs`): it drives `process_block` with the viewer's exact orbit command stream against a dummy 32-channel sink and writes raw 32-channel f32 output for offline spectral analysis. Design-level claims above (image rejection, sideband levels, pitch-jump counts) were verified against those captures, and the load-bearing properties are pinned by unit tests (scatter-line Doppler direction and amplitude gain, delay-not-wrap, velocity limit, per-branch DC gain and image rejection, block-size invariance).
+The debugging instrument for all of these is the headless capture harness (`orbit_capture_writes_debug_buffers` in `engine.rs`): it drives `process_block` with the viewer's exact orbit command stream against a dummy 32-channel sink and writes raw 32-channel f32 output for offline spectral analysis. Design-level claims above (image rejection, sideband levels, pitch-jump counts, granulation-spur reduction) were verified against those captures, and the load-bearing properties are pinned by unit tests (scatter-line Doppler direction and amplitude gain, splat-kernel flat in-band gain, delay-not-wrap, velocity limit, per-branch DC gain and image rejection, block-size invariance).
 
 ## 7. Boundaries of the model
 

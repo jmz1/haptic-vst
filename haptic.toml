@@ -20,7 +20,8 @@ length_m = 2.0   # y extent
 [grid]
 cols = 4         # across the width (x)
 rows = 8         # along the length (y)
-# gain = 1.0     # optional gain applied to every transducer
+# gain = 0.5     # optional gain applied to every transducer (default 0.5,
+                 # trimmed for Doppler amplitude headroom — see engine)
 
 # Optional per-transducer overrides, applied after the grid. Use these for
 # irregular placements or per-transducer calibration gains.
