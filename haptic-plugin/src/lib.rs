@@ -68,10 +68,14 @@ impl Default for HapticParams {
             wave_speed: FloatParam::new(
                 "Wave Speed",
                 20.0,
-                FloatRange::Skewed { min: 20.0, max: 500.0, factor: FloatRange::skew_factor(-1.0) },
+                // Match the engine's usable range (MIN_WAVE_SPEED..MAX_WAVE_SPEED).
+                // Heavily skewed toward the low end: the strong-Doppler regime the
+                // system is built for lives below ~20 m/s, and was previously
+                // unreachable from the host (old floor was 20 m/s).
+                FloatRange::Skewed { min: 0.25, max: 1000.0, factor: FloatRange::skew_factor(-2.5) },
             )
             .with_unit(" m/s")
-            .with_step_size(1.0),
+            .with_step_size(0.01),
             stimulus_type: EnumParam::new("Stimulus Type", StimulusTypeParam::Wave),
         }
     }
