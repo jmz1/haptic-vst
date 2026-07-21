@@ -5,11 +5,29 @@ use crate::config::TransducerLayout;
 pub const TRANSDUCER_COUNT: usize = 32;
 const MAX_WAVE_STIMULI: usize = 8;
 const MAX_STANDING_STIMULI: usize = 4;
-// Sized for worst-case propagation delay: table diagonal (~2.24 m for the
-// default 1m x 2m layout, plus MPE source excursion) at the minimum wave
-// speed (20 m/s) is ~115 ms; 16384 samples covers ~341 ms at 48 kHz and
-// ~171 ms at 96 kHz. Delays beyond capacity are clamped, not wrapped.
+// Delay-line capacity in *internal-rate* samples (see RENDER_DECIMATION):
+// 16384 samples at 48 kHz / 32 = 1.5 kHz is ~10.9 s of propagation — 8.3 s
+// covers the full default table at the 0.25 m/s wave-speed floor, so the
+// safety clamp below is unreachable for realistic layouts. Delays beyond
+// capacity are clamped, not wrapped.
 const MAX_DELAY_SAMPLES: usize = 16384;
+
+/// The wave field is synthesised at the device rate divided by this factor
+/// (48 kHz -> 1.5 kHz) and upsampled to the device rate at the output
+/// stage. The internal Nyquist (750 Hz at 48 kHz) comfortably covers the
+/// 20-200 Hz transducer band, per-sample delay-line work drops 32x, and
+/// delay-line capacity in seconds stretches 32x, which is what lets slow
+/// wave speeds run without clamping.
+pub const RENDER_DECIMATION: usize = 32;
+
+/// Reconstruction filter length per polyphase branch. The interpolator is a
+/// windowed-sinc lowpass with cutoff at the internal Nyquist, evaluated
+/// polyphase: each device frame is a FIR_TAPS_PER_PHASE-tap dot product
+/// against the most recent internal frames. 16 taps x Kaiser beta 10 gives
+/// ~100 dB image rejection with the transition band comfortably between
+/// the 200 Hz content edge and the first image at internal_rate - 200 Hz.
+const FIR_TAPS_PER_PHASE: usize = 16;
+const FIR_LEN: usize = FIR_TAPS_PER_PHASE * RENDER_DECIMATION;
 
 // Haptic frequency band of the transducers
 const MIN_HAPTIC_FREQ: f32 = 20.0;
@@ -18,7 +36,25 @@ const MAX_HAPTIC_FREQ: f32 = 200.0;
 // One-pole smoothing time constant for incoming MPE dimensions
 const MPE_SMOOTHING_TAU: f32 = 0.015; // 15 ms
 
+/// Incoming MPE updates arrive as discrete steps (a controller's send rate,
+/// further quantised to audio-block boundaries by the command queue). Each
+/// new target is linearly ramped over roughly the measured update spacing,
+/// clamped to this range (seconds), before the one-pole above — otherwise
+/// the block-rate staircase frequency-modulates the delay lines into an
+/// audible sideband comb around the carrier.
+const MPE_RAMP_MIN_S: f32 = 0.005;
+const MPE_RAMP_MAX_S: f32 = 0.05;
+
 const DEFAULT_WAVE_SPEED: f32 = 20.0; // m/s
+const MIN_WAVE_SPEED: f32 = 0.25; // m/s — floor chosen so a full-table propagation fits the delay lines
+const MAX_WAVE_SPEED: f32 = 1000.0; // m/s
+
+/// Maximum speed of the effective source position, as a fixed fraction of
+/// the stimulus's wave speed. Keeps the source subsonic relative to its own
+/// waves: an MPE jump would otherwise move the source faster than
+/// propagation, collapsing delay ordering (delays shrinking by more than
+/// one sample per sample reads the delay lines backwards).
+const SOURCE_SPEED_FRACTION: f32 = 0.8;
 
 /// Capacity of the IPC → audio thread command ring buffer. Sized for a
 /// worst-case burst of MPE traffic within one audio callback.
@@ -32,7 +68,10 @@ pub struct VoiceSnapshot {
     pub note: u8,
     pub frequency: f32,
     pub wave_speed: f32,
+    /// Effective (velocity-limited) source position the delay lines use.
     pub source_pos: (f32, f32),
+    /// Where MPE is currently asking the source to be.
+    pub requested_pos: (f32, f32),
     /// Current perceived source level: velocity amplitude x envelope x
     /// smoothed MPE pressure.
     pub amplitude: f32,
@@ -188,6 +227,15 @@ pub struct StimulusEngine {
 
     // Transducer configuration (hot-swappable via layout_queue)
     layout: TransducerLayout,
+
+    // Output upsampler state: the engine renders at the device rate divided
+    // by RENDER_DECIMATION; device frames are reconstructed by a polyphase
+    // windowed-sinc filter over the most recent internal frames (newest at
+    // history[history_pos], ring order oldest-ward).
+    history: [[f32; TRANSDUCER_COUNT]; FIR_TAPS_PER_PHASE],
+    history_pos: usize,
+    interp_phase: usize,
+    fir: Box<[f32; FIR_LEN]>,
 }
 
 pub struct ProcessContext<'a> {
@@ -258,6 +306,11 @@ impl StimulusEngine {
             voice_producer,
             monitor_routes: std::array::from_fn(|i| i as u8),
             layout,
+            history: [[0.0; TRANSDUCER_COUNT]; FIR_TAPS_PER_PHASE],
+            history_pos: 0,
+            // Force a render on the very first device frame
+            interp_phase: RENDER_DECIMATION - 1,
+            fir: design_reconstruction_fir(),
         };
         (engine, producer, layout_producer, voice_consumer)
     }
@@ -362,7 +415,7 @@ impl StimulusEngine {
             }
             EngineCommand::SetParameter { parameter } => match parameter {
                 Parameter::WaveSpeed(speed) => {
-                    self.wave_speed = speed.clamp(1.0, 1000.0);
+                    self.wave_speed = speed.clamp(MIN_WAVE_SPEED, MAX_WAVE_SPEED);
                 }
                 Parameter::StimulusType(kind) => {
                     self.stimulus_type = kind;
@@ -408,10 +461,13 @@ impl StimulusEngine {
     }
 
     /// Audio-callback entry point: drains pending commands once, then fills
-    /// the interleaved `data` buffer. Writes the block RMS of each of the 32
-    /// logical transducer outputs into `levels_out` (computed pre-truncation,
-    /// so levels are meaningful even on a stereo fallback device).
-    /// MUST NOT block or allocate.
+    /// the interleaved `data` buffer at the device rate. The wave field is
+    /// rendered at `sample_rate / RENDER_DECIMATION` and linearly upsampled
+    /// per device frame; the upsampler state persists across calls, so block
+    /// sizes need not be multiples of the decimation factor. Writes the
+    /// block RMS of each of the 32 logical transducer outputs into
+    /// `levels_out` (computed pre-truncation, so levels are meaningful even
+    /// on a stereo fallback device). MUST NOT block or allocate.
     pub fn process_block(
         &mut self,
         data: &mut [f32],
@@ -421,29 +477,47 @@ impl StimulusEngine {
     ) {
         self.drain_commands();
 
+        let engine_rate = sample_rate / RENDER_DECIMATION as f32;
         // Copy so the context doesn't hold a borrow of self across render_frame
         let positions = self.layout.positions;
         let context = ProcessContext {
-            sample_rate,
-            dt: 1.0 / sample_rate,
+            sample_rate: engine_rate,
+            dt: 1.0 / engine_rate,
             transducer_positions: &positions,
             table_m: self.layout.table_m,
         };
 
-        let mut output = [0.0f32; TRANSDUCER_COUNT];
         let mut sum_squares = [0.0f32; TRANSDUCER_COUNT];
         let frames = data.len() / channels;
         let routes = self.monitor_routes;
         for frame in data[..frames * channels].chunks_exact_mut(channels) {
-            self.render_frame(&context, &mut output);
-            for (sum, &sample) in sum_squares.iter_mut().zip(output.iter()) {
+            self.interp_phase += 1;
+            if self.interp_phase >= RENDER_DECIMATION {
+                self.interp_phase = 0;
+                let mut cur = [0.0f32; TRANSDUCER_COUNT];
+                self.render_frame(&context, &mut cur);
+                self.history_pos = (self.history_pos + FIR_TAPS_PER_PHASE - 1) % FIR_TAPS_PER_PHASE;
+                self.history[self.history_pos] = cur;
+            }
+            // Polyphase reconstruction: device frame at phase p is the dot
+            // product of branch p of the windowed-sinc filter with the
+            // FIR_TAPS_PER_PHASE most recent internal frames
+            let n = channels.min(TRANSDUCER_COUNT);
+            let mut interp = [0.0f32; TRANSDUCER_COUNT];
+            for k in 0..FIR_TAPS_PER_PHASE {
+                let coeff = self.fir[k * RENDER_DECIMATION + self.interp_phase];
+                let frame_k = &self.history[(self.history_pos + k) % FIR_TAPS_PER_PHASE];
+                for (out, &sample) in interp.iter_mut().zip(frame_k.iter()) {
+                    *out += coeff * sample;
+                }
+            }
+            for (sum, &sample) in sum_squares.iter_mut().zip(interp.iter()) {
                 *sum += sample * sample;
             }
             // Physical outputs play their routed logical channel (identity
             // by default; a stereo device can audition any of the 32)
-            let n = channels.min(TRANSDUCER_COUNT);
             for (p, sample) in frame[..n].iter_mut().enumerate() {
-                *sample = output[routes[p] as usize];
+                *sample = interp[routes[p] as usize];
             }
             for sample in frame[n..].iter_mut() {
                 *sample = 0.0;
@@ -459,7 +533,7 @@ impl StimulusEngine {
             *level = (sum * inv_frames).sqrt();
         }
 
-        self.publish_latest_voice(sample_rate);
+        self.publish_latest_voice(engine_rate);
         self.reap_finished_voices();
     }
 
@@ -484,7 +558,7 @@ impl StimulusEngine {
             let dx = tx - stim.source_pos.0;
             let dy = ty - stim.source_pos.1;
             let distance = (dx * dx + dy * dy).sqrt();
-            *delay = distance / stim.wave_speed.max(1.0) * sample_rate;
+            *delay = distance / stim.wave_speed.max(MIN_WAVE_SPEED) * sample_rate;
         }
 
         let _ = self.voice_producer.push(VoiceSnapshot {
@@ -493,13 +567,15 @@ impl StimulusEngine {
             frequency: stim.frequency,
             wave_speed: stim.wave_speed,
             source_pos: stim.source_pos,
-            amplitude: stim.amplitude * stim.env_level * stim.mpe.pressure,
+            requested_pos: stim.requested_pos,
+            amplitude: stim.amplitude * stim.env_level * stim.mpe.value.pressure,
             sample_rate,
             delay_samples,
         });
     }
 
-    /// Single-frame variant used by tests.
+    /// Single-frame variant used by tests: renders one *internal-rate*
+    /// frame directly at `sample_rate` (no upsampling stage).
     #[cfg(test)]
     pub fn process(&mut self, output: &mut [f32; TRANSDUCER_COUNT], sample_rate: f32) {
         self.drain_commands();
@@ -516,12 +592,121 @@ impl StimulusEngine {
 
 }
 
+/// Zeroth-order modified Bessel function of the first kind (power series),
+/// for the Kaiser window.
+fn bessel_i0(x: f64) -> f64 {
+    let mut sum = 1.0f64;
+    let mut term = 1.0f64;
+    let half = x / 2.0;
+    for k in 1..=30 {
+        let f = half / k as f64;
+        term *= f * f;
+        sum += term;
+        if term < sum * 1e-12 {
+            break;
+        }
+    }
+    sum
+}
+
+/// Design the polyphase reconstruction filter: a Kaiser-windowed sinc
+/// lowpass with cutoff at the internal Nyquist (device_rate / (2 *
+/// RENDER_DECIMATION)), scaled by RENDER_DECIMATION so each polyphase
+/// branch has unity DC gain. This single filter both interpolates the
+/// zero-stuffed internal-rate signal and suppresses its spectral images
+/// (~100 dB at Kaiser beta 10). Runs once at engine construction.
+fn design_reconstruction_fir() -> Box<[f32; FIR_LEN]> {
+    let beta = 10.0f64;
+    let denom = bessel_i0(beta);
+    let center = (FIR_LEN - 1) as f64 / 2.0;
+    let fc = 0.5 / RENDER_DECIMATION as f64; // internal Nyquist, normalised to the device rate
+    let mut h = Box::new([0.0f32; FIR_LEN]);
+    for (n, tap) in h.iter_mut().enumerate() {
+        let t = n as f64 - center;
+        let x = std::f64::consts::PI * 2.0 * fc * t;
+        let sinc = if x.abs() < 1e-9 { 1.0 } else { x.sin() / x };
+        let r = t / center;
+        let window = bessel_i0(beta * (1.0 - r * r).max(0.0).sqrt()) / denom;
+        *tap = (2.0 * fc * RENDER_DECIMATION as f64 * sinc * window) as f32;
+    }
+    h
+}
+
 /// One-pole toward `target`; coeff derived from dt and MPE_SMOOTHING_TAU.
 fn smooth_mpe(current: &mut MpeData, target: &MpeData, dt: f32) {
     let coeff = dt / (MPE_SMOOTHING_TAU + dt);
     current.pressure += (target.pressure - current.pressure) * coeff;
     current.pitch_bend += (target.pitch_bend - current.pitch_bend) * coeff;
     current.timbre += (target.timbre - current.timbre) * coeff;
+}
+
+fn lerp_mpe(a: &MpeData, b: &MpeData, t: f32) -> MpeData {
+    MpeData {
+        pressure: a.pressure + (b.pressure - a.pressure) * t,
+        pitch_bend: a.pitch_bend + (b.pitch_bend - a.pitch_bend) * t,
+        timbre: a.timbre + (b.timbre - a.timbre) * t,
+    }
+}
+
+/// Turns discrete MPE updates into a smooth per-sample trajectory: each new
+/// target is reached by a linear ramp over roughly the update spacing
+/// (MPE_RAMP_MIN_S..MPE_RAMP_MAX_S), and the ramp output is one-pole
+/// smoothed. This makes trajectory smoothness independent of how coarsely a
+/// client sends updates (see MPE_RAMP_MIN_S rationale).
+#[derive(Default)]
+struct MpeInterp {
+    /// Smoothed value used for synthesis.
+    value: MpeData,
+    /// First stage of the two-pole smoother (see step()).
+    mid: MpeData,
+    from: MpeData,
+    target: MpeData,
+    /// Seconds into / total length of the current ramp.
+    ramp_pos: f32,
+    ramp_len: f32,
+    /// Seconds since the last update, measuring the client's send spacing.
+    since_update: f32,
+}
+
+impl MpeInterp {
+    /// Jump state straight to `mpe` (note-on: no sweep from stale values).
+    fn note_on(&mut self, mpe: MpeData) {
+        self.value = mpe;
+        self.mid = mpe;
+        self.from = mpe;
+        self.target = mpe;
+        self.ramp_pos = 1.0;
+        self.ramp_len = 1.0;
+        self.since_update = 0.0;
+    }
+
+    fn ramped(&self) -> MpeData {
+        let t = if self.ramp_len > 0.0 { (self.ramp_pos / self.ramp_len).min(1.0) } else { 1.0 };
+        lerp_mpe(&self.from, &self.target, t)
+    }
+
+    fn update(&mut self, mpe: MpeData) {
+        self.from = self.ramped();
+        self.target = mpe;
+        self.ramp_len = self.since_update.clamp(MPE_RAMP_MIN_S, MPE_RAMP_MAX_S);
+        self.ramp_pos = 0.0;
+        self.since_update = 0.0;
+    }
+
+    /// Advance one sample; returns the smoothed value to synthesise with.
+    /// Two cascaded one-poles: the ramp leaves velocity kinks at the update
+    /// rate, and a single pole passes enough of them to remain audible as
+    /// FM sidebands; the second pole buys another ~19 dB there for ~15 ms
+    /// of extra position lag.
+    fn step(&mut self, dt: f32) -> MpeData {
+        self.since_update += dt;
+        self.ramp_pos += dt;
+        let ramped = self.ramped();
+        smooth_mpe(&mut self.mid, &ramped, dt);
+        let mid = self.mid;
+        smooth_mpe(&mut self.value, &mid, dt);
+        self.value
+    }
 }
 
 // Delay line for wave propagation
@@ -592,7 +777,15 @@ pub struct WaveStimulus {
     frequency: f32,
     phase: f32,
     amplitude: f32,
+    /// Effective source position: chases `requested_pos` at no more than
+    /// SOURCE_SPEED_FRACTION of the wave speed.
     source_pos: (f32, f32),
+    /// Position requested by (smoothed) MPE.
+    requested_pos: (f32, f32),
+    /// Snap `source_pos` to the requested position on the next process
+    /// call (set at note-on so a new note doesn't sweep in from wherever
+    /// the slot's previous voice left off).
+    snap_position: bool,
     wave_speed: f32, // Individual wave speed for this stimulus
 
     // Envelope
@@ -600,10 +793,8 @@ pub struct WaveStimulus {
     env_level: f32,
     env_time: f32,
 
-    // MPE: `mpe` is the smoothed value used for synthesis, `mpe_target`
-    // is the most recent raw update from the controller
-    mpe: MpeData,
-    mpe_target: MpeData,
+    // Discrete controller updates -> smooth per-sample MPE trajectory
+    mpe: MpeInterp,
 }
 
 #[derive(Default, PartialEq)]
@@ -641,19 +832,41 @@ impl Stimulus for WaveStimulus {
             }
         }
 
-        // Smooth MPE toward the latest controller values
-        smooth_mpe(&mut self.mpe, &self.mpe_target, ctx.dt);
+        // Ramp + smooth MPE toward the latest controller values
+        let mpe = self.mpe.step(ctx.dt);
 
-        // Update source position from MPE, spanning the whole table:
+        // Requested source position from MPE, spanning the whole table:
         // pitch bend -1..1 -> x across the width, timbre 0..1 -> y along
         // the length (bend 0 / timbre 0.5 is the table centre)
         let (width, length) = ctx.table_m;
-        self.source_pos.0 = (0.5 + 0.5 * self.mpe.pitch_bend.clamp(-1.0, 1.0)) * width;
-        self.source_pos.1 = self.mpe.timbre.clamp(0.0, 1.0) * length;
+        self.requested_pos = (
+            (0.5 + 0.5 * mpe.pitch_bend.clamp(-1.0, 1.0)) * width,
+            mpe.timbre.clamp(0.0, 1.0) * length,
+        );
+
+        // The effective source chases the requested position at no more
+        // than SOURCE_SPEED_FRACTION of the wave speed, so the source can
+        // never outrun its own waves
+        if self.snap_position {
+            self.snap_position = false;
+            self.source_pos = self.requested_pos;
+        } else {
+            let dx = self.requested_pos.0 - self.source_pos.0;
+            let dy = self.requested_pos.1 - self.source_pos.1;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let max_step = SOURCE_SPEED_FRACTION * self.wave_speed * ctx.dt;
+            if dist <= max_step {
+                self.source_pos = self.requested_pos;
+            } else {
+                let scale = max_step / dist;
+                self.source_pos.0 += dx * scale;
+                self.source_pos.1 += dy * scale;
+            }
+        }
 
         // Generate source signal
         let source = (self.phase * 2.0 * std::f32::consts::PI).sin()
-                    * self.amplitude * self.env_level * self.mpe.pressure;
+                    * self.amplitude * self.env_level * mpe.pressure;
 
         // Process through delay lines
         for (i, &transducer_pos) in ctx.transducer_positions.iter().enumerate() {
@@ -661,7 +874,7 @@ impl Stimulus for WaveStimulus {
             let dy = transducer_pos.1 - self.source_pos.1;
             let distance = (dx * dx + dy * dy).sqrt();
 
-            let delay_time = distance / self.wave_speed.max(1.0); // Use per-stimulus wave speed, min 1.0 to avoid div by zero
+            let delay_time = distance / self.wave_speed.max(MIN_WAVE_SPEED); // per-stimulus wave speed, floor avoids div by zero
             let delay_samples = delay_time * ctx.sample_rate;
 
             let delayed = self.delay_lines[i].write_and_read(source, delay_samples);
@@ -688,8 +901,8 @@ impl Stimulus for WaveStimulus {
     fn note_on(&mut self, frequency: f32, velocity: u8, mpe: MpeData) {
         self.frequency = frequency;
         self.amplitude = velocity as f32 / 127.0;
-        self.mpe = mpe;
-        self.mpe_target = mpe;
+        self.mpe.note_on(mpe);
+        self.snap_position = true;
         self.env_state = EnvelopeState::Attack;
         self.env_time = 0.0;
         self.wave_speed = DEFAULT_WAVE_SPEED; // Overridden by set_wave_speed after note_on
@@ -703,7 +916,7 @@ impl Stimulus for WaveStimulus {
     }
 
     fn mpe_update(&mut self, mpe: MpeData) {
-        self.mpe_target = mpe;
+        self.mpe.update(mpe);
     }
 
     fn reset(&mut self) {
@@ -711,6 +924,8 @@ impl Stimulus for WaveStimulus {
             line.reset();
         }
         self.phase = 0.0;
+        self.snap_position = true;
+        self.mpe = MpeInterp::default();
         self.env_state = EnvelopeState::Idle;
         self.env_level = 0.0;
         self.env_time = 0.0;
@@ -731,8 +946,7 @@ pub struct StandingWaveStimulus {
     env_state: EnvelopeState,
     env_level: f32,
     env_time: f32,
-    mpe: MpeData,
-    mpe_target: MpeData,
+    mpe: MpeInterp,
 }
 
 impl Stimulus for StandingWaveStimulus {
@@ -761,10 +975,10 @@ impl Stimulus for StandingWaveStimulus {
             }
         }
 
-        smooth_mpe(&mut self.mpe, &self.mpe_target, ctx.dt);
+        let mpe = self.mpe.step(ctx.dt);
 
         let source = (self.phase * 2.0 * std::f32::consts::PI).sin()
-                    * self.amplitude * self.env_level * self.mpe.pressure;
+                    * self.amplitude * self.env_level * mpe.pressure;
 
         // Simple spatial distribution without delay
         for i in 0..TRANSDUCER_COUNT {
@@ -788,8 +1002,7 @@ impl Stimulus for StandingWaveStimulus {
     fn note_on(&mut self, frequency: f32, velocity: u8, mpe: MpeData) {
         self.frequency = frequency;
         self.amplitude = velocity as f32 / 127.0;
-        self.mpe = mpe;
-        self.mpe_target = mpe;
+        self.mpe.note_on(mpe);
         self.env_state = EnvelopeState::Attack;
         self.env_time = 0.0;
     }
@@ -802,7 +1015,7 @@ impl Stimulus for StandingWaveStimulus {
     }
 
     fn mpe_update(&mut self, mpe: MpeData) {
-        self.mpe_target = mpe;
+        self.mpe.update(mpe);
     }
 
     fn reset(&mut self) {
@@ -810,8 +1023,7 @@ impl Stimulus for StandingWaveStimulus {
         self.env_state = EnvelopeState::Idle;
         self.env_level = 0.0;
         self.env_time = 0.0;
-        self.mpe = MpeData::default();
-        self.mpe_target = MpeData::default();
+        self.mpe = MpeInterp::default();
     }
 }
 
@@ -948,8 +1160,43 @@ mod tests {
         half.pressure = 0.5;
         send(&mut producer, EngineCommand::MpeUpdate { channel: 5, mpe: half });
         run_samples(&mut engine, (0.1 * SAMPLE_RATE) as usize);
-        let target = engine.wave_pool.stimuli[0].mpe_target;
+        let target = engine.wave_pool.stimuli[0].mpe.target;
         assert_eq!(target.pressure, 1.0, "other channel's update must not leak in");
+    }
+
+    #[test]
+    fn source_position_is_velocity_limited() {
+        // Note-on at the table origin, then request a jump to the far
+        // corner: the effective source must snap at note-on, then travel
+        // at no more than SOURCE_SPEED_FRACTION x wave speed, eventually
+        // converging on the requested position.
+        let origin = MpeData { pressure: 1.0, pitch_bend: -1.0, timbre: 0.0 };
+        let far = MpeData { pressure: 1.0, pitch_bend: 1.0, timbre: 1.0 };
+        let (mut engine, mut producer, _lp, _voices) = StimulusEngine::new(TransducerLayout::default());
+        send(&mut producer, EngineCommand::NoteOn { note: 60, velocity: 100, channel: 1, mpe: origin });
+        run_samples(&mut engine, 64);
+        let start = engine.wave_pool.stimuli[0].source_pos;
+        assert!(start.0.abs() < 1e-3 && start.1.abs() < 1e-3, "note-on snaps to the requested position");
+
+        send(&mut producer, EngineCommand::MpeUpdate { channel: 1, mpe: far });
+        let window_s = 0.05;
+        run_samples(&mut engine, (window_s * SAMPLE_RATE) as usize);
+        let pos = engine.wave_pool.stimuli[0].source_pos;
+        let travelled = (pos.0 * pos.0 + pos.1 * pos.1).sqrt();
+        let limit = SOURCE_SPEED_FRACTION * DEFAULT_WAVE_SPEED * window_s;
+        assert!(travelled <= limit * 1.01, "moved {travelled} m, limit {limit} m");
+        // The requested position is ~2.24 m away, well beyond the limit, so
+        // a limited source should be pinned at (close to) full speed
+        assert!(travelled >= limit * 0.9, "moved only {travelled} m of the allowed {limit} m");
+        // The requested target is most of the way to the far corner (the
+        // ramp + two-pole MPE smoothing takes ~100 ms to fully converge)
+        let req = engine.wave_pool.stimuli[0].requested_pos;
+        assert!(req.0 > 0.75 && req.1 > 1.5, "requested position should be well on its way, at {req:?}");
+
+        // Given enough time, the effective source converges on the target
+        run_samples(&mut engine, (0.3 * SAMPLE_RATE) as usize);
+        let pos = engine.wave_pool.stimuli[0].source_pos;
+        assert!((pos.0 - 1.0).abs() < 1e-2 && (pos.1 - 2.0).abs() < 1e-2, "source should converge, at {pos:?}");
     }
 
     #[test]
@@ -1043,6 +1290,151 @@ mod tests {
         assert_eq!(left_peak, 0.0, "L is routed to the far channel; its wave hasn't arrived yet");
         assert!(right_peak > 0.0, "R is routed to the near channel and should sound");
         assert!(levels[0] > 0.0, "logical levels stay pre-routing");
+    }
+
+    #[test]
+    fn reconstruction_fir_has_unity_dc_gain_and_strong_image_rejection() {
+        let h = design_reconstruction_fir();
+        // Every polyphase branch must pass DC at unity, or the output would
+        // carry amplitude ripple at the internal rate
+        for p in 0..RENDER_DECIMATION {
+            let sum: f32 = (0..FIR_TAPS_PER_PHASE).map(|k| h[k * RENDER_DECIMATION + p]).sum();
+            assert!((sum - 1.0).abs() < 0.01, "phase {p} DC gain {sum}");
+        }
+        // Frequency response at the first image of a 200 Hz tone
+        // (internal_rate - 200 Hz): must be deep in the stopband
+        let (sr, f_content) = (48000.0f64, 200.0f64);
+        let f_image = sr / RENDER_DECIMATION as f64 - f_content;
+        let respond = |freq: f64| -> f64 {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (n, &tap) in h.iter().enumerate() {
+                let w = 2.0 * std::f64::consts::PI * freq * n as f64 / sr;
+                re += tap as f64 * w.cos();
+                im -= tap as f64 * w.sin();
+            }
+            (re * re + im * im).sqrt() / RENDER_DECIMATION as f64
+        };
+        let passband_db = 20.0 * respond(f_content).log10();
+        let image_db = 20.0 * respond(f_image).log10();
+        assert!(passband_db.abs() < 0.1, "200 Hz passband gain {passband_db} dB");
+        assert!(image_db < -90.0, "first-image rejection only {image_db} dB");
+    }
+
+    #[test]
+    fn upsampled_output_is_independent_of_block_chunking() {
+        let make = || {
+            let (engine, mut producer, _lp, _voices) =
+                StimulusEngine::new(TransducerLayout::default());
+            send(&mut producer, EngineCommand::NoteOn {
+                note: 60, velocity: 100, channel: 1, mpe: full_mpe(),
+            });
+            (engine, producer)
+        };
+        let frames = 4800; // 100 ms at the device rate
+        let mut levels = [0.0f32; TRANSDUCER_COUNT];
+
+        let (mut a, _keep_a) = make();
+        let mut whole = vec![0.0f32; frames * 2];
+        a.process_block(&mut whole, 2, SAMPLE_RATE, &mut levels);
+
+        let (mut b, _keep_b) = make();
+        let mut chunked = vec![0.0f32; frames * 2];
+        let mut off = 0;
+        for &size in [512usize, 100, 60, 7, 1024, 300].iter().cycle() {
+            if off >= frames {
+                break;
+            }
+            let n = size.min(frames - off);
+            b.process_block(&mut chunked[off * 2..(off + n) * 2], 2, SAMPLE_RATE, &mut levels);
+            off += n;
+        }
+        assert!(whole.iter().any(|&s| s != 0.0), "note should be audible in the window");
+        assert_eq!(whole, chunked, "upsampler state must carry across arbitrary block boundaries");
+    }
+
+    /// Debug harness, not a regression test: drives the engine exactly like
+    /// the audio callback against a dummy 32-channel device while replaying
+    /// the viewer's orbit command stream, and captures the raw 32-channel
+    /// output to disk for offline analysis. Run explicitly:
+    ///
+    ///   HAPTIC_CAPTURE_OUT=/path/dir cargo test -p haptic-server --release \
+    ///       orbit_capture -- --ignored --nocapture
+    ///
+    /// Optional env: HAPTIC_CAPTURE_WAVE_SPEED (1.0), HAPTIC_CAPTURE_SECS
+    /// (13), HAPTIC_CAPTURE_SR (48000), HAPTIC_CAPTURE_BLOCK (512),
+    /// HAPTIC_CAPTURE_ORBIT_PERIOD (6), HAPTIC_CAPTURE_NOTE (60),
+    /// HAPTIC_CAPTURE_MPE_MS (8).
+    #[test]
+    #[ignore]
+    fn orbit_capture_writes_debug_buffers() {
+        use std::io::Write as _;
+
+        let env_f32 = |key: &str, default: f32| {
+            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        };
+        let out_dir = std::env::var("HAPTIC_CAPTURE_OUT")
+            .unwrap_or_else(|_| "target/orbit-capture".into());
+        let wave_speed = env_f32("HAPTIC_CAPTURE_WAVE_SPEED", 1.0);
+        let secs = env_f32("HAPTIC_CAPTURE_SECS", 13.0);
+        let sample_rate = env_f32("HAPTIC_CAPTURE_SR", 48000.0);
+        let block = env_f32("HAPTIC_CAPTURE_BLOCK", 512.0) as usize;
+        let orbit_period = env_f32("HAPTIC_CAPTURE_ORBIT_PERIOD", 6.0);
+        let note = env_f32("HAPTIC_CAPTURE_NOTE", 60.0) as u8;
+        let mpe_interval = env_f32("HAPTIC_CAPTURE_MPE_MS", 8.0) as f64 / 1000.0;
+
+        let layout = TransducerLayout::default();
+        let (width, length) = layout.table_m;
+        let (mut engine, mut producer, _lp, _voices) = StimulusEngine::new(layout);
+
+        // Mimic the viewer's start(): wave speed first, then note-on at the
+        // resting source position (table centre), then orbit MPE updates
+        send(&mut producer, EngineCommand::SetParameter {
+            parameter: Parameter::WaveSpeed(wave_speed),
+        });
+        send(&mut producer, EngineCommand::NoteOn {
+            note,
+            velocity: 100,
+            channel: 15,
+            mpe: MpeData { pressure: 1.0, pitch_bend: 0.0, timbre: 0.5 },
+        });
+
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let path = format!("{out_dir}/orbit_c{wave_speed}_sr{sample_rate}.f32");
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+
+        let mut next_mpe = 0.0f64;
+        let mut orbit_phase = 0.0f32;
+        let radius = 0.35 * width.min(length);
+        let mut data = vec![0.0f32; block * TRANSDUCER_COUNT];
+        let mut levels = [0.0f32; TRANSDUCER_COUNT];
+        let total_blocks = (secs as f64 * sample_rate as f64 / block as f64) as usize;
+        for b in 0..total_blocks {
+            let t = b as f64 * block as f64 / sample_rate as f64;
+            while t >= next_mpe {
+                orbit_phase += std::f32::consts::TAU * mpe_interval as f32 / orbit_period;
+                let sx = 0.5 * width + radius * orbit_phase.cos();
+                let sy = 0.5 * length + radius * orbit_phase.sin();
+                send(&mut producer, EngineCommand::MpeUpdate {
+                    channel: 15,
+                    mpe: MpeData {
+                        pressure: 1.0,
+                        pitch_bend: (2.0 * sx / width - 1.0).clamp(-1.0, 1.0),
+                        timbre: (sy / length).clamp(0.0, 1.0),
+                    },
+                });
+                next_mpe += mpe_interval;
+            }
+            engine.process_block(&mut data, TRANSDUCER_COUNT, sample_rate, &mut levels);
+            let bytes: Vec<u8> = data.iter().flat_map(|s| s.to_le_bytes()).collect();
+            file.write_all(&bytes).unwrap();
+        }
+        file.flush().unwrap();
+        eprintln!(
+            "captured {} blocks ({} s) of 32ch f32le to {}",
+            total_blocks,
+            total_blocks * block / sample_rate as usize,
+            path
+        );
     }
 
     #[test]

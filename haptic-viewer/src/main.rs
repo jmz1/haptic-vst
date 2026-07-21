@@ -14,6 +14,10 @@
 //! physical outputs by clicking circles (left-click → output 1/L,
 //! right-click → output 2/R).
 //!
+//! Two source cursors are drawn: a ring at the MPE-requested position and
+//! a cross at the effective source, which the engine velocity-limits to a
+//! fraction of the wave speed so the source never outruns its own waves.
+//!
 //! Rendering repaints continuously under vsync, so a 120 Hz display
 //! renders at 120 fps (see the on-screen fps counter).
 
@@ -62,7 +66,10 @@ struct VoiceView {
     note: u8,
     frequency: f32,
     wave_speed: f32,
+    /// Effective (velocity-limited) source the delay lines radiate from.
     source_pos: (f32, f32),
+    /// Where MPE is asking the source to be.
+    requested_pos: (f32, f32),
     amplitude: f32,
     sample_rate: f32,
     delay_samples: [f32; TRANSDUCERS],
@@ -182,6 +189,7 @@ fn apply_message(shared: &Mutex<Shared>, msg: ServerStatus) {
             frequency,
             wave_speed,
             source_pos,
+            requested_pos,
             amplitude,
             sample_rate,
             delay_samples,
@@ -189,7 +197,16 @@ fn apply_message(shared: &Mutex<Shared>, msg: ServerStatus) {
         } => {
             let mut state = shared.lock();
             state.voice = Some((
-                VoiceView { note, frequency, wave_speed, source_pos, amplitude, sample_rate, delay_samples },
+                VoiceView {
+                    note,
+                    frequency,
+                    wave_speed,
+                    source_pos,
+                    requested_pos,
+                    amplitude,
+                    sample_rate,
+                    delay_samples,
+                },
                 Instant::now(),
             ));
             state.voice_rate.tick();
@@ -275,7 +292,7 @@ impl Default for TestControls {
             playing: None,
             note: 60,
             velocity: 100,
-            wave_speed: 20.0,
+            wave_speed: 1.0,
             orbit: false,
             orbit_period_s: 6.0,
             orbit_phase: 0.0,
@@ -403,7 +420,7 @@ impl eframe::App for ViewerApp {
 
         egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
             ui.add_enabled_ui(connected, |ui| self.test_controls_ui(ui, table));
-            ui.label("drag on table: move source   ·   left-click a cell: monitor on output 1 (L)   ·   right-click: output 2 (R)");
+            ui.label("drag on table: move source (○ requested, ✚ effective)   ·   left-click a cell: monitor on output 1 (L)   ·   right-click: output 2 (R)");
         });
 
         let mut interaction = TableInteraction::default();
@@ -483,7 +500,7 @@ impl ViewerApp {
             ui.add(egui::Slider::new(&mut self.test.velocity, 1..=127));
             ui.label("wave speed");
             ui.add(
-                egui::Slider::new(&mut self.test.wave_speed, 20.0..=500.0)
+                egui::Slider::new(&mut self.test.wave_speed, 0.25..=10.0)
                     .logarithmic(true)
                     .suffix(" m/s"),
             );
@@ -616,9 +633,19 @@ fn draw_table(
         }
     }
 
-    // MPE-driven source position
+    // Source cursors: the ring is the MPE-requested position, the cross is
+    // the effective (velocity-limited) source the delay lines radiate from;
+    // a tether joins them while the source is still catching up
     if let Some(v) = voice {
         let src = to_screen(v.source_pos.0, v.source_pos.1);
+        let req = to_screen(v.requested_pos.0, v.requested_pos.1);
+        if req.distance(src) > 1.0 {
+            painter.line_segment(
+                [src, req],
+                egui::Stroke::new(1.0, egui::Color32::from_gray(140)),
+            );
+        }
+        painter.circle_stroke(req, 6.0, egui::Stroke::new(1.5, egui::Color32::from_gray(180)));
         let arm = 7.0;
         let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
         painter.line_segment([src - egui::vec2(arm, 0.0), src + egui::vec2(arm, 0.0)], stroke);

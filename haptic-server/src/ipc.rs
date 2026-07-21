@@ -132,6 +132,7 @@ pub fn listen_loop(
                     frequency: v.frequency,
                     wave_speed: v.wave_speed,
                     source_pos: v.source_pos,
+                    requested_pos: v.requested_pos,
                     amplitude: v.amplitude,
                     sample_rate: v.sample_rate,
                     delay_samples: v.delay_samples,

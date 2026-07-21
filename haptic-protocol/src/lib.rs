@@ -91,6 +91,8 @@ pub enum ServerStatus {
     /// voice, for phase visualisation. `delay_samples` are the actual
     /// per-transducer propagation delays in use; relative phase at
     /// transducer i is 2*pi * frequency * delay_samples[i] / sample_rate.
+    /// `source_pos` is the effective (velocity-limited) source the delay
+    /// lines radiate from; `requested_pos` is where MPE is asking it to be.
     VoiceState {
         timestamp_us: u64,
         seq: u64,
@@ -98,6 +100,7 @@ pub enum ServerStatus {
         frequency: f32,
         wave_speed: f32,
         source_pos: (f32, f32),
+        requested_pos: (f32, f32),
         amplitude: f32,
         sample_rate: f32,
         delay_samples: [f32; 32],
