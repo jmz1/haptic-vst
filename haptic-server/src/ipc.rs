@@ -13,7 +13,7 @@ use crate::engine::VoiceSnapshot;
 /// Minimum interval between TransducerLevels broadcasts (~60 Hz).
 const LEVELS_BROADCAST_INTERVAL: Duration = Duration::from_millis(16);
 
-/// Minimum interval between VoiceState broadcasts. 4 ms (~250 Hz) keeps the
+/// Minimum interval between ActiveVoices broadcasts. 4 ms (~250 Hz) keeps the
 /// socket well ahead of a 120 Hz display without flooding slow clients.
 const VOICE_BROADCAST_INTERVAL: Duration = Duration::from_millis(4);
 
@@ -21,6 +21,18 @@ const VOICE_BROADCAST_INTERVAL: Duration = Duration::from_millis(4);
 struct Client {
     stream: UnixStream,
     decoder: FrameDecoder,
+    /// Instance identity bound by this connection's `Hello`. Every command
+    /// from this client is stamped with it before entering the engine queue.
+    /// 0 until a `Hello` arrives (the default-instance fallback).
+    instance_id: u64,
+    /// Whether this client receives the status stream (set true when it
+    /// identifies as an Observer in its `Hello`). Controllers never receive
+    /// status, so a pure write-side plugin is never dropped for an unread
+    /// socket. False until `Hello`.
+    wants_status: bool,
+    /// Whether the one-time layout+routing greeting has been sent (only to
+    /// observers, once they identify).
+    greeted: bool,
 }
 
 pub fn listen_loop(
@@ -55,28 +67,22 @@ pub fn listen_loop(
     while running.load(Ordering::Relaxed) {
         // Accept new connections
         match listener.accept() {
-            Ok((mut stream, _)) => {
+            Ok((stream, _)) => {
                 eprintln!("New client connected");
                 if let Err(e) = stream.set_nonblocking(true) {
                     eprintln!("Failed to set stream nonblocking: {}", e);
                     continue;
                 }
-                // Greet each client with the resolved layout and current
-                // monitor routing so viewers mirror the running state
-                let routing = routing_status(&routes, device_channels.load(Ordering::Relaxed));
-                let mut greeted = true;
-                for status in [layout_status(&layout), routing] {
-                    if encode_frame(&status, &mut status_frame).is_ok() {
-                        if let Err(e) = stream.write_all(&status_frame) {
-                            eprintln!("Dropping client on greeting write failure: {}", e);
-                            greeted = false;
-                            break;
-                        }
-                    }
-                }
-                if greeted {
-                    clients.push(Client { stream, decoder: FrameDecoder::new() });
-                }
+                // The layout+routing greeting is deferred until the client
+                // identifies as an Observer in its Hello (below): controllers
+                // receive no status at all.
+                clients.push(Client {
+                    stream,
+                    decoder: FrameDecoder::new(),
+                    instance_id: 0,
+                    wants_status: false,
+                    greeted: false,
+                });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // No new connections, continue
@@ -91,8 +97,21 @@ pub fn listen_loop(
             handle_client(client, &mut command_producer, &mut routes, &mut routing_dirty)
         });
 
-        // Broadcast routing when it changes or once the device is known
+        // Greet newly-identified observers with the resolved layout and
+        // current monitor routing so they mirror the running state.
         let dc = device_channels.load(Ordering::Relaxed);
+        for client in clients.iter_mut() {
+            if client.wants_status && !client.greeted {
+                for status in [layout_status(&layout), routing_status(&routes, dc)] {
+                    if encode_frame(&status, &mut status_frame).is_ok() {
+                        let _ = client.stream.write_all(&status_frame);
+                    }
+                }
+                client.greeted = true;
+            }
+        }
+
+        // Broadcast routing when it changes or once the device is known
         if dc != last_device_channels {
             last_device_channels = dc;
             routing_dirty = true;
@@ -125,17 +144,11 @@ pub fn listen_loop(
         if let Some(v) = latest_voice {
             if last_voice_broadcast.elapsed() >= VOICE_BROADCAST_INTERVAL {
                 last_voice_broadcast = Instant::now();
-                let status = ServerStatus::VoiceState {
+                let status = ServerStatus::ActiveVoices {
                     timestamp_us: now_us(),
-                    seq: v.seq,
-                    note: v.note,
-                    frequency: v.frequency,
-                    wave_speed: v.wave_speed,
-                    source_pos: v.source_pos,
-                    requested_pos: v.requested_pos,
-                    amplitude: v.amplitude,
                     sample_rate: v.sample_rate,
-                    delay_samples: v.delay_samples,
+                    count: v.count,
+                    voices: v.voices,
                 };
                 if encode_frame(&status, &mut status_frame).is_ok() {
                     broadcast(&mut clients, &status_frame);
@@ -183,14 +196,20 @@ fn routing_status(routes: &[u8; 32], device_channels: u16) -> ServerStatus {
     ServerStatus::MonitorRouting { device_channels, routes: *routes }
 }
 
-/// Write a frame to every client, dropping clients whose stream fails
-/// (a partial write would corrupt their framing anyway).
+/// Write a frame to every observer client, dropping clients whose stream
+/// fails (a partial write would corrupt their framing anyway). Controllers
+/// (which never read) are skipped so their socket buffers never fill.
 fn broadcast(clients: &mut Vec<Client>, frame: &[u8]) {
-    clients.retain_mut(|client| match client.stream.write_all(frame) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("Dropping client on status write failure: {}", e);
-            false
+    clients.retain_mut(|client| {
+        if !client.wants_status {
+            return true;
+        }
+        match client.stream.write_all(frame) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("Dropping client on status write failure: {}", e);
+                false
+            }
         }
     });
 }
@@ -225,6 +244,12 @@ fn handle_client(
     loop {
         match client.decoder.next_frame::<HapticCommand>() {
             Ok(Some(command)) => {
+                // Bind this connection's instance identity and status role
+                // on handshake.
+                if let HapticCommand::Hello { instance_id, role, .. } = &command {
+                    client.instance_id = *instance_id;
+                    client.wants_status = *role == haptic_protocol::ClientRole::Observer;
+                }
                 // Track routing changes for rebroadcast to all clients
                 if let HapticCommand::SetParameter {
                     parameter: Parameter::MonitorRoute { output, source },
@@ -236,7 +261,8 @@ fn handle_client(
                         *routing_dirty = true;
                     }
                 }
-                if command_producer.push(command.into()).is_err() {
+                let engine_cmd = crate::engine::EngineCommand::from_wire(command, client.instance_id);
+                if command_producer.push(engine_cmd).is_err() {
                     // Ring buffer full: the audio thread is not draining or
                     // the client is flooding; drop the command
                     eprintln!("Command queue full, dropping command");
@@ -302,9 +328,17 @@ mod tests {
         }
         let mut stream = stream.expect("connect to listener");
 
-        // Two frames coalesced into a single write
+        // Handshake first (as an Observer), then two frames coalesced into a
+        // single write. The Hello binds instance_id 42 to this connection, so
+        // the following commands must arrive stamped with it.
         let mut coalesced = Vec::new();
         let mut frame = Vec::new();
+        encode_frame(&HapticCommand::Hello {
+            instance_id: 42,
+            role: haptic_protocol::ClientRole::Observer,
+            config: haptic_protocol::InstanceConfig::default(),
+        }, &mut frame).unwrap();
+        coalesced.extend_from_slice(&frame);
         encode_frame(&HapticCommand::NoteOn {
             timestamp_us: 0,
             note: 60,
@@ -339,9 +373,39 @@ mod tests {
                 thread::sleep(Duration::from_millis(5));
             }
         };
-        assert!(matches!(pop_with_timeout(), EngineCommand::NoteOn { note: 60, channel: 1, .. }));
-        assert!(matches!(pop_with_timeout(), EngineCommand::MpeUpdate { channel: 1, .. }));
-        assert!(matches!(pop_with_timeout(), EngineCommand::NoteOff { note: 60, channel: 1 }));
+        // Handshake becomes a RegisterInstance; every following command is
+        // stamped with the connection's bound instance_id (42).
+        assert!(matches!(pop_with_timeout(), EngineCommand::RegisterInstance { instance_id: 42, .. }));
+        assert!(matches!(pop_with_timeout(), EngineCommand::NoteOn { instance_id: 42, note: 60, channel: 1, .. }));
+        assert!(matches!(pop_with_timeout(), EngineCommand::MpeUpdate { instance_id: 42, channel: 1, .. }));
+        assert!(matches!(pop_with_timeout(), EngineCommand::NoteOff { instance_id: 42, note: 60, channel: 1 }));
+
+        // Role-gating: the Observer above receives the layout+routing greeting.
+        stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut buf = [0u8; 256];
+        let n = stream.read(&mut buf).expect("observer should receive a greeting");
+        assert!(n > 0, "observer received no status");
+
+        // A Controller connection receives no status at all (so a pure
+        // write-side plugin is never dropped for an unread socket).
+        let mut ctrl = UnixStream::connect(SOCKET_PATH).expect("second connect");
+        encode_frame(&HapticCommand::Hello {
+            instance_id: 99,
+            role: haptic_protocol::ClientRole::Controller,
+            config: haptic_protocol::InstanceConfig::default(),
+        }, &mut frame).unwrap();
+        ctrl.write_all(&frame).unwrap();
+        assert!(matches!(pop_with_timeout(), EngineCommand::RegisterInstance { instance_id: 99, .. }));
+        ctrl.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut cbuf = [0u8; 64];
+        match ctrl.read(&mut cbuf) {
+            Ok(0) => {}                                    // closed, fine
+            Ok(n) => panic!("controller received {n} bytes of status"),
+            Err(e) => assert!(
+                matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+                "unexpected read error: {e}"
+            ),
+        }
 
         running.store(false, Ordering::Relaxed);
         listener.join().unwrap();

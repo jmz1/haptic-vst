@@ -2,7 +2,7 @@ use nih_plug::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use parking_lot::Mutex;
-use haptic_protocol::{HapticCommand, MpeData, Parameter, StimulusType};
+use haptic_protocol::{ClientRole, HapticCommand, InstanceConfig, MpeData, Parameter, StimulusType};
 
 mod ipc_client;
 mod editor;
@@ -32,6 +32,11 @@ impl From<StimulusTypeParam> for StimulusType {
 pub struct HapticPlugin {
     params: Arc<HapticParams>,
     ipc_client: Arc<Mutex<Option<IpcClient>>>,
+    /// Stable identity for this plugin instance, generated once at
+    /// construction and sent in the `Hello` handshake. The server keys this
+    /// instance's note-type config and voice identity on it, so concurrent
+    /// instances never contend over a shared global or collide on notes.
+    instance_id: u64,
     /// Last known MPE state per MIDI channel. Each incoming event updates
     /// one dimension; the full merged struct is sent so the server never
     /// sees defaults overwrite dimensions carried by other message types.
@@ -39,6 +44,23 @@ pub struct HapticPlugin {
     // Last parameter values pushed to the server (None = never sent)
     last_sent_wave_speed: Option<f32>,
     last_sent_stimulus_type: Option<StimulusTypeParam>,
+}
+
+/// A process-unique, non-zero instance id (0 is the server's default-instance
+/// fallback). Combines wall-clock nanos, the pid, and a per-process counter so
+/// several instances constructed in the same host process stay distinct.
+fn new_instance_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let id = nanos
+        ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ ((std::process::id() as u64) << 32);
+    if id == 0 { 1 } else { id }
 }
 
 #[derive(Params)]
@@ -55,6 +77,7 @@ impl Default for HapticPlugin {
         Self {
             params: Arc::new(HapticParams::default()),
             ipc_client: Arc::new(Mutex::new(None)),
+            instance_id: new_instance_id(),
             mpe_state: [MpeData::default(); MIDI_CHANNELS],
             last_sent_wave_speed: None,
             last_sent_stimulus_type: None,
@@ -124,8 +147,20 @@ impl Plugin for HapticPlugin {
         // Try to connect to IPC server
         match IpcClient::connect() {
             Ok(client) => {
+                // Handshake first: register this instance's identity, its
+                // controller role (no status stream), and its initial
+                // note-type config, before any notes are sent.
+                let hello = HapticCommand::Hello {
+                    instance_id: self.instance_id,
+                    role: ClientRole::Controller,
+                    config: InstanceConfig {
+                        stimulus_type: self.params.stimulus_type.value().into(),
+                        wave_speed: self.params.wave_speed.value(),
+                    },
+                };
+                send_or_log(&client, hello);
                 *self.ipc_client.lock() = Some(client);
-                nih_log!("Successfully connected to haptic server");
+                nih_log!("Connected to haptic server as instance {}", self.instance_id);
             }
             Err(e) => {
                 nih_log!("Failed to connect to haptic server: {}", e);

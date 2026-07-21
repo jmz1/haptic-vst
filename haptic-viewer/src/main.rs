@@ -30,11 +30,17 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use haptic_protocol::{
-    encode_frame, FrameDecoder, HapticCommand, MpeData, Parameter, ServerStatus, SOCKET_PATH,
+    encode_frame, ClientRole, FrameDecoder, HapticCommand, InstanceConfig, MpeData, Parameter,
+    ServerStatus, StimulusType, SOCKET_PATH,
 };
 use parking_lot::Mutex;
 
 const TRANSDUCERS: usize = 32;
+
+/// Wave-speed floor mirroring the engine's `MIN_WAVE_SPEED`, used when the
+/// viewer reconstructs per-transducer delays geometrically from a voice's
+/// source position and wave speed.
+const WAVE_SPEED_FLOOR: f32 = 0.25;
 
 /// OKLCH hue of sRGB blue: the reference for zero phase difference.
 const ZERO_PHASE_HUE_DEG: f32 = 264.0;
@@ -63,7 +69,9 @@ struct LayoutView {
 
 #[derive(Clone, Copy)]
 struct VoiceView {
+    instance_id: u64,
     note: u8,
+    note_type: StimulusType,
     frequency: f32,
     wave_speed: f32,
     /// Effective (velocity-limited) source the delay lines radiate from.
@@ -71,8 +79,6 @@ struct VoiceView {
     /// Where MPE is asking the source to be.
     requested_pos: (f32, f32),
     amplitude: f32,
-    sample_rate: f32,
-    delay_samples: [f32; TRANSDUCERS],
 }
 
 #[derive(Clone, Copy)]
@@ -87,7 +93,9 @@ struct Shared {
     /// Writable clone of the socket for sending commands from the UI.
     writer: Option<UnixStream>,
     layout: Option<LayoutView>,
-    voice: Option<(VoiceView, Instant)>,
+    /// All active voices from the last `ActiveVoices` broadcast, with the
+    /// time it arrived (for staleness).
+    voices: Option<(Vec<VoiceView>, Instant)>,
     routing: Option<RoutingView>,
     voice_rate: RateCounter,
 }
@@ -135,12 +143,31 @@ fn send_command(shared: &Mutex<Shared>, cmd: &HapticCommand) {
 // Socket reader
 // ---------------------------------------------------------------------------
 
-fn reader_thread(shared: Arc<Mutex<Shared>>) {
+fn reader_thread(shared: Arc<Mutex<Shared>>, instance_id: u64) {
     loop {
         let Ok(mut stream) = UnixStream::connect(SOCKET_PATH) else {
             thread::sleep(Duration::from_millis(500));
             continue;
         };
+        // Handshake as an Observer so the server sends us the status stream
+        // (controllers receive none). Our own test notes are stamped with this
+        // same instance_id server-side, so the viewer's wave-speed slider sets
+        // its own config and never contends with a plugin's.
+        {
+            let mut hello = Vec::with_capacity(64);
+            if encode_frame(
+                &HapticCommand::Hello {
+                    instance_id,
+                    role: ClientRole::Observer,
+                    config: InstanceConfig::default(),
+                },
+                &mut hello,
+            )
+            .is_ok()
+            {
+                let _ = stream.write_all(&hello);
+            }
+        }
         {
             let mut state = shared.lock();
             state.connected = true;
@@ -170,7 +197,7 @@ fn reader_thread(shared: Arc<Mutex<Shared>>) {
         let mut state = shared.lock();
         state.connected = false;
         state.writer = None;
-        state.voice = None;
+        state.voices = None;
         drop(state);
         thread::sleep(Duration::from_millis(500));
     }
@@ -184,31 +211,23 @@ fn apply_message(shared: &Mutex<Shared>, msg: ServerStatus) {
         ServerStatus::MonitorRouting { device_channels, routes } => {
             shared.lock().routing = Some(RoutingView { device_channels, routes });
         }
-        ServerStatus::VoiceState {
-            note,
-            frequency,
-            wave_speed,
-            source_pos,
-            requested_pos,
-            amplitude,
-            sample_rate,
-            delay_samples,
-            ..
-        } => {
+        ServerStatus::ActiveVoices { count, voices, .. } => {
+            let list: Vec<VoiceView> = voices
+                .iter()
+                .take(count as usize)
+                .map(|v| VoiceView {
+                    instance_id: v.instance_id,
+                    note: v.note,
+                    note_type: v.note_type,
+                    frequency: v.frequency,
+                    wave_speed: v.wave_speed,
+                    source_pos: v.source_pos,
+                    requested_pos: v.requested_pos,
+                    amplitude: v.amplitude,
+                })
+                .collect();
             let mut state = shared.lock();
-            state.voice = Some((
-                VoiceView {
-                    note,
-                    frequency,
-                    wave_speed,
-                    source_pos,
-                    requested_pos,
-                    amplitude,
-                    sample_rate,
-                    delay_samples,
-                },
-                Instant::now(),
-            ));
+            state.voices = Some((list, Instant::now()));
             state.voice_rate.tick();
         }
         _ => {}
@@ -352,10 +371,23 @@ impl TestControls {
 // App
 // ---------------------------------------------------------------------------
 
+/// Which active voices the field visualisation includes. The viewer is the
+/// one observer of whole-server state, so by default it sums every voice;
+/// filtering narrows to a single controller instance.
+#[derive(Clone, Copy, PartialEq)]
+enum VoiceFilter {
+    /// Sum the field of every active voice (whole-system state).
+    All,
+    /// Only voices owned by this instance.
+    Instance(u64),
+}
+
 struct ViewerApp {
     shared: Arc<Mutex<Shared>>,
     fps: RateCounter,
     test: TestControls,
+    /// Which voices the field visualisation includes.
+    filter: VoiceFilter,
     /// Parameter values in effect for the sounding note, to retrigger when
     /// the user lands on new slider values.
     sounding_params: (u8, u8, f32),
@@ -382,13 +414,37 @@ impl eframe::App for ViewerApp {
         self.fps.tick();
         let fps = self.fps.rate();
 
-        let (connected, layout, voice, routing, voice_rate) = {
+        let (connected, layout, voices, routing, voice_rate) = {
             let mut state = self.shared.lock();
             let rate = state.voice_rate.rate();
-            (state.connected, state.layout, state.voice, state.routing, rate)
+            let voices = state
+                .voices
+                .as_ref()
+                .filter(|(_, at)| at.elapsed() < VOICE_STALE)
+                .map(|(v, _)| v.clone())
+                .unwrap_or_default();
+            (state.connected, state.layout, voices, state.routing, rate)
         };
-        let fresh_voice = voice.and_then(|(v, at)| (at.elapsed() < VOICE_STALE).then_some(v));
         let table = layout.map(|l| l.table_m).unwrap_or((1.0, 2.0));
+
+        // Distinct instances currently sounding, for the filter picker.
+        let mut instances: Vec<u64> = voices.iter().map(|v| v.instance_id).collect();
+        instances.sort_unstable();
+        instances.dedup();
+        // Drop a stale instance filter back to All if that instance went quiet.
+        if let VoiceFilter::Instance(id) = self.filter {
+            if !instances.contains(&id) {
+                self.filter = VoiceFilter::All;
+            }
+        }
+        let shown: Vec<VoiceView> = voices
+            .iter()
+            .copied()
+            .filter(|v| match self.filter {
+                VoiceFilter::All => true,
+                VoiceFilter::Instance(id) => v.instance_id == id,
+            })
+            .collect();
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -402,23 +458,25 @@ impl eframe::App for ViewerApp {
                     ui.label(format!("device: {} ch", r.device_channels));
                 }
                 ui.separator();
-                match fresh_voice {
-                    Some(v) => ui.label(format!(
-                        "note {} ({:.1} Hz)   c = {:.0} m/s   λ = {:.2} m   amp {:.2}",
-                        note_name(v.note),
-                        v.frequency,
-                        v.wave_speed,
-                        v.wave_speed / v.frequency,
-                        v.amplitude,
-                    )),
-                    None => ui.label("no active voice"),
-                };
+                ui.label(match voices.len() {
+                    0 => "no active voices".to_string(),
+                    n => format!("{n} voice(s), {} instance(s)", instances.len()),
+                });
+                if shown.len() == 1 {
+                    let v = &shown[0];
+                    ui.separator();
+                    ui.label(format!(
+                        "{:?} · note {} ({:.1} Hz)  c = {:.0} m/s  λ = {:.2} m",
+                        v.note_type, note_name(v.note), v.frequency, v.wave_speed, v.wave_speed / v.frequency,
+                    ));
+                }
                 ui.separator();
                 ui.label(format!("{fps} fps / {voice_rate} msg/s"));
             });
         });
 
         egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
+            self.filter_ui(ui, &instances);
             ui.add_enabled_ui(connected, |ui| self.test_controls_ui(ui, table));
             ui.label("drag on table: move source (○ requested, ✚ effective)   ·   left-click a cell: monitor on output 1 (L)   ·   right-click: output 2 (R)");
         });
@@ -431,7 +489,7 @@ impl eframe::App for ViewerApp {
                 });
                 return;
             };
-            interaction = draw_table(ui, &layout, fresh_voice.as_ref(), routing.as_ref());
+            interaction = draw_table(ui, &layout, &shown, routing.as_ref());
         });
 
         // Apply table interactions
@@ -478,6 +536,30 @@ impl eframe::App for ViewerApp {
 }
 
 impl ViewerApp {
+    /// Filter picker: sum the whole system, or narrow to one controller
+    /// instance. Instances are labelled by a short hash of their id.
+    fn filter_ui(&mut self, ui: &mut egui::Ui, instances: &[u64]) {
+        ui.horizontal(|ui| {
+            ui.label("visualise:");
+            let label = match self.filter {
+                VoiceFilter::All => "all instances (summed)".to_string(),
+                VoiceFilter::Instance(id) => format!("instance {:04x}", id & 0xffff),
+            };
+            egui::ComboBox::from_id_salt("voice_filter")
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.filter, VoiceFilter::All, "all instances (summed)");
+                    for &id in instances {
+                        ui.selectable_value(
+                            &mut self.filter,
+                            VoiceFilter::Instance(id),
+                            format!("instance {:04x}", id & 0xffff),
+                        );
+                    }
+                });
+        });
+    }
+
     fn test_controls_ui(&mut self, ui: &mut egui::Ui, table: (f32, f32)) {
         ui.horizontal(|ui| {
             let playing = self.test.playing.is_some();
@@ -515,10 +597,29 @@ impl ViewerApp {
     }
 }
 
+/// Complex field (re, im) at a transducer, summed over `voices`: each voice
+/// contributes a phasor `amp_i · e^{j·φ_i}` where `φ_i = 2π f τ_i` is its
+/// propagation phase lag (τ_i reconstructed geometrically) and `amp_i` is its
+/// source level with distance attenuation. Interference between voices is thus
+/// rendered directly. Returns the pre-gain complex sum.
+fn field_at(pos: (f32, f32), voices: &[VoiceView]) -> (f32, f32) {
+    let (mut re, mut im) = (0.0f32, 0.0f32);
+    for v in voices {
+        let dx = pos.0 - v.source_pos.0;
+        let dy = pos.1 - v.source_pos.1;
+        let dist = (dx * dx + dy * dy).sqrt();
+        let phi = std::f32::consts::TAU * v.frequency * dist / v.wave_speed.max(WAVE_SPEED_FLOOR);
+        let amp = v.amplitude / (1.0 + 2.0 * dist);
+        re += amp * phi.cos();
+        im += amp * phi.sin();
+    }
+    (re, im)
+}
+
 fn draw_table(
     ui: &mut egui::Ui,
     layout: &LayoutView,
-    voice: Option<&VoiceView>,
+    voices: &[VoiceView],
     routing: Option<&RoutingView>,
 ) -> TableInteraction {
     let mut interaction = TableInteraction::default();
@@ -577,24 +678,19 @@ fn draw_table(
 
     for (i, &(x, y)) in layout.positions.iter().enumerate() {
         let center = to_screen(x, y);
-        let color = match voice {
-            Some(v) => {
-                // Relative phase at this transducer: the delay the engine's
-                // delay line is applying, as a fraction of the wave period
-                let dphi = std::f32::consts::TAU * v.frequency * v.delay_samples[i] / v.sample_rate;
-                let hue = ZERO_PHASE_HUE_DEG + dphi.to_degrees();
-
-                // Local amplitude: source level x distance attenuation
-                // (matching the engine) x configured gain
-                let distance = v.delay_samples[i] / v.sample_rate * v.wave_speed;
-                let amp = v.amplitude * layout.gains[i] / (1.0 + 2.0 * distance);
-                let vis = (amp * 2.0).clamp(0.0, 1.0).sqrt();
-
-                let lightness = 0.25 + 0.50 * vis;
-                let chroma = 0.03 + 0.14 * vis;
-                oklch_to_color(lightness, chroma, hue)
-            }
-            None => egui::Color32::from_gray(60),
+        let color = if voices.is_empty() {
+            egui::Color32::from_gray(60)
+        } else {
+            // Summed field: hue = resultant phase, lightness/chroma = resultant
+            // magnitude (× this transducer's configured gain). For a single
+            // voice this reduces to its relative phase and local amplitude.
+            let (re, im) = field_at((x, y), voices);
+            let hue = ZERO_PHASE_HUE_DEG + im.atan2(re).to_degrees();
+            let amp = (re * re + im * im).sqrt() * layout.gains[i];
+            let vis = (amp * 2.0).clamp(0.0, 1.0).sqrt();
+            let lightness = 0.25 + 0.50 * vis;
+            let chroma = 0.03 + 0.14 * vis;
+            oklch_to_color(lightness, chroma, hue)
         };
         painter.circle_filled(center, radius, color);
         painter.circle_stroke(center, radius, egui::Stroke::new(1.0, egui::Color32::from_gray(30)));
@@ -633,10 +729,10 @@ fn draw_table(
         }
     }
 
-    // Source cursors: the ring is the MPE-requested position, the cross is
-    // the effective (velocity-limited) source the delay lines radiate from;
-    // a tether joins them while the source is still catching up
-    if let Some(v) = voice {
+    // Source cursors, one per visualised voice: the ring is the MPE-requested
+    // position, the cross is the effective (velocity-limited) source the delay
+    // lines radiate from; a tether joins them while the source is catching up.
+    for v in voices {
         let src = to_screen(v.source_pos.0, v.source_pos.1);
         let req = to_screen(v.requested_pos.0, v.requested_pos.1);
         if req.distance(src) > 1.0 {
@@ -675,9 +771,17 @@ fn draw_table(
 
 fn main() -> eframe::Result<()> {
     let shared = Arc::new(Mutex::new(Shared::default()));
+    // Stable, non-zero identity for this viewer's own (test-console) instance.
+    let instance_id = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        nanos ^ ((std::process::id() as u64) << 32) | 1
+    };
     {
         let shared = shared.clone();
-        thread::spawn(move || reader_thread(shared));
+        thread::spawn(move || reader_thread(shared, instance_id));
     }
 
     let options = eframe::NativeOptions {
@@ -696,6 +800,7 @@ fn main() -> eframe::Result<()> {
                 shared,
                 fps: RateCounter::default(),
                 test: TestControls::default(),
+                filter: VoiceFilter::All,
                 sounding_params: (60, 100, 20.0),
             }))
         }),
