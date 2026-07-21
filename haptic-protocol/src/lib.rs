@@ -1,11 +1,23 @@
-use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+/// Wire-protocol version carried by the mandatory `Hello` handshake.
+///
+/// Bincode encodes enum variants by declaration order, so protocol changes
+/// are coordinated and versioned. A server must reject a client whose version
+/// does not exactly match this value before accepting any other command.
+pub const PROTOCOL_VERSION: u16 = 2;
+
+/// Shared numeric limits used by every producer and the server validator.
+pub const MIDI_CHANNEL_COUNT: u8 = 16;
+pub const MIN_WAVE_SPEED: f32 = 0.25;
+pub const MAX_WAVE_SPEED: f32 = 1000.0;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct MpeData {
-    pub pressure: f32,      // 0.0-1.0
-    pub pitch_bend: f32,    // -1.0 to 1.0
-    pub timbre: f32,        // 0.0-1.0
+    pub pressure: f32,   // 0.0-1.0
+    pub pitch_bend: f32, // -1.0 to 1.0
+    pub timbre: f32,     // 0.0-1.0
 }
 
 impl Default for MpeData {
@@ -38,7 +50,10 @@ pub struct InstanceConfig {
 
 impl Default for InstanceConfig {
     fn default() -> Self {
-        Self { stimulus_type: StimulusType::Wave, wave_speed: 20.0 }
+        Self {
+            stimulus_type: StimulusType::Wave,
+            wave_speed: 20.0,
+        }
     }
 }
 
@@ -71,8 +86,8 @@ pub enum ClientRole {
 }
 
 /// Maximum concurrently-visualised voices carried in an `ActiveVoices`
-/// status (matches the wave-stimulus pool size).
-pub const MAX_ACTIVE_VOICES: usize = 8;
+/// status (wave and standing-stimulus pools combined).
+pub const MAX_ACTIVE_VOICES: usize = 12;
 
 /// Compact per-voice state for visualisation. The viewer recomputes each
 /// transducer's propagation delay, relative phase, and local amplitude
@@ -101,6 +116,7 @@ pub enum HapticCommand {
     /// binds `instance_id` to the connection and stamps every later command
     /// from it, so notes/MPE need not carry the id themselves.
     Hello {
+        protocol_version: u16,
         instance_id: u64,
         role: ClientRole,
         config: InstanceConfig,
@@ -126,11 +142,19 @@ pub enum HapticCommand {
         timestamp_us: u64,
         parameter: Parameter,
     },
-    Panic,              // Stop all
+    Panic, // Stop all
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ServerStatus {
+    /// Confirms that the server accepted and registered the connection's
+    /// mandatory `Hello`. Clients must not report themselves connected until
+    /// this arrives; a successful socket write alone does not mean the server
+    /// accepted the identity or protocol version.
+    HelloAccepted {
+        protocol_version: u16,
+        instance_id: u64,
+    },
     TransducerLevels {
         timestamp_us: u64,
         levels: [f32; 32],
@@ -194,7 +218,9 @@ pub enum FrameError {
 impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FrameError::Oversized(n) => write!(f, "frame length {} exceeds maximum {}", n, MAX_FRAME_SIZE),
+            FrameError::Oversized(n) => {
+                write!(f, "frame length {} exceeds maximum {}", n, MAX_FRAME_SIZE)
+            }
             FrameError::Deserialize(e) => write!(f, "frame deserialization failed: {}", e),
         }
     }
@@ -220,7 +246,9 @@ pub struct FrameDecoder {
 
 impl FrameDecoder {
     pub fn new() -> Self {
-        Self { buf: Vec::with_capacity(MAX_FRAME_SIZE) }
+        Self {
+            buf: Vec::with_capacity(MAX_FRAME_SIZE),
+        }
     }
 
     /// Append raw bytes read from the stream.
@@ -262,7 +290,11 @@ mod tests {
             note,
             velocity: 100,
             channel: 1,
-            mpe: MpeData { pressure: 0.7, pitch_bend: -0.25, timbre: 0.5 },
+            mpe: MpeData {
+                pressure: 0.7,
+                pitch_bend: -0.25,
+                timbre: 0.5,
+            },
         }
     }
 
@@ -319,7 +351,10 @@ mod tests {
         let mut dec = FrameDecoder::new();
         dec.extend(&(MAX_FRAME_SIZE as u32 + 1).to_le_bytes());
         dec.extend(&[0u8; 8]);
-        assert!(matches!(dec.next_frame::<HapticCommand>(), Err(FrameError::Oversized(_))));
+        assert!(matches!(
+            dec.next_frame::<HapticCommand>(),
+            Err(FrameError::Oversized(_))
+        ));
     }
 
     #[test]
@@ -333,23 +368,36 @@ mod tests {
         encode_frame(&note_on(48), &mut good).unwrap();
         dec.extend(&good);
 
-        assert!(matches!(dec.next_frame::<HapticCommand>(), Err(FrameError::Deserialize(_))));
+        assert!(matches!(
+            dec.next_frame::<HapticCommand>(),
+            Err(FrameError::Deserialize(_))
+        ));
         assert_note(&dec.next_frame::<HapticCommand>().unwrap().unwrap(), 48);
     }
 
     #[test]
     fn hello_roundtrips() {
         let hello = HapticCommand::Hello {
+            protocol_version: PROTOCOL_VERSION,
             instance_id: 0xDEAD_BEEF_1234_5678,
             role: ClientRole::Observer,
-            config: InstanceConfig { stimulus_type: StimulusType::Standing, wave_speed: 3.5 },
+            config: InstanceConfig {
+                stimulus_type: StimulusType::Standing,
+                wave_speed: 3.5,
+            },
         };
         let mut buf = Vec::new();
         encode_frame(&hello, &mut buf).unwrap();
         let mut dec = FrameDecoder::new();
         dec.extend(&buf);
         match dec.next_frame::<HapticCommand>().unwrap().unwrap() {
-            HapticCommand::Hello { instance_id, role, config } => {
+            HapticCommand::Hello {
+                protocol_version,
+                instance_id,
+                role,
+                config,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(instance_id, 0xDEAD_BEEF_1234_5678);
                 assert_eq!(role, ClientRole::Observer);
                 assert_eq!(config.stimulus_type, StimulusType::Standing);
@@ -379,7 +427,12 @@ mod tests {
         let mut buf = Vec::new();
         encode_frame(&status, &mut buf).unwrap();
         // A full ActiveVoices frame must fit the framing budget.
-        assert!(buf.len() <= MAX_FRAME_SIZE, "frame {} > max {}", buf.len(), MAX_FRAME_SIZE);
+        assert!(
+            buf.len() <= MAX_FRAME_SIZE,
+            "frame {} > max {}",
+            buf.len(),
+            MAX_FRAME_SIZE
+        );
         let mut dec = FrameDecoder::new();
         dec.extend(&buf);
         match dec.next_frame::<ServerStatus>().unwrap().unwrap() {

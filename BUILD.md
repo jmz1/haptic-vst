@@ -35,6 +35,11 @@ target/bundled/
 └── haptic-plugin.vst3    # VST3 format plugin
 ```
 
+The plugin editor displays `build <hash> · protocol <version>`. The same values
+are written to `/Users/jmz/tmp/log/haptic-vst.log` when the library loads and an
+instance initializes. The hash covers the plugin source, shared protocol source,
+workspace manifests, and lockfile, so dirty-worktree rebuilds are distinguishable.
+
 (CLAP export is currently disabled in `haptic-plugin/src/lib.rs`; a stale
 `haptic-plugin.clap` may remain in `target/bundled/` from older builds.)
 
@@ -88,7 +93,7 @@ cargo run --bin haptic-server
 - **Real-time Processing**: Lock-free audio path in the server
 - **MIDI/MPE Input**: Velocity → amplitude, bend/pressure/slide → source
   position and intensity
-- **DAW-automatable parameters**: Wave Speed (20–500 m/s) and Stimulus Type
+- **DAW-automatable parameters**: Wave Speed (0.25–1000 m/s, low-speed skew) and Stimulus Type
 - **32-channel Output**: Direct control of haptic transducer arrays
 - **Logging**: Plugin log at `/Users/jmz/tmp/log/haptic-vst.log`
   (override with `NIH_LOG`)

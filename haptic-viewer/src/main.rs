@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use haptic_protocol::{
     encode_frame, ClientRole, FrameDecoder, HapticCommand, InstanceConfig, MpeData, Parameter,
-    ServerStatus, StimulusType, SOCKET_PATH,
+    ServerStatus, StimulusType, PROTOCOL_VERSION, SOCKET_PATH,
 };
 use parking_lot::Mutex;
 
@@ -118,7 +118,11 @@ impl RateCounter {
     }
 
     fn trim(&mut self, now: Instant) {
-        while self.stamps.front().is_some_and(|t| now - *t > Duration::from_secs(1)) {
+        while self
+            .stamps
+            .front()
+            .is_some_and(|t| now - *t > Duration::from_secs(1))
+        {
             self.stamps.pop_front();
         }
     }
@@ -143,9 +147,9 @@ fn send_command(shared: &Mutex<Shared>, cmd: &HapticCommand) {
 // Socket reader
 // ---------------------------------------------------------------------------
 
-fn reader_thread(shared: Arc<Mutex<Shared>>, instance_id: u64) {
+fn reader_thread(shared: Arc<Mutex<Shared>>, instance_id: u64, socket_path: String) {
     loop {
-        let Ok(mut stream) = UnixStream::connect(SOCKET_PATH) else {
+        let Ok(mut stream) = UnixStream::connect(&socket_path) else {
             thread::sleep(Duration::from_millis(500));
             continue;
         };
@@ -157,25 +161,24 @@ fn reader_thread(shared: Arc<Mutex<Shared>>, instance_id: u64) {
             let mut hello = Vec::with_capacity(64);
             if encode_frame(
                 &HapticCommand::Hello {
+                    protocol_version: PROTOCOL_VERSION,
                     instance_id,
                     role: ClientRole::Observer,
                     config: InstanceConfig::default(),
                 },
                 &mut hello,
             )
-            .is_ok()
+            .is_err()
+                || stream.write_all(&hello).is_err()
             {
-                let _ = stream.write_all(&hello);
+                thread::sleep(Duration::from_millis(500));
+                continue;
             }
         }
-        {
-            let mut state = shared.lock();
-            state.connected = true;
-            state.writer = stream.try_clone().ok();
-        }
-
         let mut decoder = FrameDecoder::new();
         let mut buffer = [0u8; 8192];
+        let mut pending_writer = stream.try_clone().ok();
+        let mut accepted = false;
         'connection: loop {
             match stream.read(&mut buffer) {
                 Ok(0) | Err(_) => break 'connection,
@@ -183,7 +186,19 @@ fn reader_thread(shared: Arc<Mutex<Shared>>, instance_id: u64) {
                     decoder.extend(&buffer[..n]);
                     loop {
                         match decoder.next_frame::<ServerStatus>() {
-                            Ok(Some(msg)) => apply_message(&shared, msg),
+                            Ok(Some(ServerStatus::HelloAccepted {
+                                protocol_version,
+                                instance_id: accepted_id,
+                            })) if protocol_version == PROTOCOL_VERSION
+                                && accepted_id == instance_id =>
+                            {
+                                accepted = true;
+                                let mut state = shared.lock();
+                                state.connected = true;
+                                state.writer = pending_writer.take();
+                            }
+                            Ok(Some(msg)) if accepted => apply_message(&shared, msg),
+                            Ok(Some(_)) => break 'connection,
                             Ok(None) => break,
                             // Framing errors are unrecoverable mid-stream;
                             // reconnect to resynchronise
@@ -205,11 +220,25 @@ fn reader_thread(shared: Arc<Mutex<Shared>>, instance_id: u64) {
 
 fn apply_message(shared: &Mutex<Shared>, msg: ServerStatus) {
     match msg {
-        ServerStatus::Layout { positions, gains, table_m } => {
-            shared.lock().layout = Some(LayoutView { positions, gains, table_m });
+        ServerStatus::Layout {
+            positions,
+            gains,
+            table_m,
+        } => {
+            shared.lock().layout = Some(LayoutView {
+                positions,
+                gains,
+                table_m,
+            });
         }
-        ServerStatus::MonitorRouting { device_channels, routes } => {
-            shared.lock().routing = Some(RoutingView { device_channels, routes });
+        ServerStatus::MonitorRouting {
+            device_channels,
+            routes,
+        } => {
+            shared.lock().routing = Some(RoutingView {
+                device_channels,
+                routes,
+            });
         }
         ServerStatus::ActiveVoices { count, voices, .. } => {
             let list: Vec<VoiceView> = voices
@@ -252,12 +281,18 @@ fn oklab_to_linear_srgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
 
 fn in_gamut((r, g, b): (f32, f32, f32)) -> bool {
     const EPS: f32 = 1e-4;
-    (-EPS..=1.0 + EPS).contains(&r) && (-EPS..=1.0 + EPS).contains(&g) && (-EPS..=1.0 + EPS).contains(&b)
+    (-EPS..=1.0 + EPS).contains(&r)
+        && (-EPS..=1.0 + EPS).contains(&g)
+        && (-EPS..=1.0 + EPS).contains(&b)
 }
 
 fn linear_to_srgb_u8(v: f32) -> u8 {
     let v = v.clamp(0.0, 1.0);
-    let s = if v <= 0.003_130_8 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+    let s = if v <= 0.003_130_8 {
+        12.92 * v
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
     (s * 255.0 + 0.5) as u8
 }
 
@@ -331,38 +366,50 @@ impl TestControls {
     }
 
     fn start(&mut self, shared: &Mutex<Shared>, table: (f32, f32)) {
-        send_command(shared, &HapticCommand::SetParameter {
-            timestamp_us: 0,
-            parameter: Parameter::WaveSpeed(self.wave_speed),
-        });
-        send_command(shared, &HapticCommand::NoteOn {
-            timestamp_us: 0,
-            note: self.note,
-            velocity: self.velocity,
-            channel: TEST_CHANNEL,
-            mpe: self.mpe(table),
-        });
+        send_command(
+            shared,
+            &HapticCommand::SetParameter {
+                timestamp_us: 0,
+                parameter: Parameter::WaveSpeed(self.wave_speed),
+            },
+        );
+        send_command(
+            shared,
+            &HapticCommand::NoteOn {
+                timestamp_us: 0,
+                note: self.note,
+                velocity: self.velocity,
+                channel: TEST_CHANNEL,
+                mpe: self.mpe(table),
+            },
+        );
         self.playing = Some(self.note);
     }
 
     fn stop(&mut self, shared: &Mutex<Shared>) {
         if let Some(note) = self.playing.take() {
-            send_command(shared, &HapticCommand::NoteOff {
-                timestamp_us: 0,
-                note,
-                channel: TEST_CHANNEL,
-            });
+            send_command(
+                shared,
+                &HapticCommand::NoteOff {
+                    timestamp_us: 0,
+                    note,
+                    channel: TEST_CHANNEL,
+                },
+            );
         }
     }
 
     fn send_position(&mut self, shared: &Mutex<Shared>, table: (f32, f32)) {
         if self.playing.is_some() && self.last_mpe_sent.elapsed() >= MPE_SEND_INTERVAL {
             self.last_mpe_sent = Instant::now();
-            send_command(shared, &HapticCommand::MpeUpdate {
-                timestamp_us: 0,
-                channel: TEST_CHANNEL,
-                mpe: self.mpe(table),
-            });
+            send_command(
+                shared,
+                &HapticCommand::MpeUpdate {
+                    timestamp_us: 0,
+                    channel: TEST_CHANNEL,
+                    mpe: self.mpe(table),
+                },
+            );
         }
     }
 }
@@ -393,7 +440,9 @@ struct ViewerApp {
     sounding_params: (u8, u8, f32),
 }
 
-const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const NOTE_NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
 
 fn note_name(note: u8) -> String {
     format!("{}{}", NOTE_NAMES[note as usize % 12], note as i16 / 12 - 1)
@@ -465,13 +514,25 @@ impl eframe::App for ViewerApp {
                 if shown.len() == 1 {
                     let v = &shown[0];
                     ui.separator();
-                    ui.label(format!(
-                        "{:?} · note {} ({:.1} Hz)  c = {:.0} m/s  λ = {:.2} m",
-                        v.note_type, note_name(v.note), v.frequency, v.wave_speed, v.wave_speed / v.frequency,
-                    ));
+                    match v.note_type {
+                        StimulusType::Wave => ui.label(format!(
+                            "Wave · note {} ({:.1} Hz)  c = {:.0} m/s  λ = {:.2} m",
+                            note_name(v.note),
+                            v.frequency,
+                            v.wave_speed,
+                            v.wave_speed / v.frequency,
+                        )),
+                        StimulusType::Standing => ui.label(format!(
+                            "Standing · note {} ({:.1} Hz)",
+                            note_name(v.note),
+                            v.frequency,
+                        )),
+                    };
                 }
                 ui.separator();
                 ui.label(format!("{fps} fps / {voice_rate} msg/s"));
+                ui.separator();
+                ui.weak("geometric preview · voices shown phase-aligned");
             });
         });
 
@@ -494,25 +555,27 @@ impl eframe::App for ViewerApp {
 
         // Apply table interactions
         if let Some((output, source)) = interaction.route_to_output {
-            send_command(&self.shared, &HapticCommand::SetParameter {
-                timestamp_us: 0,
-                parameter: Parameter::MonitorRoute { output, source: source as u8 },
-            });
+            send_command(
+                &self.shared,
+                &HapticCommand::SetParameter {
+                    timestamp_us: 0,
+                    parameter: Parameter::MonitorRoute {
+                        output,
+                        source: source as u8,
+                    },
+                },
+            );
         }
         if let Some(world) = interaction.drag_world {
             self.test.orbit = false;
-            self.test.source = (
-                world.0.clamp(0.0, table.0),
-                world.1.clamp(0.0, table.1),
-            );
+            self.test.source = (world.0.clamp(0.0, table.0), world.1.clamp(0.0, table.1));
             self.test.send_position(&self.shared, table);
         }
 
         // Orbit: circle the source around the table centre
         if self.test.orbit && self.test.playing.is_some() {
             let dt = ctx.input(|i| i.stable_dt).min(0.1);
-            self.test.orbit_phase +=
-                std::f32::consts::TAU * dt / self.test.orbit_period_s.max(0.5);
+            self.test.orbit_phase += std::f32::consts::TAU * dt / self.test.orbit_period_s.max(0.5);
             let radius = 0.35 * table.0.min(table.1);
             self.test.source = (
                 0.5 * table.0 + radius * self.test.orbit_phase.cos(),
@@ -548,7 +611,11 @@ impl ViewerApp {
             egui::ComboBox::from_id_salt("voice_filter")
                 .selected_text(label)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.filter, VoiceFilter::All, "all instances (summed)");
+                    ui.selectable_value(
+                        &mut self.filter,
+                        VoiceFilter::All,
+                        "all instances (summed)",
+                    );
                     for &id in instances {
                         ui.selectable_value(
                             &mut self.filter,
@@ -561,9 +628,15 @@ impl ViewerApp {
     }
 
     fn test_controls_ui(&mut self, ui: &mut egui::Ui, table: (f32, f32)) {
+        // Keep the console usable at the default 620 px window width. These
+        // controls used to occupy one long row, which clipped at wave speed.
         ui.horizontal(|ui| {
             let playing = self.test.playing.is_some();
-            let button = if playing { "■ stop test note" } else { "▶ start test note" };
+            let button = if playing {
+                "■ stop test note"
+            } else {
+                "▶ start test note"
+            };
             if ui.button(button).clicked() {
                 if playing {
                     self.test.stop(&self.shared);
@@ -575,17 +648,24 @@ impl ViewerApp {
             }
             ui.separator();
             ui.label("note");
-            ui.add(egui::Slider::new(&mut self.test.note, 24..=96).custom_formatter(
-                |v, _| note_name(v as u8),
-            ));
+            ui.add(
+                egui::Slider::new(&mut self.test.note, 24..=96)
+                    .custom_formatter(|v, _| note_name(v as u8)),
+            );
+        });
+        ui.horizontal(|ui| {
             ui.label("velocity");
             ui.add(egui::Slider::new(&mut self.test.velocity, 1..=127));
+            ui.separator();
             ui.label("wave speed");
             ui.add(
                 egui::Slider::new(&mut self.test.wave_speed, 0.25..=10.0)
                     .logarithmic(true)
                     .suffix(" m/s"),
             );
+        });
+        ui.horizontal(|ui| {
+            ui.label("motion");
             ui.separator();
             ui.checkbox(&mut self.test.orbit, "orbit");
             ui.add(
@@ -597,21 +677,27 @@ impl ViewerApp {
     }
 }
 
-/// Complex field (re, im) at a transducer, summed over `voices`: each voice
-/// contributes a phasor `amp_i · e^{j·φ_i}` where `φ_i = 2π f τ_i` is its
-/// propagation phase lag (τ_i reconstructed geometrically) and `amp_i` is its
-/// source level with distance attenuation. Interference between voices is thus
-/// rendered directly. Returns the pre-gain complex sum.
+/// Approximate complex field at a transducer. Wave propagation phase and
+/// attenuation are reconstructed geometrically; standing voices are uniform.
+/// Voice snapshots do not carry synchronized oscillator phase or delay-line
+/// history, so multiple voices are intentionally shown phase-aligned rather
+/// than presented as exact server-output interference.
 fn field_at(pos: (f32, f32), voices: &[VoiceView]) -> (f32, f32) {
     let (mut re, mut im) = (0.0f32, 0.0f32);
     for v in voices {
-        let dx = pos.0 - v.source_pos.0;
-        let dy = pos.1 - v.source_pos.1;
-        let dist = (dx * dx + dy * dy).sqrt();
-        let phi = std::f32::consts::TAU * v.frequency * dist / v.wave_speed.max(WAVE_SPEED_FLOOR);
-        let amp = v.amplitude / (1.0 + 2.0 * dist);
-        re += amp * phi.cos();
-        im += amp * phi.sin();
+        match v.note_type {
+            StimulusType::Wave => {
+                let dx = pos.0 - v.source_pos.0;
+                let dy = pos.1 - v.source_pos.1;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let phi =
+                    std::f32::consts::TAU * v.frequency * dist / v.wave_speed.max(WAVE_SPEED_FLOOR);
+                let amp = v.amplitude / (1.0 + 2.0 * dist);
+                re += amp * phi.cos();
+                im += amp * phi.sin();
+            }
+            StimulusType::Standing => re += v.amplitude,
+        }
     }
     (re, im)
 }
@@ -645,10 +731,17 @@ fn draw_table(
         avail.center().x - 0.5 * world_w * scale,
         avail.center().y - 0.5 * world_h * scale,
     );
-    let to_screen =
-        |x: f32, y: f32| egui::pos2(origin.x + (x - min_x) * scale, origin.y + (y - min_y) * scale);
+    let to_screen = |x: f32, y: f32| {
+        egui::pos2(
+            origin.x + (x - min_x) * scale,
+            origin.y + (y - min_y) * scale,
+        )
+    };
     let to_world = |p: egui::Pos2| {
-        ((p.x - origin.x) / scale + min_x, (p.y - origin.y) / scale + min_y)
+        (
+            (p.x - origin.x) / scale + min_x,
+            (p.y - origin.y) / scale + min_y,
+        )
     };
 
     // Table outline
@@ -693,7 +786,11 @@ fn draw_table(
             oklch_to_color(lightness, chroma, hue)
         };
         painter.circle_filled(center, radius, color);
-        painter.circle_stroke(center, radius, egui::Stroke::new(1.0, egui::Color32::from_gray(30)));
+        painter.circle_stroke(
+            center,
+            radius,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(30)),
+        );
 
         if radius > 9.0 {
             painter.text(
@@ -733,6 +830,9 @@ fn draw_table(
     // position, the cross is the effective (velocity-limited) source the delay
     // lines radiate from; a tether joins them while the source is catching up.
     for v in voices {
+        if v.note_type != StimulusType::Wave {
+            continue;
+        }
         let src = to_screen(v.source_pos.0, v.source_pos.1);
         let req = to_screen(v.requested_pos.0, v.requested_pos.1);
         if req.distance(src) > 1.0 {
@@ -741,11 +841,21 @@ fn draw_table(
                 egui::Stroke::new(1.0, egui::Color32::from_gray(140)),
             );
         }
-        painter.circle_stroke(req, 6.0, egui::Stroke::new(1.5, egui::Color32::from_gray(180)));
+        painter.circle_stroke(
+            req,
+            6.0,
+            egui::Stroke::new(1.5, egui::Color32::from_gray(180)),
+        );
         let arm = 7.0;
         let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
-        painter.line_segment([src - egui::vec2(arm, 0.0), src + egui::vec2(arm, 0.0)], stroke);
-        painter.line_segment([src - egui::vec2(0.0, arm), src + egui::vec2(0.0, arm)], stroke);
+        painter.line_segment(
+            [src - egui::vec2(arm, 0.0), src + egui::vec2(arm, 0.0)],
+            stroke,
+        );
+        painter.line_segment(
+            [src - egui::vec2(0.0, arm), src + egui::vec2(0.0, arm)],
+            stroke,
+        );
     }
 
     // Interactions: clicks on circles select monitor routing; drags move
@@ -770,6 +880,15 @@ fn draw_table(
 }
 
 fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let socket_path = args
+        .iter()
+        .position(|argument| argument == "--socket")
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+        .or_else(|| std::env::var("HAPTIC_SOCKET_PATH").ok())
+        .unwrap_or_else(|| SOCKET_PATH.to_string());
+    eprintln!("Viewer socket: {socket_path}");
     let shared = Arc::new(Mutex::new(Shared::default()));
     // Stable, non-zero identity for this viewer's own (test-console) instance.
     let instance_id = {
@@ -781,7 +900,7 @@ fn main() -> eframe::Result<()> {
     };
     {
         let shared = shared.clone();
-        thread::spawn(move || reader_thread(shared, instance_id));
+        thread::spawn(move || reader_thread(shared, instance_id, socket_path));
     }
 
     let options = eframe::NativeOptions {

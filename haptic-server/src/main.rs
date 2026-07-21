@@ -1,12 +1,12 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+mod audio;
 mod config;
 mod engine;
-mod audio;
 mod ipc;
 
 use config::TransducerLayout;
@@ -14,17 +14,32 @@ use engine::StimulusEngine;
 
 const DEFAULT_CONFIG_PATH: &str = "haptic.toml";
 
+#[derive(Debug, PartialEq)]
+struct ServerOptions {
+    test_tone: bool,
+    dummy_audio: bool,
+    config_path: PathBuf,
+    socket_path: String,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Starting Haptic VST Server");
 
-    let args: Vec<String> = std::env::args().collect();
-    let test_tone = args.iter().any(|arg| arg == "--test-tone");
-    let config_path = args
-        .iter()
-        .position(|arg| arg == "--config")
-        .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_usage();
+        return Ok(());
+    }
+    let options = parse_options(
+        args,
+        std::env::var("HAPTIC_SOCKET_PATH").ok(),
+        std::process::id(),
+    )?;
+    let config_path = options.config_path.clone();
+    if options.dummy_audio {
+        eprintln!("Headless test mode: physical audio devices will not be opened");
+    }
+    eprintln!("Server socket: {}", options.socket_path);
 
     // Load the transducer layout: a missing file falls back to the built-in
     // default (4x8 grid over 1m x 2m); a present-but-invalid file is a hard
@@ -71,8 +86,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device_channels_for_ipc = device_channels.clone();
     let ipc_handle = {
         let running = running.clone();
+        let socket_path = options.socket_path.clone();
         thread::spawn(move || {
             if let Err(e) = ipc::listen_loop(
+                &socket_path,
                 running,
                 command_producer,
                 levels_consumer,
@@ -90,7 +107,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let watcher_handle = {
         let running = running.clone();
         thread::spawn(move || {
-            config_watcher(running, config_path, engine_layout_producer, ipc_layout_producer)
+            config_watcher(
+                running,
+                config_path,
+                engine_layout_producer,
+                ipc_layout_producer,
+            )
         })
     };
 
@@ -102,7 +124,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // Run audio loop on main thread (highest priority)
-    if let Err(e) = audio::run_audio_loop(engine, running.clone(), test_tone, levels_producer, device_channels) {
+    if options.dummy_audio {
+        audio::run_dummy_audio_loop(
+            engine,
+            running.clone(),
+            options.test_tone,
+            levels_producer,
+            device_channels,
+        );
+    } else if let Err(e) = audio::run_audio_loop(
+        engine,
+        running.clone(),
+        options.test_tone,
+        levels_producer,
+        device_channels,
+    ) {
         eprintln!("Audio error: {}", e);
     }
 
@@ -115,13 +151,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn print_usage() {
+    eprintln!(
+        "Usage: haptic-server [--config PATH] [--test-tone] [--headless|--dummy-audio] [--socket PATH]\n\
+         \n\
+         --headless, --dummy-audio  Use a timed 48 kHz/32-channel memory sink; no hardware.\n\
+         --socket PATH              Override the Unix socket/lock namespace.\n\
+         HAPTIC_SOCKET_PATH         Environment alternative to --socket.\n\
+         \n\
+         Headless mode defaults to /tmp/haptic-vst-test-<pid>.sock and therefore\n\
+         never contends with the production /tmp/haptic-vst.sock endpoint."
+    );
+}
+
+fn parse_options(
+    args: impl IntoIterator<Item = String>,
+    environment_socket: Option<String>,
+    process_id: u32,
+) -> Result<ServerOptions, Box<dyn std::error::Error>> {
+    let mut test_tone = false;
+    let mut dummy_audio = false;
+    let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+    let mut socket_path = None;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--test-tone" => test_tone = true,
+            "--headless" | "--dummy-audio" => dummy_audio = true,
+            "--config" => {
+                config_path = PathBuf::from(next_option_value(&mut args, "--config")?);
+            }
+            "--socket" => socket_path = Some(next_option_value(&mut args, "--socket")?),
+            unknown => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown argument {unknown}; use --help"),
+                )
+                .into());
+            }
+        }
+    }
+
+    let socket_path = socket_path.or(environment_socket).unwrap_or_else(|| {
+        if dummy_audio {
+            format!("/tmp/haptic-vst-test-{process_id}.sock")
+        } else {
+            haptic_protocol::SOCKET_PATH.to_string()
+        }
+    });
+
+    Ok(ServerOptions {
+        test_tone,
+        dummy_audio,
+        config_path,
+        socket_path,
+    })
+}
+
+fn next_option_value(
+    args: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    args.next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{option} requires a value"),
+            )
+            .into()
+        })
+}
+
 /// Poll the config file's mtime (~1 Hz); on change, parse it off the audio
 /// thread and push the new layout into the engine's layout ring. Parse
 /// errors leave the current layout running.
 fn config_watcher(
     running: Arc<AtomicBool>,
     path: PathBuf,
-    mut engine_producer: rtrb::Producer<Box<TransducerLayout>>,
+    mut engine_producer: rtrb::Producer<TransducerLayout>,
     mut ipc_producer: rtrb::Producer<TransducerLayout>,
 ) {
     let mtime_of = |path: &std::path::Path| -> Option<SystemTime> {
@@ -136,7 +245,7 @@ fn config_watcher(
             last_mtime = mtime;
             match config::load_layout(&path) {
                 Ok(layout) => {
-                    if engine_producer.push(Box::new(layout)).is_ok() {
+                    if engine_producer.push(layout).is_ok() {
                         eprintln!("Config reloaded from {}", path.display());
                     }
                     let _ = ipc_producer.push(layout);
@@ -146,5 +255,40 @@ fn config_watcher(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_mode_uses_real_audio_and_production_socket() {
+        let options = parse_options(Vec::new(), None, 123).unwrap();
+        assert!(!options.dummy_audio);
+        assert_eq!(options.socket_path, haptic_protocol::SOCKET_PATH);
+    }
+
+    #[test]
+    fn headless_mode_uses_dummy_audio_and_per_process_test_socket() {
+        let options = parse_options(vec!["--headless".into()], None, 123).unwrap();
+        assert!(options.dummy_audio);
+        assert_eq!(options.socket_path, "/tmp/haptic-vst-test-123.sock");
+    }
+
+    #[test]
+    fn explicit_test_socket_overrides_the_mode_default() {
+        let options = parse_options(
+            vec![
+                "--dummy-audio".into(),
+                "--socket".into(),
+                "/tmp/haptic-vst-test.sock".into(),
+            ],
+            Some("/tmp/from-environment.sock".into()),
+            123,
+        )
+        .unwrap();
+        assert!(options.dummy_audio);
+        assert_eq!(options.socket_path, "/tmp/haptic-vst-test.sock");
     }
 }

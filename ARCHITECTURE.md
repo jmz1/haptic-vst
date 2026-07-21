@@ -2,6 +2,11 @@
 
 This document explains the architecture of the 32-channel haptic VST plugin system and comprehensively covers the Rust features, syntax, and idioms used throughout the project.
 
+Implementation status and priorities live in `ROADMAP.md`; the active hardening
+sequence lives in `docs/code-review-remediation-plan.md`. Code excerpts in the
+Rust-language tutorial sections are illustrative, while the “Data flow
+(current)” section below is the concise runtime reference.
+
 ## Table of Contents
 
 1. [Project Overview](#project-overview)
@@ -27,12 +32,17 @@ The system converts MIDI notes into spatial haptic stimuli with wave propagation
 
 ```
 ┌─────────────────┐    Unix Socket    ┌──────────────────┐
-│   VST3 Plugin   │ ←─────────────→   │   Haptic Server  │
+│   VST3 Plugin   │ ──────────────→   │   Haptic Server  │
 │                 │   (IPC Protocol)  │                  │
 │ • MIDI Input    │                   │ • Stimulus Engine│
 │ • GUI Interface │                   │ • Audio Output   │
 │ • Parameter Ctrl│                   │ • 32 Channels    │
 └─────────────────┘                   └──────────────────┘
+                                              ▲
+                                              │ observer status + test control
+                                      ┌───────┴────────┐
+                                      │ Haptic Viewer  │
+                                      └────────────────┘
         │                                       │
         │                                       │
     ┌───▼───┐                               ┌───▼────┐
@@ -46,31 +56,45 @@ The system converts MIDI notes into spatial haptic stimuli with wave propagation
 1. **haptic-protocol**: Shared data structures, message framing, and communication protocol
 2. **haptic-plugin**: VST3 plugin with GUI and MIDI processing
 3. **haptic-server**: Real-time audio engine with haptic stimulus generation
+4. **haptic-viewer**: Whole-server observer, geometric field preview, routing UI, and test console
+5. **haptic-plugin-standalone**: Standalone host for the controller plugin
 
 ### Data flow (current)
 
 - **MIDI → plugin**: The plugin keeps a per-channel `MpeData` cache (16 entries). Each
   incoming event (note on/off, poly/channel pressure, pitch bend, CC74 timbre) merges one
   dimension into the cache, and the full merged struct is sent so no dimension is ever
-  overwritten with defaults. Strike velocity seeds the pressure at note-on.
+  overwritten with defaults. Note-on seeds pressure at unity for non-MPE
+  keyboards; strike velocity independently controls amplitude.
 - **Plugin → server IPC**: `HapticCommand`s are bincode-serialized into length-prefixed
   (u32 LE) frames over a Unix socket. A dedicated worker thread owns the socket; the audio
   thread hands it commands through a bounded channel (drops when full, never blocks).
   The server reassembles frames with `FrameDecoder`, so coalesced or fragmented reads are
-  handled correctly.
+  handled correctly. Every connection begins with an exact-version `Hello`; identity and
+  role are bound once and confirmed with `HelloAccepted` before the client reports itself
+  connected. Disconnect releases that instance's voices.
+- **Observer output**: framed status messages use bounded per-client buffers. Nonblocking
+  partial writes resume at the saved cursor; temporary backpressure is not a disconnect.
+  Terminal failure or sustained backlog enters the same retried per-instance cleanup path as
+  a read-side closure, preventing observer-owned test notes from sticking.
 - **Parameters**: Stimulus type (wave/standing) and wave speed are DAW-automatable plugin
   parameters, pushed to the server as `SetParameter` commands on change. Velocity maps to
   amplitude only.
 - **Server engine**: The IPC thread pushes `EngineCommand`s into an `rtrb` SPSC ring
   buffer. The `StimulusEngine` is owned by the cpal audio callback (no locks on the audio
   path) and drains the queue once per callback. A `(channel, note) → pool slot` ownership
-  map routes note-off and MPE updates to the owning stimulus and implements voice stealing
+  map keyed by `(instance_id, channel, note)` routes note-off and MPE updates to the owning stimulus and implements voice stealing
   (oldest-in-release first, else oldest). MIDI notes map to the 20–200 Hz haptic band
   (equal temperament transposed so middle C ≈ 65 Hz); MPE values are one-pole smoothed
   inside each stimulus (~15 ms).
 - **Health**: the audio callback records timing into lock-free histogram stats, reported
   every 5 s by a monitor thread; `--test-tone` plays a channel-cycling burst pattern for
   interface bring-up.
+- **Headless profiles**: `--headless`/`--dummy-audio` replace CPAL with a
+  wall-clocked 48 kHz, 32-channel memory sink while leaving the engine, rings,
+  snapshots, and IPC active. Test profiles default to a per-process Unix socket;
+  `--socket`/`HAPTIC_SOCKET_PATH` select a stable dedicated endpoint. Test runs
+  therefore neither acquire the production socket singleton nor open hardware.
 
 ## Rust Fundamentals Used
 
@@ -265,7 +289,8 @@ pub struct MpeData {
 ```rust
 pub struct HapticPlugin {
     params: Arc<HapticParams>,
-    ipc_client: Arc<Mutex<Option<IpcClient>>>,
+    ipc_client: Arc<IpcClient>,
+    diag: Arc<Diagnostics>,                 // atomic counters, no callback lock
     mpe_state: [MpeData; 16],                 // per-channel MPE merge cache
     last_sent_wave_speed: Option<f32>,        // parameter push tracking
     last_sent_stimulus_type: Option<StimulusTypeParam>,
@@ -283,8 +308,8 @@ impl Plugin for HapticPlugin {
 
 3. **Option<T> type**:
 ```rust
-ipc_client: Arc<Mutex<Option<IpcClient>>>
-//                    ^^^^^^^^^^^^^^^^^ Option for nullable values
+last_sent_wave_speed: Option<f32>
+//                      ^^^^^^^^^^^ Option for an unsent/cached value
 ```
 **Explanation**: Rust doesn't have null pointers. `Option<T>` is an enum: `Some(T)` or `None`.
 
@@ -299,9 +324,13 @@ while let Some(event) = context.next_event() {
 ```rust
 FloatParam::new(
     "Wave Speed",
-    100.0,
-    FloatRange::Linear { min: 20.0, max: 500.0 }
-).with_smoother(SmoothingStyle::Linear(50.0))
+    20.0,
+    FloatRange::Skewed {
+        min: 0.25,
+        max: 1000.0,
+        factor: FloatRange::skew_factor(-2.5),
+    }
+)
 ```
 
 ### haptic-plugin/src/editor.rs

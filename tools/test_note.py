@@ -15,18 +15,39 @@ import math
 import socket
 import struct
 import time
+import os
 
 SOCKET_PATH = "/tmp/haptic-vst.sock"
 TEST_CHANNEL = 15
 
+PROTOCOL_VERSION = 2
+
 # HapticCommand variant tags (declaration order in haptic-protocol)
-NOTE_ON, NOTE_OFF, MPE_UPDATE, SET_PARAMETER, PANIC = range(5)
+HELLO, NOTE_ON, NOTE_OFF, MPE_UPDATE, SET_PARAMETER, PANIC = range(6)
 # Parameter variant tags
 P_WAVE_SPEED, P_STIMULUS_TYPE, P_MONITOR_ROUTE = range(3)
+# ClientRole / StimulusType variant tags
+ROLE_CONTROLLER = 0
+STIMULUS_WAVE = 0
 
 
 def frame(payload: bytes) -> bytes:
     return struct.pack("<I", len(payload)) + payload
+
+
+def recv_exact(sock, length):
+    chunks = bytearray()
+    while len(chunks) < length:
+        chunk = sock.recv(length - len(chunks))
+        if not chunk:
+            raise ConnectionError("server closed during handshake")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def hello(instance_id):
+    return frame(struct.pack("<IHQIIf", HELLO, PROTOCOL_VERSION, instance_id,
+                             ROLE_CONTROLLER, STIMULUS_WAVE, 20.0))
 
 
 def note_on(note, velocity, pressure, bend, timbre):
@@ -57,13 +78,19 @@ def panic():
 
 
 class Client:
-    """Send-and-drain client: the server broadcasts status to every
-    connection and drops clients whose receive buffer fills, so we must
-    keep reading even though we ignore the content."""
+    """Versioned controller client for the server's framed Unix socket."""
 
-    def __init__(self):
+    def __init__(self, socket_path):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.connect(SOCKET_PATH)
+        self.sock.connect(socket_path)
+        instance_id = (time.time_ns() ^ (os.getpid() << 32)) & ((1 << 64) - 1)
+        instance_id = instance_id or 1
+        self.sock.sendall(hello(instance_id))
+        payload_len = struct.unpack("<I", recv_exact(self.sock, 4))[0]
+        payload = recv_exact(self.sock, payload_len)
+        status, version, accepted_id = struct.unpack("<IHQ", payload)
+        if status != 0 or version != PROTOCOL_VERSION or accepted_id != instance_id:
+            raise ConnectionError("server rejected or mismatched the handshake")
         self.sock.setblocking(False)
 
     def drain(self):
@@ -101,9 +128,11 @@ def main():
     ap.add_argument("--route", action="append", default=[], metavar="OUT:SRC",
                     help="monitor-route physical output OUT to logical channel SRC (repeatable)")
     ap.add_argument("--panic", action="store_true", help="send panic and exit")
+    ap.add_argument("--socket", default=os.environ.get("HAPTIC_SOCKET_PATH", SOCKET_PATH),
+                    help="server Unix socket (or set HAPTIC_SOCKET_PATH)")
     args = ap.parse_args()
 
-    c = Client()
+    c = Client(args.socket)
 
     if args.panic:
         c.send(panic())

@@ -1,5 +1,8 @@
-use haptic_protocol::{HapticCommand, InstanceConfig, MpeData, Parameter, StimulusType, VoiceInfo, MAX_ACTIVE_VOICES};
 use crate::config::TransducerLayout;
+use haptic_protocol::{
+    HapticCommand, InstanceConfig, MpeData, Parameter, StimulusType, VoiceInfo, MAX_ACTIVE_VOICES,
+    MAX_WAVE_SPEED, MIN_WAVE_SPEED,
+};
 
 // Constants from requirements
 pub const TRANSDUCER_COUNT: usize = 32;
@@ -61,9 +64,6 @@ const MPE_RAMP_MIN_S: f32 = 0.005;
 const MPE_RAMP_MAX_S: f32 = 0.05;
 
 const DEFAULT_WAVE_SPEED: f32 = 20.0; // m/s
-const MIN_WAVE_SPEED: f32 = 0.25; // m/s — floor chosen so a full-table propagation fits the delay lines
-const MAX_WAVE_SPEED: f32 = 1000.0; // m/s
-
 /// Maximum speed of the effective source position, as a fixed fraction of
 /// the stimulus's wave speed. Keeps the source comfortably subsonic relative
 /// to its own waves. With the scatter-write delay line (see `DelayLine`), an
@@ -168,7 +168,11 @@ impl<T: Stimulus + Default, const N: usize> StimulusPool<T, N> {
         }
     }
 
-    pub fn process_all(&mut self, context: &ProcessContext<'_>, output: &mut [f32; TRANSDUCER_COUNT]) {
+    pub fn process_all(
+        &mut self,
+        context: &ProcessContext<'_>,
+        output: &mut [f32; TRANSDUCER_COUNT],
+    ) {
         for (i, stimulus) in self.stimuli.iter_mut().enumerate() {
             if self.active_mask[i] {
                 if !stimulus.is_active() {
@@ -238,10 +242,11 @@ pub struct StimulusEngine {
     // Lock-free SPSC command queues, consumer ends (IPC thread holds the
     // command producer, the config watcher holds the layout producer)
     command_queue: rtrb::Consumer<EngineCommand>,
-    layout_queue: rtrb::Consumer<Box<TransducerLayout>>,
+    layout_queue: rtrb::Consumer<TransducerLayout>,
 
     // Voice snapshots out to the IPC thread (drops when full)
     voice_producer: rtrb::Producer<VoiceSnapshot>,
+    last_voice_snapshot_count: u8,
 
     // Physical output p plays logical channel monitor_routes[p]
     monitor_routes: [u8; TRANSDUCER_COUNT],
@@ -279,11 +284,36 @@ pub struct ProcessContext<'a> {
 #[derive(Clone)]
 pub enum EngineCommand {
     /// Register or replace an instance's note-type config (from `Hello`).
-    RegisterInstance { instance_id: u64, config: InstanceConfig },
-    NoteOn { instance_id: u64, note: u8, velocity: u8, channel: u8, mpe: MpeData },
-    NoteOff { instance_id: u64, note: u8, channel: u8 },
-    MpeUpdate { instance_id: u64, channel: u8, mpe: MpeData },
-    SetParameter { instance_id: u64, parameter: Parameter },
+    RegisterInstance {
+        instance_id: u64,
+        config: InstanceConfig,
+    },
+    /// A client's socket closed. Release all of its voices and return its
+    /// fixed-capacity configuration slot to the registry.
+    DisconnectInstance {
+        instance_id: u64,
+    },
+    NoteOn {
+        instance_id: u64,
+        note: u8,
+        velocity: u8,
+        channel: u8,
+        mpe: MpeData,
+    },
+    NoteOff {
+        instance_id: u64,
+        note: u8,
+        channel: u8,
+    },
+    MpeUpdate {
+        instance_id: u64,
+        channel: u8,
+        mpe: MpeData,
+    },
+    SetParameter {
+        instance_id: u64,
+        parameter: Parameter,
+    },
     Panic,
 }
 
@@ -293,21 +323,41 @@ impl EngineCommand {
     /// id/config; everything else inherits the connection's bound id.
     pub fn from_wire(cmd: HapticCommand, instance_id: u64) -> Self {
         match cmd {
-            HapticCommand::Hello { instance_id, config, .. } => {
-                EngineCommand::RegisterInstance { instance_id, config }
-            }
-            HapticCommand::NoteOn { note, velocity, channel, mpe, .. } => {
-                EngineCommand::NoteOn { instance_id, note, velocity, channel, mpe }
-            }
-            HapticCommand::NoteOff { note, channel, .. } => {
-                EngineCommand::NoteOff { instance_id, note, channel }
-            }
-            HapticCommand::MpeUpdate { channel, mpe, .. } => {
-                EngineCommand::MpeUpdate { instance_id, channel, mpe }
-            }
-            HapticCommand::SetParameter { parameter, .. } => {
-                EngineCommand::SetParameter { instance_id, parameter }
-            }
+            HapticCommand::Hello {
+                instance_id,
+                config,
+                ..
+            } => EngineCommand::RegisterInstance {
+                instance_id,
+                config,
+            },
+            HapticCommand::NoteOn {
+                note,
+                velocity,
+                channel,
+                mpe,
+                ..
+            } => EngineCommand::NoteOn {
+                instance_id,
+                note,
+                velocity,
+                channel,
+                mpe,
+            },
+            HapticCommand::NoteOff { note, channel, .. } => EngineCommand::NoteOff {
+                instance_id,
+                note,
+                channel,
+            },
+            HapticCommand::MpeUpdate { channel, mpe, .. } => EngineCommand::MpeUpdate {
+                instance_id,
+                channel,
+                mpe,
+            },
+            HapticCommand::SetParameter { parameter, .. } => EngineCommand::SetParameter {
+                instance_id,
+                parameter,
+            },
             HapticCommand::Panic => EngineCommand::Panic,
         }
     }
@@ -323,7 +373,7 @@ impl StimulusEngine {
     ) -> (
         Self,
         rtrb::Producer<EngineCommand>,
-        rtrb::Producer<Box<TransducerLayout>>,
+        rtrb::Producer<TransducerLayout>,
         rtrb::Consumer<VoiceSnapshot>,
     ) {
         let (producer, consumer) = rtrb::RingBuffer::new(COMMAND_QUEUE_CAPACITY);
@@ -340,6 +390,7 @@ impl StimulusEngine {
             command_queue: consumer,
             layout_queue: layout_consumer,
             voice_producer,
+            last_voice_snapshot_count: 0,
             monitor_routes: std::array::from_fn(|i| i as u8),
             layout,
             history: [[0.0; TRANSDUCER_COUNT]; FIR_TAPS_PER_PHASE],
@@ -366,9 +417,11 @@ impl StimulusEngine {
     /// Register or replace an instance's config, or (if unregistered) create
     /// it. Returns a mutable handle to the stored config for in-place patching.
     fn instance_config_mut(&mut self, instance_id: u64) -> Option<&mut InstanceConfig> {
-        if let Some(slot) = self.instances.iter().position(
-            |e| matches!(e, Some((id, _)) if *id == instance_id),
-        ) {
+        if let Some(slot) = self
+            .instances
+            .iter()
+            .position(|e| matches!(e, Some((id, _)) if *id == instance_id))
+        {
             return self.instances[slot].as_mut().map(|(_, cfg)| cfg);
         }
         // Not registered yet: claim the first free slot with a default config.
@@ -385,11 +438,36 @@ impl StimulusEngine {
         }
     }
 
+    fn disconnect_instance(&mut self, instance_id: u64) {
+        for slot in 0..MAX_WAVE_STIMULI {
+            if self.wave_owners[slot].is_some_and(|owner| owner.instance_id == instance_id) {
+                self.wave_pool.get_mut(slot).note_off();
+            }
+        }
+        for slot in 0..MAX_STANDING_STIMULI {
+            if self.standing_owners[slot].is_some_and(|owner| owner.instance_id == instance_id) {
+                self.standing_pool.get_mut(slot).note_off();
+            }
+        }
+        if let Some(slot) = self
+            .instances
+            .iter()
+            .position(|entry| entry.is_some_and(|(id, _)| id == instance_id))
+        {
+            self.instances[slot] = None;
+        }
+    }
+
     fn note_on(&mut self, instance_id: u64, note: u8, velocity: u8, channel: u8, mpe: MpeData) {
         let frequency = note_to_haptic_frequency(note);
         let seq = self.next_seq;
         self.next_seq += 1;
-        let owner = VoiceOwner { instance_id, channel, note, seq };
+        let owner = VoiceOwner {
+            instance_id,
+            channel,
+            note,
+            seq,
+        };
         let config = self.instance_config(instance_id);
 
         match config.stimulus_type {
@@ -416,7 +494,9 @@ impl StimulusEngine {
                         slot
                     }
                 };
-                self.standing_pool.get_mut(slot).note_on(frequency, velocity, mpe);
+                self.standing_pool
+                    .get_mut(slot)
+                    .note_on(frequency, velocity, mpe);
                 self.standing_owners[slot] = Some(owner);
             }
         }
@@ -425,14 +505,20 @@ impl StimulusEngine {
     fn note_off(&mut self, instance_id: u64, note: u8, channel: u8) {
         for slot in 0..MAX_WAVE_STIMULI {
             if let Some(owner) = self.wave_owners[slot] {
-                if owner.instance_id == instance_id && owner.channel == channel && owner.note == note {
+                if owner.instance_id == instance_id
+                    && owner.channel == channel
+                    && owner.note == note
+                {
                     self.wave_pool.get_mut(slot).note_off();
                 }
             }
         }
         for slot in 0..MAX_STANDING_STIMULI {
             if let Some(owner) = self.standing_owners[slot] {
-                if owner.instance_id == instance_id && owner.channel == channel && owner.note == note {
+                if owner.instance_id == instance_id
+                    && owner.channel == channel
+                    && owner.note == note
+                {
                     self.standing_pool.get_mut(slot).note_off();
                 }
             }
@@ -474,19 +560,42 @@ impl StimulusEngine {
 
     fn apply_command(&mut self, cmd: EngineCommand) {
         match cmd {
-            EngineCommand::RegisterInstance { instance_id, config } => {
+            EngineCommand::RegisterInstance {
+                instance_id,
+                config,
+            } => {
                 self.register_instance(instance_id, config);
             }
-            EngineCommand::NoteOn { instance_id, note, velocity, channel, mpe } => {
+            EngineCommand::DisconnectInstance { instance_id } => {
+                self.disconnect_instance(instance_id);
+            }
+            EngineCommand::NoteOn {
+                instance_id,
+                note,
+                velocity,
+                channel,
+                mpe,
+            } => {
                 self.note_on(instance_id, note, velocity, channel, mpe);
             }
-            EngineCommand::NoteOff { instance_id, note, channel } => {
+            EngineCommand::NoteOff {
+                instance_id,
+                note,
+                channel,
+            } => {
                 self.note_off(instance_id, note, channel);
             }
-            EngineCommand::MpeUpdate { instance_id, channel, mpe } => {
+            EngineCommand::MpeUpdate {
+                instance_id,
+                channel,
+                mpe,
+            } => {
                 self.mpe_update(instance_id, channel, mpe);
             }
-            EngineCommand::SetParameter { instance_id, parameter } => match parameter {
+            EngineCommand::SetParameter {
+                instance_id,
+                parameter,
+            } => match parameter {
                 // WaveSpeed / StimulusType patch the sender's own instance config.
                 Parameter::WaveSpeed(speed) => {
                     if let Some(cfg) = self.instance_config_mut(instance_id) {
@@ -519,11 +628,10 @@ impl StimulusEngine {
         while let Ok(cmd) = self.command_queue.pop() {
             self.apply_command(cmd);
         }
-        // Hot config reload: copy the new layout in place. Dropping the Box
-        // deallocates on the audio thread, but only on the rare occasion a
-        // human edits the config file - accepted.
+        // Hot config reload is a fixed-size Copy through the preallocated ring:
+        // no allocation or deallocation occurs on the audio thread.
         while let Ok(layout) = self.layout_queue.pop() {
-            self.layout = *layout;
+            self.layout = layout;
         }
     }
 
@@ -599,7 +707,10 @@ impl StimulusEngine {
             // Physical outputs play their routed logical channel (identity
             // by default; a stereo device can audition any of the 32)
             for (p, sample) in frame[..n].iter_mut().enumerate() {
-                *sample = interp[routes[p] as usize];
+                // Reconstruction can overshoot even though the internal-rate
+                // mix was bounded. Enforce the hardware limit at the final
+                // device-rate output.
+                *sample = interp[routes[p] as usize].clamp(-1.0, 1.0);
             }
             for sample in frame[n..].iter_mut() {
                 *sample = 0.0;
@@ -619,7 +730,7 @@ impl StimulusEngine {
         self.reap_finished_voices();
     }
 
-    /// Push a snapshot of every active wave voice for the visualiser, each
+    /// Push a snapshot of every active voice for the visualiser, each
     /// tagged with its owning `instance_id`. The viewer reconstructs the
     /// per-transducer field geometrically, so no delay array is sent. No-op
     /// (and no allocation) when nothing is playing.
@@ -645,10 +756,43 @@ impl StimulusEngine {
             };
             count += 1;
         }
-        if count == 0 {
+        for (slot, owner) in self.standing_owners.iter().enumerate() {
+            let Some(owner) = owner else { continue };
+            if !self.standing_pool.slot_active(slot) || count >= MAX_ACTIVE_VOICES {
+                continue;
+            }
+            let stim = &self.standing_pool.stimuli[slot];
+            let center = (self.layout.table_m.0 * 0.5, self.layout.table_m.1 * 0.5);
+            voices[count] = VoiceInfo {
+                instance_id: owner.instance_id,
+                seq: owner.seq,
+                note: owner.note,
+                note_type: StimulusType::Standing,
+                frequency: stim.frequency,
+                wave_speed: 0.0,
+                source_pos: center,
+                requested_pos: center,
+                amplitude: stim.amplitude * stim.env_level * stim.mpe.value.pressure,
+            };
+            count += 1;
+        }
+        // Publish one explicit empty snapshot when the final voice ends so an
+        // observer clears immediately without relying on a stale-data timeout.
+        if count == 0 && self.last_voice_snapshot_count == 0 {
             return;
         }
-        let _ = self.voice_producer.push(VoiceSnapshot { sample_rate, count: count as u8, voices });
+        let count = count as u8;
+        if self
+            .voice_producer
+            .push(VoiceSnapshot {
+                sample_rate,
+                count,
+                voices,
+            })
+            .is_ok()
+        {
+            self.last_voice_snapshot_count = count;
+        }
     }
 
     /// Single-frame variant used by tests: renders one *internal-rate*
@@ -668,7 +812,6 @@ impl StimulusEngine {
         self.render_frame(&context, output);
         self.reap_finished_voices();
     }
-
 }
 
 /// Zeroth-order modified Bessel function of the first kind (power series),
@@ -732,7 +875,11 @@ fn design_splat_kernel() -> Box<[f32; SPLAT_LEN]> {
             let px = std::f64::consts::PI * x;
             let sinc = if px.abs() < 1e-9 { 1.0 } else { px.sin() / px };
             let r = x / half;
-            let window = if r.abs() >= 1.0 { 0.0 } else { bessel_i0(beta * (1.0 - r * r).sqrt()) / denom };
+            let window = if r.abs() >= 1.0 {
+                0.0
+            } else {
+                bessel_i0(beta * (1.0 - r * r).sqrt()) / denom
+            };
             *w = sinc * window;
             sum += *w;
         }
@@ -792,7 +939,11 @@ impl MpeInterp {
     }
 
     fn ramped(&self) -> MpeData {
-        let t = if self.ramp_len > 0.0 { (self.ramp_pos / self.ramp_len).min(1.0) } else { 1.0 };
+        let t = if self.ramp_len > 0.0 {
+            (self.ramp_pos / self.ramp_len).min(1.0)
+        } else {
+            1.0
+        };
         lerp_mpe(&self.from, &self.target, t)
     }
 
@@ -821,7 +972,6 @@ impl MpeInterp {
 }
 
 // Delay line for wave propagation
-#[derive(Clone)]
 /// A propagation delay line for a *moving source, fixed listener*, using
 /// **scatter writes and a sequential read** (interpolating write / fixed
 /// read). This is the physically correct arrangement for a moving source:
@@ -849,6 +999,11 @@ impl MpeInterp {
 /// variation left is the genuine Doppler bunching gain.
 struct DelayLine {
     buffer: Box<[f32; MAX_DELAY_SAMPLES]>, // Move large buffer to heap
+    /// Logical-clear generation for every cell. Reset advances one integer
+    /// instead of clearing 64 KiB in the audio callback; a cell from an older
+    /// generation reads as zero and is initialized lazily on first touch.
+    epochs: Box<[u32; MAX_DELAY_SAMPLES]>,
+    epoch: u32,
     /// Clock / read pointer, advances exactly 1 per frame.
     pos: f32,
     size: usize,
@@ -858,6 +1013,8 @@ impl DelayLine {
     fn new() -> Self {
         Self {
             buffer: Box::new([0.0; MAX_DELAY_SAMPLES]), // Allocate on heap
+            epochs: Box::new([0; MAX_DELAY_SAMPLES]),
+            epoch: 1,
             pos: 0.0,
             size: MAX_DELAY_SAMPLES,
         }
@@ -867,14 +1024,15 @@ impl DelayLine {
     /// `delay_samples` ahead of the read pointer, then read and consume the
     /// sample arriving at the current frame.
     fn write_and_read(&mut self, input: f32, delay_samples: f32, kernel: &[f32; SPLAT_LEN]) -> f32 {
-        // Lower clamp keeps the whole SPLAT_TAPS-wide kernel strictly ahead of
-        // the read pointer (nothing deposited into already-read cells, which a
-        // sub-SPLAT_HALF delay would otherwise do — the read pointer is always
-        // integer, advancing exactly one cell per frame). Upper clamp keeps the
-        // longest propagation delayed at the capacity limit, never wrapped past
-        // the read pointer. The floor costs SPLAT_HALF internal samples (~2.7 ms
-        // @ 1.5 kHz) of latency on a coincident transducer — negligible.
-        let delay_samples = delay_samples.clamp(SPLAT_HALF as f32, (self.size - SPLAT_TAPS - 2) as f32);
+        // A constant lookahead keeps the whole SPLAT_TAPS-wide kernel strictly
+        // ahead of the integer read pointer. The upper bound keeps the longest
+        // propagation delayed at the capacity limit, never wrapped past it.
+        // Add a constant kernel lookahead to every physical delay. Clamping all
+        // short delays to SPLAT_HALF would erase their relative phase; adding
+        // the same latency preserves delay differences while keeping the whole
+        // deposit ahead of the read pointer.
+        let delay_samples =
+            (delay_samples.max(0.0) + SPLAT_HALF as f32).min((self.size - SPLAT_TAPS - 2) as f32);
 
         // Bandlimited scatter: deposit `input` across SPLAT_TAPS cells straddling
         // its fractional arrival index, weighted by the windowed-sinc kernel for
@@ -888,14 +1046,23 @@ impl DelayLine {
         let koff = phase * SPLAT_TAPS;
         for t in 0..SPLAT_TAPS {
             let cell = (base + t + self.size - (SPLAT_HALF - 1)) % self.size;
+            if self.epochs[cell] != self.epoch {
+                self.buffer[cell] = 0.0;
+                self.epochs[cell] = self.epoch;
+            }
             self.buffer[cell] += input * kernel[koff + t];
         }
 
         // Sequential read: the sample scheduled to arrive at this frame. Zero
         // the slot after reading so the ring cell is clean for its next lap.
         let read_idx = self.pos as usize % self.size;
-        let output = self.buffer[read_idx];
+        let output = if self.epochs[read_idx] == self.epoch {
+            self.buffer[read_idx]
+        } else {
+            0.0
+        };
         self.buffer[read_idx] = 0.0;
+        self.epochs[read_idx] = self.epoch;
 
         // Advance the clock (integer-valued, wraps at capacity)
         self.pos = (self.pos + 1.0) % self.size as f32;
@@ -904,7 +1071,13 @@ impl DelayLine {
     }
 
     fn reset(&mut self) {
-        self.buffer.as_mut().fill(0.0);
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            // Unreachable in normal operation (over four billion resets of one
+            // slot), but retain correct behavior across integer wrap.
+            self.epochs.as_mut().fill(0);
+            self.epoch = 1;
+        }
         self.pos = 0.0;
     }
 }
@@ -938,6 +1111,12 @@ pub struct WaveStimulus {
     env_state: EnvelopeState,
     env_level: f32,
     env_time: f32,
+    release_start_level: f32,
+
+    /// Frames until the latest possible scattered arrival has been consumed.
+    /// The source envelope may be idle while physically emitted energy remains
+    /// in flight in the per-transducer delay lines.
+    tail_frames_remaining: usize,
 
     // Discrete controller updates -> smooth per-sample MPE trajectory
     mpe: MpeInterp,
@@ -958,7 +1137,8 @@ impl Stimulus for WaveStimulus {
 
         // Update envelope
         match self.env_state {
-            EnvelopeState::Idle => return output,
+            EnvelopeState::Idle if self.tail_frames_remaining == 0 => return output,
+            EnvelopeState::Idle => {}
             EnvelopeState::Attack => {
                 self.env_time += ctx.dt;
                 self.env_level = (self.env_time * 10.0).min(1.0); // 100ms attack
@@ -971,7 +1151,7 @@ impl Stimulus for WaveStimulus {
             }
             EnvelopeState::Release => {
                 self.env_time += ctx.dt;
-                self.env_level = (1.0 - self.env_time * 2.0).max(0.0); // 500ms release
+                self.env_level = self.release_start_level * (1.0 - self.env_time * 2.0).max(0.0); // 500ms release
                 if self.env_level <= 0.0 {
                     self.env_state = EnvelopeState::Idle;
                 }
@@ -1012,7 +1192,11 @@ impl Stimulus for WaveStimulus {
 
         // Generate source signal
         let source = (self.phase * 2.0 * std::f32::consts::PI).sin()
-                    * self.amplitude * self.env_level * mpe.pressure;
+            * self.amplitude
+            * self.env_level
+            * mpe.pressure;
+        let source_active = self.env_state != EnvelopeState::Idle;
+        let mut latest_arrival_frames = 0usize;
 
         // Process through delay lines
         for (i, &transducer_pos) in ctx.transducer_positions.iter().enumerate() {
@@ -1022,28 +1206,42 @@ impl Stimulus for WaveStimulus {
 
             let delay_time = distance / self.wave_speed.max(MIN_WAVE_SPEED); // per-stimulus wave speed, floor avoids div by zero
             let delay_samples = delay_time * ctx.sample_rate;
+            latest_arrival_frames = latest_arrival_frames.max(
+                (delay_samples.ceil().max(0.0) as usize + SPLAT_TAPS + SPLAT_HALF)
+                    .min(MAX_DELAY_SAMPLES - 1),
+            );
 
             // Distance attenuation is applied at emission (each wavefront
             // carries its own emission-time attenuation into the delay line);
             // the sequential read is then raw. Doppler amplitude gain from
             // bunched arrivals rides on top of this geometric spreading loss.
             let emitted = source / (1.0 + distance * 2.0);
-            output[i] = self.delay_lines[i].write_and_read(emitted, delay_samples, ctx.splat_kernel);
+            output[i] =
+                self.delay_lines[i].write_and_read(emitted, delay_samples, ctx.splat_kernel);
+        }
+
+        if source_active {
+            self.tail_frames_remaining = latest_arrival_frames;
+        } else {
+            self.tail_frames_remaining = self.tail_frames_remaining.saturating_sub(1);
         }
 
         // Update phase
         self.phase += self.frequency * ctx.dt;
-        if self.phase >= 1.0 { self.phase -= 1.0; }
+        if self.phase >= 1.0 {
+            self.phase -= 1.0;
+        }
 
         output
     }
 
     fn is_active(&self) -> bool {
-        self.env_state != EnvelopeState::Idle
+        self.env_state != EnvelopeState::Idle || self.tail_frames_remaining > 0
     }
 
     fn is_releasing(&self) -> bool {
         self.env_state == EnvelopeState::Release
+            || (self.env_state == EnvelopeState::Idle && self.tail_frames_remaining > 0)
     }
 
     fn note_on(&mut self, frequency: f32, velocity: u8, mpe: MpeData) {
@@ -1053,6 +1251,8 @@ impl Stimulus for WaveStimulus {
         self.snap_position = true;
         self.env_state = EnvelopeState::Attack;
         self.env_time = 0.0;
+        self.release_start_level = 0.0;
+        self.tail_frames_remaining = 0;
         self.wave_speed = DEFAULT_WAVE_SPEED; // Overridden by set_wave_speed after note_on
     }
 
@@ -1060,6 +1260,7 @@ impl Stimulus for WaveStimulus {
         if self.env_state != EnvelopeState::Idle {
             self.env_state = EnvelopeState::Release;
             self.env_time = 0.0;
+            self.release_start_level = self.env_level;
         }
     }
 
@@ -1077,6 +1278,8 @@ impl Stimulus for WaveStimulus {
         self.env_state = EnvelopeState::Idle;
         self.env_level = 0.0;
         self.env_time = 0.0;
+        self.release_start_level = 0.0;
+        self.tail_frames_remaining = 0;
         self.wave_speed = DEFAULT_WAVE_SPEED;
     }
 
@@ -1094,6 +1297,7 @@ pub struct StandingWaveStimulus {
     env_state: EnvelopeState,
     env_level: f32,
     env_time: f32,
+    release_start_level: f32,
     mpe: MpeInterp,
 }
 
@@ -1116,7 +1320,7 @@ impl Stimulus for StandingWaveStimulus {
             }
             EnvelopeState::Release => {
                 self.env_time += ctx.dt;
-                self.env_level = (1.0 - self.env_time * 2.0).max(0.0);
+                self.env_level = self.release_start_level * (1.0 - self.env_time * 2.0).max(0.0);
                 if self.env_level <= 0.0 {
                     self.env_state = EnvelopeState::Idle;
                 }
@@ -1126,15 +1330,17 @@ impl Stimulus for StandingWaveStimulus {
         let mpe = self.mpe.step(ctx.dt);
 
         let source = (self.phase * 2.0 * std::f32::consts::PI).sin()
-                    * self.amplitude * self.env_level * mpe.pressure;
+            * self.amplitude
+            * self.env_level
+            * mpe.pressure;
 
         // Simple spatial distribution without delay
-        for i in 0..TRANSDUCER_COUNT {
-            output[i] = source; // All transducers in phase
-        }
+        output.fill(source); // All transducers in phase
 
         self.phase += self.frequency * ctx.dt;
-        if self.phase >= 1.0 { self.phase -= 1.0; }
+        if self.phase >= 1.0 {
+            self.phase -= 1.0;
+        }
 
         output
     }
@@ -1153,12 +1359,14 @@ impl Stimulus for StandingWaveStimulus {
         self.mpe.note_on(mpe);
         self.env_state = EnvelopeState::Attack;
         self.env_time = 0.0;
+        self.release_start_level = 0.0;
     }
 
     fn note_off(&mut self) {
         if self.env_state != EnvelopeState::Idle {
             self.env_state = EnvelopeState::Release;
             self.env_time = 0.0;
+            self.release_start_level = self.env_level;
         }
     }
 
@@ -1171,6 +1379,7 @@ impl Stimulus for StandingWaveStimulus {
         self.env_state = EnvelopeState::Idle;
         self.env_level = 0.0;
         self.env_time = 0.0;
+        self.release_start_level = 0.0;
         self.mpe = MpeInterp::default();
     }
 }
@@ -1182,7 +1391,11 @@ mod tests {
     const SAMPLE_RATE: f32 = 48000.0;
 
     fn full_mpe() -> MpeData {
-        MpeData { pressure: 1.0, pitch_bend: 0.0, timbre: 0.5 }
+        MpeData {
+            pressure: 1.0,
+            pitch_bend: 0.0,
+            timbre: 0.5,
+        }
     }
 
     fn run_samples(engine: &mut StimulusEngine, n: usize) -> f32 {
@@ -1220,18 +1433,39 @@ mod tests {
 
     #[test]
     fn note_on_produces_output_and_note_off_releases() {
-        let (mut engine, mut producer, _layout_producer, _voices) = StimulusEngine::new(TransducerLayout::default());
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 0, note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
+        let (mut engine, mut producer, _layout_producer, _voices) =
+            StimulusEngine::new(TransducerLayout::default());
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 0,
+                note: 60,
+                velocity: 100,
+                channel: 1,
+                mpe: full_mpe(),
+            },
+        );
 
         // 200ms: through the attack, into sustain
         let peak = run_samples(&mut engine, (0.2 * SAMPLE_RATE) as usize);
         assert!(peak > 0.0, "expected audible output after note on");
         assert_eq!(active_wave_voices(&engine), 1);
 
-        send(&mut producer, EngineCommand::NoteOff { instance_id: 0, note: 60, channel: 1 });
+        send(
+            &mut producer,
+            EngineCommand::NoteOff {
+                instance_id: 0,
+                note: 60,
+                channel: 1,
+            },
+        );
         // 700ms: past the 500ms release
         run_samples(&mut engine, (0.7 * SAMPLE_RATE) as usize);
-        assert_eq!(active_wave_voices(&engine), 0, "voice should be reaped after release");
+        assert_eq!(
+            active_wave_voices(&engine),
+            0,
+            "voice should be reaped after release"
+        );
 
         let residual = run_samples(&mut engine, 1024);
         assert_eq!(residual, 0.0, "released voice should be silent");
@@ -1239,56 +1473,147 @@ mod tests {
 
     #[test]
     fn note_off_only_affects_matching_note_and_channel() {
-        let (mut engine, mut producer, _layout_producer, _voices) = StimulusEngine::new(TransducerLayout::default());
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 0, note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 0, note: 64, velocity: 100, channel: 2, mpe: full_mpe() });
+        let (mut engine, mut producer, _layout_producer, _voices) =
+            StimulusEngine::new(TransducerLayout::default());
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 0,
+                note: 60,
+                velocity: 100,
+                channel: 1,
+                mpe: full_mpe(),
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 0,
+                note: 64,
+                velocity: 100,
+                channel: 2,
+                mpe: full_mpe(),
+            },
+        );
         run_samples(&mut engine, 256);
         assert_eq!(active_wave_voices(&engine), 2);
 
         // Wrong channel: no effect
-        send(&mut producer, EngineCommand::NoteOff { instance_id: 0, note: 60, channel: 2 });
+        send(
+            &mut producer,
+            EngineCommand::NoteOff {
+                instance_id: 0,
+                note: 60,
+                channel: 2,
+            },
+        );
         run_samples(&mut engine, (0.7 * SAMPLE_RATE) as usize);
         assert_eq!(active_wave_voices(&engine), 2);
 
-        send(&mut producer, EngineCommand::NoteOff { instance_id: 0, note: 60, channel: 1 });
+        send(
+            &mut producer,
+            EngineCommand::NoteOff {
+                instance_id: 0,
+                note: 60,
+                channel: 1,
+            },
+        );
         run_samples(&mut engine, (0.7 * SAMPLE_RATE) as usize);
         assert_eq!(active_wave_voices(&engine), 1);
     }
 
     #[test]
     fn voice_stealing_prefers_releasing_then_oldest() {
-        let (mut engine, mut producer, _layout_producer, _voices) = StimulusEngine::new(TransducerLayout::default());
+        let (mut engine, mut producer, _layout_producer, _voices) =
+            StimulusEngine::new(TransducerLayout::default());
         for note in 0..MAX_WAVE_STIMULI as u8 {
-            send(&mut producer, EngineCommand::NoteOn { instance_id: 0, note: 40 + note, velocity: 100, channel: note, mpe: full_mpe() });
+            send(
+                &mut producer,
+                EngineCommand::NoteOn {
+                    instance_id: 0,
+                    note: 40 + note,
+                    velocity: 100,
+                    channel: note,
+                    mpe: full_mpe(),
+                },
+            );
         }
         run_samples(&mut engine, 64);
         assert_eq!(active_wave_voices(&engine), MAX_WAVE_STIMULI);
 
         // Release note 42 (channel 2), then allocate over capacity
-        send(&mut producer, EngineCommand::NoteOff { instance_id: 0, note: 42, channel: 2 });
+        send(
+            &mut producer,
+            EngineCommand::NoteOff {
+                instance_id: 0,
+                note: 42,
+                channel: 2,
+            },
+        );
         run_samples(&mut engine, 64); // still releasing, still owned
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 0, note: 90, velocity: 100, channel: 10, mpe: full_mpe() });
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 0,
+                note: 90,
+                velocity: 100,
+                channel: 10,
+                mpe: full_mpe(),
+            },
+        );
         run_samples(&mut engine, 64);
 
         assert_eq!(active_wave_voices(&engine), MAX_WAVE_STIMULI);
-        let notes: Vec<u8> = engine.wave_owners.iter().flatten().map(|o| o.note).collect();
+        let notes: Vec<u8> = engine
+            .wave_owners
+            .iter()
+            .flatten()
+            .map(|o| o.note)
+            .collect();
         assert!(notes.contains(&90), "new note should have a voice");
-        assert!(!notes.contains(&42), "releasing voice should have been stolen");
+        assert!(
+            !notes.contains(&42),
+            "releasing voice should have been stolen"
+        );
 
         // Pool still full, nothing releasing: the oldest (note 40) is stolen
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 0, note: 91, velocity: 100, channel: 11, mpe: full_mpe() });
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 0,
+                note: 91,
+                velocity: 100,
+                channel: 11,
+                mpe: full_mpe(),
+            },
+        );
         run_samples(&mut engine, 64);
-        let notes: Vec<u8> = engine.wave_owners.iter().flatten().map(|o| o.note).collect();
+        let notes: Vec<u8> = engine
+            .wave_owners
+            .iter()
+            .flatten()
+            .map(|o| o.note)
+            .collect();
         assert!(notes.contains(&91));
         assert!(!notes.contains(&40), "oldest voice should have been stolen");
     }
 
     #[test]
     fn mpe_update_reaches_owning_stimulus_smoothly() {
-        let (mut engine, mut producer, _layout_producer, _voices) = StimulusEngine::new(TransducerLayout::default());
+        let (mut engine, mut producer, _layout_producer, _voices) =
+            StimulusEngine::new(TransducerLayout::default());
         let mut quiet = full_mpe();
         quiet.pressure = 0.0;
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 0, note: 60, velocity: 100, channel: 3, mpe: quiet });
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 0,
+                note: 60,
+                velocity: 100,
+                channel: 3,
+                mpe: quiet,
+            },
+        );
 
         // Past the attack with zero pressure: silent
         let peak = run_samples(&mut engine, (0.2 * SAMPLE_RATE) as usize);
@@ -1297,7 +1622,14 @@ mod tests {
         // Press: output should fade in via smoothing. The window must cover
         // wave propagation to the nearest transducer (~0.13 m at 100 m/s
         // with the default cell-centred layout ≈ 1.3 ms).
-        send(&mut producer, EngineCommand::MpeUpdate { instance_id: 0, channel: 3, mpe: full_mpe() });
+        send(
+            &mut producer,
+            EngineCommand::MpeUpdate {
+                instance_id: 0,
+                channel: 3,
+                mpe: full_mpe(),
+            },
+        );
         let early = run_samples(&mut engine, (0.01 * SAMPLE_RATE) as usize); // 10 ms
         let later = run_samples(&mut engine, (0.1 * SAMPLE_RATE) as usize);
         assert!(early > 0.0, "pressure should start taking effect");
@@ -1306,10 +1638,20 @@ mod tests {
         // Update on a different channel must not affect this voice
         let mut half = full_mpe();
         half.pressure = 0.5;
-        send(&mut producer, EngineCommand::MpeUpdate { instance_id: 0, channel: 5, mpe: half });
+        send(
+            &mut producer,
+            EngineCommand::MpeUpdate {
+                instance_id: 0,
+                channel: 5,
+                mpe: half,
+            },
+        );
         run_samples(&mut engine, (0.1 * SAMPLE_RATE) as usize);
         let target = engine.wave_pool.stimuli[0].mpe.target;
-        assert_eq!(target.pressure, 1.0, "other channel's update must not leak in");
+        assert_eq!(
+            target.pressure, 1.0,
+            "other channel's update must not leak in"
+        );
     }
 
     #[test]
@@ -1318,41 +1660,103 @@ mod tests {
         // corner: the effective source must snap at note-on, then travel
         // at no more than SOURCE_SPEED_FRACTION x wave speed, eventually
         // converging on the requested position.
-        let origin = MpeData { pressure: 1.0, pitch_bend: -1.0, timbre: 0.0 };
-        let far = MpeData { pressure: 1.0, pitch_bend: 1.0, timbre: 1.0 };
-        let (mut engine, mut producer, _lp, _voices) = StimulusEngine::new(TransducerLayout::default());
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 0, note: 60, velocity: 100, channel: 1, mpe: origin });
+        let origin = MpeData {
+            pressure: 1.0,
+            pitch_bend: -1.0,
+            timbre: 0.0,
+        };
+        let far = MpeData {
+            pressure: 1.0,
+            pitch_bend: 1.0,
+            timbre: 1.0,
+        };
+        let (mut engine, mut producer, _lp, _voices) =
+            StimulusEngine::new(TransducerLayout::default());
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 0,
+                note: 60,
+                velocity: 100,
+                channel: 1,
+                mpe: origin,
+            },
+        );
         run_samples(&mut engine, 64);
         let start = engine.wave_pool.stimuli[0].source_pos;
-        assert!(start.0.abs() < 1e-3 && start.1.abs() < 1e-3, "note-on snaps to the requested position");
+        assert!(
+            start.0.abs() < 1e-3 && start.1.abs() < 1e-3,
+            "note-on snaps to the requested position"
+        );
 
-        send(&mut producer, EngineCommand::MpeUpdate { instance_id: 0, channel: 1, mpe: far });
+        send(
+            &mut producer,
+            EngineCommand::MpeUpdate {
+                instance_id: 0,
+                channel: 1,
+                mpe: far,
+            },
+        );
         let window_s = 0.05;
         run_samples(&mut engine, (window_s * SAMPLE_RATE) as usize);
         let pos = engine.wave_pool.stimuli[0].source_pos;
         let travelled = (pos.0 * pos.0 + pos.1 * pos.1).sqrt();
         let limit = SOURCE_SPEED_FRACTION * DEFAULT_WAVE_SPEED * window_s;
-        assert!(travelled <= limit * 1.01, "moved {travelled} m, limit {limit} m");
+        assert!(
+            travelled <= limit * 1.01,
+            "moved {travelled} m, limit {limit} m"
+        );
         // The requested position is ~2.24 m away, well beyond the limit, so
         // a limited source should be pinned at (close to) full speed
-        assert!(travelled >= limit * 0.9, "moved only {travelled} m of the allowed {limit} m");
+        assert!(
+            travelled >= limit * 0.9,
+            "moved only {travelled} m of the allowed {limit} m"
+        );
         // The requested target is most of the way to the far corner (the
         // ramp + two-pole MPE smoothing takes ~100 ms to fully converge)
         let req = engine.wave_pool.stimuli[0].requested_pos;
-        assert!(req.0 > 0.75 && req.1 > 1.5, "requested position should be well on its way, at {req:?}");
+        assert!(
+            req.0 > 0.75 && req.1 > 1.5,
+            "requested position should be well on its way, at {req:?}"
+        );
 
         // Given enough time, the effective source converges on the target
         run_samples(&mut engine, (0.3 * SAMPLE_RATE) as usize);
         let pos = engine.wave_pool.stimuli[0].source_pos;
-        assert!((pos.0 - 1.0).abs() < 1e-2 && (pos.1 - 2.0).abs() < 1e-2, "source should converge, at {pos:?}");
+        assert!(
+            (pos.0 - 1.0).abs() < 1e-2 && (pos.1 - 2.0).abs() < 1e-2,
+            "source should converge, at {pos:?}"
+        );
     }
 
     #[test]
     fn set_parameter_patches_instance_config_and_applies_at_note_on() {
-        let (mut engine, mut producer, _layout_producer, _voices) = StimulusEngine::new(TransducerLayout::default());
-        send(&mut producer, EngineCommand::SetParameter { instance_id: 7, parameter: Parameter::StimulusType(StimulusType::Standing) });
-        send(&mut producer, EngineCommand::SetParameter { instance_id: 7, parameter: Parameter::WaveSpeed(250.0) });
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 7, note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
+        let (mut engine, mut producer, _layout_producer, _voices) =
+            StimulusEngine::new(TransducerLayout::default());
+        send(
+            &mut producer,
+            EngineCommand::SetParameter {
+                instance_id: 7,
+                parameter: Parameter::StimulusType(StimulusType::Standing),
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::SetParameter {
+                instance_id: 7,
+                parameter: Parameter::WaveSpeed(250.0),
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 7,
+                note: 60,
+                velocity: 100,
+                channel: 1,
+                mpe: full_mpe(),
+            },
+        );
         run_samples(&mut engine, 64);
 
         // The instance's config drove note allocation into the standing pool.
@@ -1360,11 +1764,29 @@ mod tests {
         assert_eq!(engine.standing_owners.iter().flatten().count(), 1);
         assert_eq!(engine.instance_config(7).wave_speed, 250.0);
 
-        send(&mut producer, EngineCommand::SetParameter { instance_id: 7, parameter: Parameter::StimulusType(StimulusType::Wave) });
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 7, note: 62, velocity: 100, channel: 2, mpe: full_mpe() });
+        send(
+            &mut producer,
+            EngineCommand::SetParameter {
+                instance_id: 7,
+                parameter: Parameter::StimulusType(StimulusType::Wave),
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 7,
+                note: 62,
+                velocity: 100,
+                channel: 2,
+                mpe: full_mpe(),
+            },
+        );
         run_samples(&mut engine, 64);
         assert_eq!(active_wave_voices(&engine), 1);
-        assert_eq!(engine.wave_pool.stimuli[0].wave_speed, 250.0, "instance wave speed should apply at note on");
+        assert_eq!(
+            engine.wave_pool.stimuli[0].wave_speed, 250.0,
+            "instance wave speed should apply at note on"
+        );
     }
 
     #[test]
@@ -1372,35 +1794,227 @@ mod tests {
         // Two instances register different wave speeds; the same (channel,
         // note) from each must be an independent voice using its own config,
         // and a note-off from one must not silence the other.
-        let (mut engine, mut producer, _lp, _voices) = StimulusEngine::new(TransducerLayout::default());
-        send(&mut producer, EngineCommand::RegisterInstance {
-            instance_id: 100,
-            config: InstanceConfig { stimulus_type: StimulusType::Wave, wave_speed: 5.0 },
-        });
-        send(&mut producer, EngineCommand::RegisterInstance {
-            instance_id: 200,
-            config: InstanceConfig { stimulus_type: StimulusType::Wave, wave_speed: 300.0 },
-        });
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 100, note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 200, note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
+        let (mut engine, mut producer, _lp, _voices) =
+            StimulusEngine::new(TransducerLayout::default());
+        send(
+            &mut producer,
+            EngineCommand::RegisterInstance {
+                instance_id: 100,
+                config: InstanceConfig {
+                    stimulus_type: StimulusType::Wave,
+                    wave_speed: 5.0,
+                },
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::RegisterInstance {
+                instance_id: 200,
+                config: InstanceConfig {
+                    stimulus_type: StimulusType::Wave,
+                    wave_speed: 300.0,
+                },
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 100,
+                note: 60,
+                velocity: 100,
+                channel: 1,
+                mpe: full_mpe(),
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 200,
+                note: 60,
+                velocity: 100,
+                channel: 1,
+                mpe: full_mpe(),
+            },
+        );
         run_samples(&mut engine, 64);
-        assert_eq!(active_wave_voices(&engine), 2, "same (channel, note) from two instances are two voices");
+        assert_eq!(
+            active_wave_voices(&engine),
+            2,
+            "same (channel, note) from two instances are two voices"
+        );
 
         // Each voice captured its own instance's wave speed.
         let speeds: Vec<f32> = (0..MAX_WAVE_STIMULI)
             .filter(|&s| engine.wave_owners[s].is_some())
             .map(|s| engine.wave_pool.stimuli[s].wave_speed)
             .collect();
-        assert!(speeds.contains(&5.0) && speeds.contains(&300.0), "got {speeds:?}");
+        assert!(
+            speeds.contains(&5.0) && speeds.contains(&300.0),
+            "got {speeds:?}"
+        );
 
         // Note-off from instance 100 releases only its voice.
-        send(&mut producer, EngineCommand::NoteOff { instance_id: 100, note: 60, channel: 1 });
+        send(
+            &mut producer,
+            EngineCommand::NoteOff {
+                instance_id: 100,
+                note: 60,
+                channel: 1,
+            },
+        );
         run_samples(&mut engine, 64);
         let releasing: Vec<bool> = (0..MAX_WAVE_STIMULI)
             .filter(|&s| engine.wave_owners[s].is_some())
             .map(|s| engine.wave_pool.slot_releasing(s))
             .collect();
-        assert!(releasing.contains(&true) && releasing.contains(&false), "exactly one voice releasing: {releasing:?}");
+        assert!(
+            releasing.contains(&true) && releasing.contains(&false),
+            "exactly one voice releasing: {releasing:?}"
+        );
+    }
+
+    #[test]
+    fn scatter_lookahead_preserves_relative_short_delays() {
+        let kernel = design_splat_kernel();
+        let mut zero_delay = DelayLine::new();
+        let mut two_sample_delay = DelayLine::new();
+        let mut zero_out = [0.0f32; 12];
+        let mut two_out = [0.0f32; 12];
+        for n in 0..zero_out.len() {
+            let input = if n == 0 { 1.0 } else { 0.0 };
+            zero_out[n] = zero_delay.write_and_read(input, 0.0, &kernel);
+            two_out[n] = two_sample_delay.write_and_read(input, 2.0, &kernel);
+        }
+        let zero_peak = zero_out
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .unwrap()
+            .0;
+        let two_peak = two_out
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .unwrap()
+            .0;
+        assert_eq!(two_peak - zero_peak, 2);
+    }
+
+    #[test]
+    fn delay_line_reset_logically_discards_pending_samples() {
+        let kernel = design_splat_kernel();
+        let mut line = DelayLine::new();
+        line.write_and_read(1.0, 20.0, &kernel);
+        let old_epoch = line.epoch;
+        line.reset();
+        assert_ne!(line.epoch, old_epoch);
+        for _ in 0..40 {
+            assert_eq!(line.write_and_read(0.0, 20.0, &kernel), 0.0);
+        }
+    }
+
+    #[test]
+    fn wave_voice_drains_propagation_tail_after_envelope_release() {
+        let kernel = design_splat_kernel();
+        let positions = [(1.0, 0.0); TRANSDUCER_COUNT];
+        let context = ProcessContext {
+            sample_rate: 1_500.0,
+            dt: 1.0 / 1_500.0,
+            transducer_positions: &positions,
+            table_m: (1.0, 2.0),
+            splat_kernel: &kernel,
+        };
+        let mut stimulus = WaveStimulus::default();
+        stimulus.note_on(
+            40.0,
+            127,
+            MpeData {
+                pressure: 1.0,
+                pitch_bend: -1.0,
+                timbre: 0.0,
+            },
+        );
+        stimulus.set_wave_speed(1.0);
+        for _ in 0..75 {
+            stimulus.process(&context);
+        }
+        stimulus.note_off();
+        for _ in 0..900 {
+            stimulus.process(&context);
+        }
+        assert!(stimulus.env_state == EnvelopeState::Idle);
+        assert!(
+            stimulus.is_active(),
+            "in-flight arrivals must keep the voice alive"
+        );
+
+        let mut late_peak = 0.0f32;
+        for _ in 0..1_200 {
+            late_peak = late_peak.max(stimulus.process(&context)[0].abs());
+        }
+        assert!(
+            late_peak > 1e-3,
+            "expected delayed release energy, peak={late_peak}"
+        );
+    }
+
+    #[test]
+    fn note_off_during_attack_releases_from_current_level() {
+        let kernel = design_splat_kernel();
+        let positions = [(0.0, 0.0); TRANSDUCER_COUNT];
+        let context = ProcessContext {
+            sample_rate: 1_000.0,
+            dt: 0.001,
+            transducer_positions: &positions,
+            table_m: (1.0, 2.0),
+            splat_kernel: &kernel,
+        };
+        let mut stimulus = StandingWaveStimulus::default();
+        stimulus.note_on(40.0, 127, full_mpe());
+        for _ in 0..50 {
+            stimulus.process(&context);
+        }
+        let before = stimulus.env_level;
+        stimulus.note_off();
+        stimulus.process(&context);
+        assert!(stimulus.env_level <= before);
+        assert!(stimulus.env_level > before * 0.99);
+    }
+
+    #[test]
+    fn disconnect_releases_owned_voices_and_frees_instance_slot() {
+        let (mut engine, mut producer, _, _) = StimulusEngine::new(TransducerLayout::default());
+        send(
+            &mut producer,
+            EngineCommand::RegisterInstance {
+                instance_id: 123,
+                config: InstanceConfig::default(),
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 123,
+                note: 60,
+                velocity: 100,
+                channel: 1,
+                mpe: full_mpe(),
+            },
+        );
+        run_samples(&mut engine, 1);
+        assert_eq!(active_wave_voices(&engine), 1);
+        assert!(engine.instances.iter().flatten().any(|(id, _)| *id == 123));
+
+        send(
+            &mut producer,
+            EngineCommand::DisconnectInstance { instance_id: 123 },
+        );
+        run_samples(&mut engine, 1);
+        assert!(engine.wave_pool.stimuli[0].is_releasing());
+        assert!(!engine.instances.iter().flatten().any(|(id, _)| *id == 123));
+
+        run_samples(&mut engine, SAMPLE_RATE as usize);
+        assert_eq!(active_wave_voices(&engine), 0);
     }
 
     #[test]
@@ -1410,9 +2024,23 @@ mod tests {
         // 1.875)) is ~2.07 m away -> ~103 ms at the default 20 m/s =
         // ~4966 samples. The old 4800-sample delay line overflowed here
         // and read the just-written sample instead (zero delay).
-        let mpe = MpeData { pressure: 1.0, pitch_bend: -1.0, timbre: 0.0 };
-        let (mut engine, mut producer, _lp, _voices) = StimulusEngine::new(TransducerLayout::default());
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 0, note: 60, velocity: 100, channel: 1, mpe });
+        let mpe = MpeData {
+            pressure: 1.0,
+            pitch_bend: -1.0,
+            timbre: 0.0,
+        };
+        let (mut engine, mut producer, _lp, _voices) =
+            StimulusEngine::new(TransducerLayout::default());
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 0,
+                note: 60,
+                velocity: 100,
+                channel: 1,
+                mpe,
+            },
+        );
 
         let mut output = [0.0f32; TRANSDUCER_COUNT];
         let mut near_peak = 0.0f32;
@@ -1428,8 +2056,14 @@ mod tests {
             }
         }
         assert!(near_peak > 0.0, "near transducer should sound quickly");
-        assert_eq!(far_early_peak, 0.0, "far corner must stay silent until the wave arrives (~108 ms)");
-        assert!(far_late_peak > 0.0, "far corner should sound once the wave arrives");
+        assert_eq!(
+            far_early_peak, 0.0,
+            "far corner must stay silent until the wave arrives (~108 ms)"
+        );
+        assert!(
+            far_late_peak > 0.0,
+            "far corner should sound once the wave arrives"
+        );
     }
 
     #[test]
@@ -1445,8 +2079,8 @@ mod tests {
         let f0 = 100.0_f32;
         let d_rate = 0.3_f32; // |dδ/dn| samples per sample, < 0.5
         let n = 1500usize; // one second of internal frames
-        // Start high enough that the delay stays comfortably positive across
-        // the full shrinking sweep (500 − 0.3·1500 = 50 samples at the end).
+                           // Start high enough that the delay stays comfortably positive across
+                           // the full shrinking sweep (500 − 0.3·1500 = 50 samples at the end).
         let d_start = 500.0_f32;
 
         // Returns (zero_crossings, peak_abs, rms) of the delay-line output for
@@ -1496,11 +2130,20 @@ mod tests {
 
         // No read-backwards garbage on approach: bunching gives bounded gain
         // (~1/(1−0.3) ≈ 1.43), not an explosion.
-        assert!(approach_peak < 2.0, "approach peak {approach_peak} should stay bounded");
-        assert!(approach_rms > stationary_rms, "approaching source should be louder (Doppler gain)");
+        assert!(
+            approach_peak < 2.0,
+            "approach peak {approach_peak} should stay bounded"
+        );
+        assert!(
+            approach_rms > stationary_rms,
+            "approaching source should be louder (Doppler gain)"
+        );
 
         // No dropout gaps on recession: the signal thins but stays live.
-        assert!(recede_rms > 0.2 * stationary_rms, "receding output collapsed: rms {recede_rms}");
+        assert!(
+            recede_rms > 0.2 * stationary_rms,
+            "receding output collapsed: rms {recede_rms}"
+        );
     }
 
     #[test]
@@ -1535,16 +2178,27 @@ mod tests {
 
     #[test]
     fn layout_gains_apply_and_hot_swap_takes_effect() {
-        let mut muted = TransducerLayout::default();
-        muted.gains = [0.0; TRANSDUCER_COUNT];
+        let muted = TransducerLayout {
+            gains: [0.0; TRANSDUCER_COUNT],
+            ..TransducerLayout::default()
+        };
         let (mut engine, mut producer, mut layout_producer, _voices) = StimulusEngine::new(muted);
 
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 0, note: 60, velocity: 100, channel: 1, mpe: full_mpe() });
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 0,
+                note: 60,
+                velocity: 100,
+                channel: 1,
+                mpe: full_mpe(),
+            },
+        );
         let peak = run_samples(&mut engine, (0.2 * SAMPLE_RATE) as usize);
         assert_eq!(peak, 0.0, "zero gains must mute all output");
 
         // Hot-swap to unity gains: same note keeps sounding, now audible
-        layout_producer.push(Box::new(TransducerLayout::default())).unwrap();
+        layout_producer.push(TransducerLayout::default()).unwrap();
         let peak = run_samples(&mut engine, (0.2 * SAMPLE_RATE) as usize);
         assert!(peak > 0.0, "restored gains must un-mute the running voice");
     }
@@ -1555,17 +2209,43 @@ mod tests {
         // (~12 ms away), ch31 far (~103 ms away). Route physical L <- 31
         // and R <- 0 on a stereo "device": L must stay silent early while
         // R sounds, proving outputs follow the routing.
-        let mpe = MpeData { pressure: 1.0, pitch_bend: -1.0, timbre: 0.0 };
-        let (mut engine, mut producer, _lp, _voices) = StimulusEngine::new(TransducerLayout::default());
-        send(&mut producer, EngineCommand::SetParameter {
-            instance_id: 0,
-            parameter: Parameter::MonitorRoute { output: 0, source: 31 },
-        });
-        send(&mut producer, EngineCommand::SetParameter {
-            instance_id: 0,
-            parameter: Parameter::MonitorRoute { output: 1, source: 0 },
-        });
-        send(&mut producer, EngineCommand::NoteOn { instance_id: 0, note: 60, velocity: 100, channel: 1, mpe });
+        let mpe = MpeData {
+            pressure: 1.0,
+            pitch_bend: -1.0,
+            timbre: 0.0,
+        };
+        let (mut engine, mut producer, _lp, _voices) =
+            StimulusEngine::new(TransducerLayout::default());
+        send(
+            &mut producer,
+            EngineCommand::SetParameter {
+                instance_id: 0,
+                parameter: Parameter::MonitorRoute {
+                    output: 0,
+                    source: 31,
+                },
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::SetParameter {
+                instance_id: 0,
+                parameter: Parameter::MonitorRoute {
+                    output: 1,
+                    source: 0,
+                },
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 0,
+                note: 60,
+                velocity: 100,
+                channel: 1,
+                mpe,
+            },
+        );
 
         // 60 ms stereo block: past ch0's delay, well before ch31's
         let frames = (0.06 * SAMPLE_RATE) as usize;
@@ -1574,10 +2254,54 @@ mod tests {
         engine.process_block(&mut data, 2, SAMPLE_RATE, &mut levels);
 
         let left_peak = data.iter().step_by(2).fold(0.0f32, |m, &s| m.max(s.abs()));
-        let right_peak = data.iter().skip(1).step_by(2).fold(0.0f32, |m, &s| m.max(s.abs()));
-        assert_eq!(left_peak, 0.0, "L is routed to the far channel; its wave hasn't arrived yet");
-        assert!(right_peak > 0.0, "R is routed to the near channel and should sound");
+        let right_peak = data
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert_eq!(
+            left_peak, 0.0,
+            "L is routed to the far channel; its wave hasn't arrived yet"
+        );
+        assert!(
+            right_peak > 0.0,
+            "R is routed to the near channel and should sound"
+        );
         assert!(levels[0] > 0.0, "logical levels stay pre-routing");
+    }
+
+    #[test]
+    fn active_voice_snapshots_include_standing_stimuli() {
+        let (mut engine, mut producer, _, mut snapshots) =
+            StimulusEngine::new(TransducerLayout::default());
+        send(
+            &mut producer,
+            EngineCommand::RegisterInstance {
+                instance_id: 55,
+                config: InstanceConfig {
+                    stimulus_type: StimulusType::Standing,
+                    wave_speed: 20.0,
+                },
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 55,
+                note: 60,
+                velocity: 100,
+                channel: 1,
+                mpe: full_mpe(),
+            },
+        );
+        let mut data = [0.0f32; 32 * 32];
+        let mut levels = [0.0f32; TRANSDUCER_COUNT];
+        engine.process_block(&mut data, 32, SAMPLE_RATE, &mut levels);
+
+        let snapshot = snapshots.pop().unwrap();
+        assert_eq!(snapshot.count, 1);
+        assert_eq!(snapshot.voices[0].instance_id, 55);
+        assert_eq!(snapshot.voices[0].note_type, StimulusType::Standing);
     }
 
     #[test]
@@ -1586,7 +2310,9 @@ mod tests {
         // Every polyphase branch must pass DC at unity, or the output would
         // carry amplitude ripple at the internal rate
         for p in 0..RENDER_DECIMATION {
-            let sum: f32 = (0..FIR_TAPS_PER_PHASE).map(|k| h[k * RENDER_DECIMATION + p]).sum();
+            let sum: f32 = (0..FIR_TAPS_PER_PHASE)
+                .map(|k| h[k * RENDER_DECIMATION + p])
+                .sum();
             assert!((sum - 1.0).abs() < 0.01, "phase {p} DC gain {sum}");
         }
         // Frequency response at the first image of a 200 Hz tone
@@ -1604,7 +2330,10 @@ mod tests {
         };
         let passband_db = 20.0 * respond(f_content).log10();
         let image_db = 20.0 * respond(f_image).log10();
-        assert!(passband_db.abs() < 0.1, "200 Hz passband gain {passband_db} dB");
+        assert!(
+            passband_db.abs() < 0.1,
+            "200 Hz passband gain {passband_db} dB"
+        );
         assert!(image_db < -90.0, "first-image rejection only {image_db} dB");
     }
 
@@ -1613,10 +2342,16 @@ mod tests {
         let make = || {
             let (engine, mut producer, _lp, _voices) =
                 StimulusEngine::new(TransducerLayout::default());
-            send(&mut producer, EngineCommand::NoteOn {
-                instance_id: 0,
-                note: 60, velocity: 100, channel: 1, mpe: full_mpe(),
-            });
+            send(
+                &mut producer,
+                EngineCommand::NoteOn {
+                    instance_id: 0,
+                    note: 60,
+                    velocity: 100,
+                    channel: 1,
+                    mpe: full_mpe(),
+                },
+            );
             (engine, producer)
         };
         let frames = 4800; // 100 ms at the device rate
@@ -1634,11 +2369,48 @@ mod tests {
                 break;
             }
             let n = size.min(frames - off);
-            b.process_block(&mut chunked[off * 2..(off + n) * 2], 2, SAMPLE_RATE, &mut levels);
+            b.process_block(
+                &mut chunked[off * 2..(off + n) * 2],
+                2,
+                SAMPLE_RATE,
+                &mut levels,
+            );
             off += n;
         }
-        assert!(whole.iter().any(|&s| s != 0.0), "note should be audible in the window");
-        assert_eq!(whole, chunked, "upsampler state must carry across arbitrary block boundaries");
+        assert!(
+            whole.iter().any(|&s| s != 0.0),
+            "note should be audible in the window"
+        );
+        assert_eq!(
+            whole, chunked,
+            "upsampler state must carry across arbitrary block boundaries"
+        );
+    }
+
+    #[test]
+    fn reconstructed_device_output_is_hard_bounded() {
+        let layout = TransducerLayout {
+            gains: [100.0; TRANSDUCER_COUNT],
+            ..TransducerLayout::default()
+        };
+        let (mut engine, mut producer, _, _) = StimulusEngine::new(layout);
+        for note in 60..68 {
+            send(
+                &mut producer,
+                EngineCommand::NoteOn {
+                    instance_id: 0,
+                    note,
+                    velocity: 127,
+                    channel: note - 60,
+                    mpe: full_mpe(),
+                },
+            );
+        }
+        let mut data = vec![0.0f32; 4_800 * TRANSDUCER_COUNT];
+        let mut levels = [0.0f32; TRANSDUCER_COUNT];
+        engine.process_block(&mut data, TRANSDUCER_COUNT, SAMPLE_RATE, &mut levels);
+        assert!(data.iter().all(|sample| sample.is_finite()));
+        assert!(data.iter().all(|sample| sample.abs() <= 1.0));
     }
 
     /// Debug harness, not a regression test: drives the engine exactly like
@@ -1659,10 +2431,13 @@ mod tests {
         use std::io::Write as _;
 
         let env_f32 = |key: &str, default: f32| {
-            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
         };
-        let out_dir = std::env::var("HAPTIC_CAPTURE_OUT")
-            .unwrap_or_else(|_| "target/orbit-capture".into());
+        let out_dir =
+            std::env::var("HAPTIC_CAPTURE_OUT").unwrap_or_else(|_| "target/orbit-capture".into());
         let wave_speed = env_f32("HAPTIC_CAPTURE_WAVE_SPEED", 1.0);
         let secs = env_f32("HAPTIC_CAPTURE_SECS", 13.0);
         let sample_rate = env_f32("HAPTIC_CAPTURE_SR", 48000.0);
@@ -1677,17 +2452,27 @@ mod tests {
 
         // Mimic the viewer's start(): wave speed first, then note-on at the
         // resting source position (table centre), then orbit MPE updates
-        send(&mut producer, EngineCommand::SetParameter {
-            instance_id: 0,
-            parameter: Parameter::WaveSpeed(wave_speed),
-        });
-        send(&mut producer, EngineCommand::NoteOn {
-            instance_id: 0,
-            note,
-            velocity: 100,
-            channel: 15,
-            mpe: MpeData { pressure: 1.0, pitch_bend: 0.0, timbre: 0.5 },
-        });
+        send(
+            &mut producer,
+            EngineCommand::SetParameter {
+                instance_id: 0,
+                parameter: Parameter::WaveSpeed(wave_speed),
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 0,
+                note,
+                velocity: 100,
+                channel: 15,
+                mpe: MpeData {
+                    pressure: 1.0,
+                    pitch_bend: 0.0,
+                    timbre: 0.5,
+                },
+            },
+        );
 
         std::fs::create_dir_all(&out_dir).unwrap();
         let path = format!("{out_dir}/orbit_c{wave_speed}_sr{sample_rate}.f32");
@@ -1705,15 +2490,18 @@ mod tests {
                 orbit_phase += std::f32::consts::TAU * mpe_interval as f32 / orbit_period;
                 let sx = 0.5 * width + radius * orbit_phase.cos();
                 let sy = 0.5 * length + radius * orbit_phase.sin();
-                send(&mut producer, EngineCommand::MpeUpdate {
-                    instance_id: 0,
-                    channel: 15,
-                    mpe: MpeData {
-                        pressure: 1.0,
-                        pitch_bend: (2.0 * sx / width - 1.0).clamp(-1.0, 1.0),
-                        timbre: (sy / length).clamp(0.0, 1.0),
+                send(
+                    &mut producer,
+                    EngineCommand::MpeUpdate {
+                        instance_id: 0,
+                        channel: 15,
+                        mpe: MpeData {
+                            pressure: 1.0,
+                            pitch_bend: (2.0 * sx / width - 1.0).clamp(-1.0, 1.0),
+                            timbre: (sy / length).clamp(0.0, 1.0),
+                        },
                     },
-                });
+                );
                 next_mpe += mpe_interval;
             }
             engine.process_block(&mut data, TRANSDUCER_COUNT, sample_rate, &mut levels);
@@ -1731,9 +2519,19 @@ mod tests {
 
     #[test]
     fn panic_silences_everything() {
-        let (mut engine, mut producer, _layout_producer, _voices) = StimulusEngine::new(TransducerLayout::default());
+        let (mut engine, mut producer, _layout_producer, _voices) =
+            StimulusEngine::new(TransducerLayout::default());
         for note in 60..64u8 {
-            send(&mut producer, EngineCommand::NoteOn { instance_id: 0, note, velocity: 100, channel: note - 60, mpe: full_mpe() });
+            send(
+                &mut producer,
+                EngineCommand::NoteOn {
+                    instance_id: 0,
+                    note,
+                    velocity: 100,
+                    channel: note - 60,
+                    mpe: full_mpe(),
+                },
+            );
         }
         run_samples(&mut engine, 256);
         send(&mut producer, EngineCommand::Panic);

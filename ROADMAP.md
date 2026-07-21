@@ -4,6 +4,52 @@
 
 ## Status update (2026-07-20, post-implementation)
 
+- **Pre-Phase-E hardening tranche 1 complete (2026-07-21).** Added protocol
+  versioning and a mandatory one-shot `Hello`; the server rejects incompatible,
+  pre-handshake, duplicate-ID, and non-finite traffic, while finite normalized
+  values are clamped to their supported ranges. Socket
+  disconnects now reliably enqueue per-instance release/registry cleanup, with
+  command capacity reserved for lifecycle traffic. The plugin callback no longer
+  allocates/formats diagnostics, reads wall time, or locks diagnostic/config
+  mutexes. Delay-line reset is generation-based (no multi-megabyte callback
+  clear), layout reload no longer deallocates on the callback, low-speed release
+  tails drain, short delays retain relative phase, attack-time note-off is
+  continuous, velocity is linear for non-MPE input, and device output is bounded
+  after reconstruction. Standing voices now appear in snapshots; the viewer is
+  explicitly labelled as a phase-aligned geometric preview. Audio selection
+  still falls back to the default device but prefers 48 kHz wherever supported.
+  See `docs/code-review-remediation-plan.md` for completed and remaining work.
+
+- **Held-note reconnect regression fixed (2026-07-21).** Protocol v2 adds
+  `HelloAccepted`; the plugin now marks a connection and increments its
+  reconnect tracker only after the server has accepted its version, identity,
+  and engine registration. Finite MPE endpoint overshoot is clamped, and an
+  invalid post-handshake control sample is dropped without tearing down the
+  held-note connection. Controller sockets receive the one acknowledgement but
+  remain excluded from continuous observer broadcasts.
+
+- **VST build identity embedded (2026-07-21).** Each plugin build now carries a
+  deterministic source-content hash covering the plugin, shared protocol, and
+  workspace dependency lockfile. The editor displays the hash and protocol
+  version, and both are written to the plugin log at library load and instance
+  initialization, making stale DAW-loaded bundles directly identifiable.
+
+- **Observer backpressure and stuck-note cleanup fixed (2026-07-21).** Status
+  writes now use a bounded per-client buffer with resumable partial writes;
+  transient nonblocking `WouldBlock` no longer drops the viewer or corrupts
+  framing. Terminal write failures and sustained backlog removal now enter the
+  same retried `DisconnectInstance` path as read-side closure, so a viewer-owned
+  test note cannot remain sounding after its connection disappears.
+
+- **Isolated headless server mode (2026-07-21).** `--headless` and
+  `--dummy-audio` run the complete engine against a wall-clocked 48 kHz,
+  32-channel memory sink without opening CoreAudio devices. They default to a
+  per-process `/tmp/haptic-vst-test-<pid>.sock` lock namespace, so production
+  and parallel test servers do not contend. `--socket` and
+  `HAPTIC_SOCKET_PATH` select a stable dedicated test endpoint across the
+  server, viewer, scripted client, and standalone/plugin client. Endpoint
+  collisions remain fail-fast; production singleton protection is unchanged.
+
 - **Phase A — complete.** All of G1–G5 and velocity disentanglement implemented and unit/integration tested (13 tests). Exit criterion verified against the live server with a scripted MPE lifecycle (note on → bend/pressure/timbre sweeps → note off → panic) over the socket.
 - **Phase B — complete except item 4.** Engine now owned by the audio callback (no locks on the audio path), `rtrb` SPSC command queue drained once per callback, `static mut` replaced with atomics, per-event success logging removed and MPE events unlogged. Health harness reports callback p50/p99/max and stream errors every 5 s; `--test-tone` implemented. 90 s stress at ~770 cmds/s: release build p50 ≈ 2.1 ms / max ≈ 4.5 ms against a ~10.7 ms budget, zero stream errors, zero queue overflows. Item 4 (per-block envelope/MPE processing) deferred — headroom makes it unnecessary for now.
 - **Phase C — complete.** `TransducerLevels` (per-block RMS, 32 logical channels pre-truncation) broadcast at ~60 Hz over the framed protocol; plugin reader thread feeds the egui grid, which renders live levels. Verified end-to-end at 60 Hz.
@@ -18,7 +64,13 @@
 - **Delay line switched to scatter-write / sequential-read (2026-07-21).** The delay line was fixed-write / interpolated-read — physically the moving-*listener* model (delay evaluated at reception time), and the reason the source needed a velocity cap to stop the read tap overtaking the write head. For a moving source and fixed listener the correct arrangement is **interpolating writes, fixed reads**: each emitted sample is scattered (2-tap linear, accumulating) into its emission-time arrival slot `n + τᵢ(n)` and a sequential read pointer consumes arrivals. This removes the read-backwards failure mode outright and adds the physically correct Doppler *amplitude* gain (bunched arrivals on approach) the old single-tap read couldn't produce. `SOURCE_SPEED_FRACTION` lowered 0.8 → 0.5 so the scatter arrival index stays monotonic and gap-free (`da/dn ∈ [0.5, 1.5]`) with no special-casing. Distance attenuation moved to the write. Verified: all engine tests pass, a new `scatter_delay_line_shifts_pitch_with_source_motion` unit test pins Doppler direction + amplitude gain, and the c=1 orbit capture shows a clean ~6 s periodic pitch *and* amplitude swing (RMS ~2.4×), bounded output, zero non-finite samples. Design doc §3–§6 updated. Two-rate render, polyphase sinc, MPE smoothing, snapshots, viewer untouched.
 - **Scatter deposit made bandlimited; output headroom trimmed (2026-07-21).** Live testing of the scatter-write line at low wave speed (c=2 m/s, 4 s orbit) surfaced two artifacts, both diagnosed from `orbit_capture` samples: (1) **warble** — the 2-tap linear deposit's gain varies with the fractional arrival phase, so a sweeping delay amplitude-modulates the output into granulation spurs (~−20 dB); (2) **popping** — the (real) Doppler bunching gain stacking on the near-field `1/(1+2d)` gain railed the ±1 clamp on close passes. Fixes: the deposit is now a **windowed-sinc splat** (`SPLAT_TAPS=8`, Kaiser β=9, 128 phases, unit-sum per phase — flat in-band gain < 0.1 dB across phases), cutting granulation spurs ~20 dB in both Doppler directions (isolated A/B: spreading −20→−41 dB, bunching −35→−56 dB; stationary at the −138 dB f32 floor) while keeping the full Doppler amplitude behaviour; and the default per-transducer gain is trimmed to 0.5 (`DEFAULT_TRANSDUCER_GAIN`, −6 dB), sized for the worst-case 2× bunching of an advancing source at the 0.5·c limit. Re-capture: peak 1.03→0.61, railed samples 1586→0. New unit test `splat_kernel_has_unit_dc_and_flat_in_band_gain_across_phases`; config default-gain tests updated. Design doc §3/§6 updated.
 - **Design docs started (2026-07-20).** `docs/doppler-delay-line-design.md` documents the delay-line Doppler source (emergent-Doppler model, stability layers, two-rate architecture, failure-mode history). `docs/syllabary-protocol.md` is a **draft** of the expressive note-type protocol on top of MPE (syllable vocabulary, four-layer control model bounded by Push 3 / Live 12 MPE, per-instance syllable selection, handshake + namespaced-parameter migration plan, configurable attenuation `d0`/`p` as the first namespaced params). Nothing from the draft is implemented; its migration step 1 (handshake + `instance_id`) also fixes a real latent bug — voice identity `(channel, note)` collides across concurrent plugin instances.
-- **Next:** the client/server ownership rework below (in progress, started 2026-07-21) — this *is* syllabary migration step 1, brought forward. Then Phase E (stimulus research track: real standing-wave spatial structure, SpatialSweep, phasor-model experiment offline first).
+- **Next:** execute the pre-Phase-E hardening work in
+  [`docs/code-review-remediation-plan.md`](docs/code-review-remediation-plan.md), starting
+  with versioned handshakes, connection-owned voice cleanup, numeric validation,
+  and 48 kHz-preferred device configuration. The client/server ownership rework
+  below is complete, but its lifecycle and protocol-hardening follow-ups must land
+  before Phase E (real standing-wave spatial structure, SpatialSweep, phasor-model
+  experiment offline first).
 
 ## Architecture direction: multi-instance controllers, per-instance note-type config, observer viewer (design intent, 2026-07-21)
 
@@ -39,11 +91,17 @@
 **Implementation plan (milestones, committed independently).**
 1. **Plugin wave-speed range fix** — match the engine (0.25–1000 m/s, skewed so sub-20 is reachable). Isolated bug, unblocks low-c testing. ✅ *(done)*
 2. **Protocol** (`haptic-protocol`) — `HapticCommand::Hello { instance_id, role, config }`; `InstanceConfig { stimulus_type, wave_speed }`; `ClientRole { Controller, Observer }` (gates status delivery); replaced the single-voice `VoiceState` with a multi-voice `ActiveVoices` carrying per-voice `VoiceInfo` (`instance_id` + `note_type`, compact — the viewer recomputes phase/amplitude geometrically, so the 32-float delay array is dropped). `MonitorRoute` stays server-global. ✅ *(done — Hello/ActiveVoices roundtrip + frame-budget tests)*
-3. **Server** (`haptic-server`) — per-connection `instance_id` bound on `Hello` and stamped onto every command (`EngineCommand::from_wire`); fixed-capacity instance→config registry in the engine (linear scan, no audio-thread alloc); per-instance config applied at note-on; `(instance_id, channel, note)` voice identity; all active voices broadcast tagged with identity; status delivery gated by role (observers greeted + streamed, controllers get nothing so a pure write-side plugin is never dropped for an unread socket). ✅ *(done — multi-instance isolation + socket handshake/stamping/gating tests)*
-4. **Plugin client-mode** — sends `Hello` (Controller) + config on connect; IPC client is now write-only (reader thread + levels removed); editor shows only connection status + this instance's note-type config (RMS grid deleted). ✅ *(done)*
+3. **Server** (`haptic-server`) — per-connection `instance_id` bound on `Hello` and stamped onto every command (`EngineCommand::from_wire`); fixed-capacity instance→config registry in the engine (linear scan, no audio-thread alloc); per-instance config applied at note-on; `(instance_id, channel, note)` voice identity; all active voices broadcast tagged with identity; status delivery gated by role (observers are streamed status, controllers receive only `HelloAccepted`). ✅ *(done — multi-instance isolation + socket handshake/stamping/gating tests)*
+4. **Plugin client-mode** — sends `Hello` (Controller) + config on connect; waits for `HelloAccepted`, then remains command-only apart from connection liveness checks; editor shows only connection status + this instance's note-type config (RMS grid deleted). ✅ *(done)*
 5. **Viewer** — sends `Hello` (Observer); consumes `ActiveVoices`; renders the summed complex field across voices (interference-correct) and per-voice cursors; a filter picker narrows to a single instance or sums all; its test console is its own instance, so its wave-speed slider no longer fights the plugin. ✅ *(done)*
 
 Notes: coordinated protocol change — server, viewer and plugin rebuilt together. Interim server→client parameter echo deliberately skipped (per-instance config supersedes it). "Note type" is, for now, the `InstanceConfig` bundle (stimulus type + params) tagged by `instance_id`; note-type *filtering* is plumbed (`VoiceInfo.note_type`) but degenerate while all wave voices are `Wave` — it becomes meaningful as the syllabary vocabulary lands on the same identity primitive. Still open: the inverted `requested` vertical axis (trivial timbre→y flip); CLAP export; a human-readable instance label in the viewer's filter (currently a short id hash).
+
+> **Historical baseline below.** Sections 1–5 capture the 2026-07-20 audit and
+> the Phase A–E plan that drove the completed work summarized above. Statements
+> describing the “current” implementation in those sections are retained as
+> history and are not the present state. Current priorities are the status
+> update above and `docs/code-review-remediation-plan.md`.
 
 ## 1. Where this codebase sits among the planning documents
 

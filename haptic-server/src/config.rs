@@ -5,8 +5,8 @@
 //! per-transducer delays from real distances and wave speed (m/s), so the
 //! layout must use real dimensions, not normalised coordinates.
 
-use serde::Deserialize;
 use crate::engine::TRANSDUCER_COUNT;
+use serde::Deserialize;
 
 /// Default table extents: 1 m across (x), 2 m along (y).
 pub const DEFAULT_TABLE_WIDTH_M: f32 = 1.0;
@@ -35,18 +35,33 @@ impl Default for TransducerLayout {
     /// 4 columns across the 1 m width, 8 rows along the 2 m length,
     /// cell-centred. Channels run across the width first: channel = row*4+col.
     fn default() -> Self {
-        Self::grid(4, 8, DEFAULT_TABLE_WIDTH_M, DEFAULT_TABLE_LENGTH_M, DEFAULT_TRANSDUCER_GAIN)
-            .expect("default grid is valid")
+        Self::grid(
+            4,
+            8,
+            DEFAULT_TABLE_WIDTH_M,
+            DEFAULT_TABLE_LENGTH_M,
+            DEFAULT_TRANSDUCER_GAIN,
+        )
+        .expect("default grid is valid")
     }
 }
 
 impl TransducerLayout {
     /// Cell-centred cols × rows grid over a width × length table.
-    pub fn grid(cols: usize, rows: usize, width_m: f32, length_m: f32, gain: f32) -> Result<Self, String> {
+    pub fn grid(
+        cols: usize,
+        rows: usize,
+        width_m: f32,
+        length_m: f32,
+        gain: f32,
+    ) -> Result<Self, String> {
         if cols * rows != TRANSDUCER_COUNT {
             return Err(format!(
                 "grid is {}x{} = {} transducers; exactly {} required",
-                cols, rows, cols * rows, TRANSDUCER_COUNT
+                cols,
+                rows,
+                cols * rows,
+                TRANSDUCER_COUNT
             ));
         }
         if !(width_m > 0.0 && length_m > 0.0) {
@@ -118,7 +133,13 @@ pub fn parse_layout(text: &str) -> Result<TransducerLayout, String> {
     };
 
     let mut layout = match &raw.grid {
-        Some(g) => TransducerLayout::grid(g.cols, g.rows, width_m, length_m, g.gain.unwrap_or(DEFAULT_TRANSDUCER_GAIN))?,
+        Some(g) => TransducerLayout::grid(
+            g.cols,
+            g.rows,
+            width_m,
+            length_m,
+            g.gain.unwrap_or(DEFAULT_TRANSDUCER_GAIN),
+        )?,
         None => TransducerLayout::grid(4, 8, width_m, length_m, DEFAULT_TRANSDUCER_GAIN)?,
     };
 
@@ -214,7 +235,10 @@ mod tests {
         assert_eq!(layout.positions[5], (0.42, 1.0));
         assert_eq!(layout.gains[5], 0.25);
         // Other channels untouched (grid default gain)
-        assert_eq!(layout.positions[0], TransducerLayout::default().positions[0]);
+        assert_eq!(
+            layout.positions[0],
+            TransducerLayout::default().positions[0]
+        );
         assert_eq!(layout.gains[0], DEFAULT_TRANSDUCER_GAIN);
     }
 
@@ -225,7 +249,9 @@ mod tests {
         // Channel out of range
         assert!(parse_layout("[[transducer]]\nchannel = 32\nx = 0.0\ny = 0.0").is_err());
         // Negative gain
-        assert!(parse_layout("[[transducer]]\nchannel = 0\nx = 0.0\ny = 0.0\ngain = -1.0").is_err());
+        assert!(
+            parse_layout("[[transducer]]\nchannel = 0\nx = 0.0\ny = 0.0\ngain = -1.0").is_err()
+        );
         // Unknown field (typo protection)
         assert!(parse_layout("[table]\nwidth = 1.0\nlength_m = 2.0").is_err());
     }
