@@ -3,16 +3,17 @@ use nih_plug::prelude::*;
 use nih_plug::prelude::nih_log;
 use std::sync::Arc;
 use parking_lot::Mutex;
-use crate::{HapticParams, IpcClient};
+use crate::ipc_client::{Diagnostics, IpcClient};
+use crate::HapticParams;
 
 pub fn create(
     params: Arc<HapticParams>,
-    ipc_client: Arc<Mutex<Option<IpcClient>>>,
+    ipc_client: Arc<IpcClient>,
+    diag: Arc<Mutex<Diagnostics>>,
 ) -> Option<Box<dyn Editor>> {
     nih_log!("Creating plugin editor UI");
-    let editor_state = EguiState::from_size(800, 600);
-    nih_log!("Editor UI size: 800x600");
-    
+    let editor_state = EguiState::from_size(560, 620);
+
     create_egui_editor(
         editor_state,
         params.clone(),
@@ -20,26 +21,32 @@ pub fn create(
             nih_log!("Editor UI initialized");
         },
         move |egui_ctx, setter, _state| {
+            // Repaint steadily so the diagnostics (counts, last events) stay live.
+            egui_ctx.request_repaint_after(std::time::Duration::from_millis(100));
+
             egui::CentralPanel::default().show(egui_ctx, |ui| {
                 ui.heading("Haptic Controller");
                 ui.label(
-                    "Controller client: sends this instance's note-type configuration \
-                     to the server. Whole-system visualisation lives in haptic-viewer.",
+                    "Controller client — sends this instance's note-type configuration \
+                     and MIDI to the server. Field visualisation lives in haptic-viewer.",
                 );
 
                 ui.separator();
 
-                // Connection status. The plugin is a pure controller now — it
-                // consumes no status stream, so there is nothing to poll and no
-                // reason to repaint continuously; is_connected reflects the
-                // writer thread's health.
-                let connected = ipc_client.lock().as_ref().map_or(false, |c| c.is_connected());
+                let connected = ipc_client.is_connected();
+                let d = diag.lock();
                 ui.horizontal(|ui| {
                     ui.label("Server:");
                     if connected {
-                        ui.colored_label(egui::Color32::GREEN, "Connected");
+                        ui.colored_label(egui::Color32::GREEN, "● connected");
                     } else {
-                        ui.colored_label(egui::Color32::RED, "Disconnected");
+                        ui.colored_label(egui::Color32::RED, "● disconnected (retrying)");
+                    }
+                    ui.separator();
+                    ui.label(format!("instance {:04x}", d.instance_id & 0xffff));
+                    if d.connect_generation > 1 {
+                        ui.separator();
+                        ui.label(format!("reconnects: {}", d.connect_generation - 1));
                     }
                 });
 
@@ -62,12 +69,47 @@ pub fn create(
 
                 ui.separator();
 
+                // Incoming-MIDI diagnostics: confirms events are arriving from
+                // the host and being sent. `dropped` counts sends that failed
+                // (queue full / server down) — a fast pointer at why notes have
+                // "no effect".
                 ui.group(|ui| {
-                    ui.label("Performance is played over MIDI/MPE:");
-                    ui.label("• Note & velocity → which stimulus and how hard");
-                    ui.label("• MPE pressure / bend / slide → live source modulation");
-                    ui.label(format!("Plugin v{} · socket /tmp/haptic-vst.sock", crate::HapticPlugin::VERSION));
+                    ui.label("Incoming MIDI");
+                    ui.horizontal(|ui| {
+                        ui.label(format!("note-on: {}", d.notes_on));
+                        ui.separator();
+                        ui.label(format!("note-off: {}", d.notes_off));
+                        ui.separator();
+                        ui.label(format!("mpe: {}", d.mpe_updates));
+                        ui.separator();
+                        let dropped = d.sends_dropped;
+                        let col = if dropped > 0 { egui::Color32::from_rgb(220, 140, 60) } else { egui::Color32::GRAY };
+                        ui.colored_label(col, format!("dropped: {dropped}"));
+                    });
+                    if d.notes_on == 0 && d.notes_off == 0 && d.mpe_updates == 0 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 140, 60),
+                            "No MIDI received yet — check the track's MIDI routing to this plugin.",
+                        );
+                    }
                 });
+
+                ui.separator();
+
+                ui.group(|ui| {
+                    ui.label("Recent events");
+                    egui::ScrollArea::vertical().max_height(200.0).stick_to_bottom(true).show(ui, |ui| {
+                        if d.events.is_empty() {
+                            ui.weak("(none)");
+                        }
+                        for line in d.events.iter() {
+                            ui.monospace(line);
+                        }
+                    });
+                });
+
+                ui.separator();
+                ui.weak(format!("Plugin v{} · socket /tmp/haptic-vst.sock", crate::HapticPlugin::VERSION));
             });
         },
     )

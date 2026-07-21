@@ -1,13 +1,12 @@
 use nih_plug::prelude::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use parking_lot::Mutex;
-use haptic_protocol::{ClientRole, HapticCommand, InstanceConfig, MpeData, Parameter, StimulusType};
+use haptic_protocol::{HapticCommand, InstanceConfig, MpeData, Parameter, StimulusType};
 
 mod ipc_client;
 mod editor;
 
-use ipc_client::IpcClient;
+use ipc_client::{Diagnostics, IpcClient};
 
 const MIDI_CHANNELS: usize = 16;
 const CC_TIMBRE: u8 = 74; // MPE Y-axis / slide
@@ -31,7 +30,12 @@ impl From<StimulusTypeParam> for StimulusType {
 
 pub struct HapticPlugin {
     params: Arc<HapticParams>,
-    ipc_client: Arc<Mutex<Option<IpcClient>>>,
+    /// Reconnecting, write-only IPC client. Always present; its manager thread
+    /// keeps the connection up in the background.
+    ipc_client: Arc<IpcClient>,
+    /// Live diagnostics shared with the editor (incoming MIDI, send failures,
+    /// connection generation).
+    diag: Arc<Mutex<Diagnostics>>,
     /// Stable identity for this plugin instance, generated once at
     /// construction and sent in the `Hello` handshake. The server keys this
     /// instance's note-type config and voice identity on it, so concurrent
@@ -74,10 +78,19 @@ pub struct HapticParams {
 impl Default for HapticPlugin {
     fn default() -> Self {
         nih_log!("Creating new HapticPlugin instance");
+        let params = Arc::new(HapticParams::default());
+        let instance_id = new_instance_id();
+        let diag = Arc::new(Mutex::new(Diagnostics { instance_id, ..Default::default() }));
+        let initial_config = InstanceConfig {
+            stimulus_type: params.stimulus_type.value().into(),
+            wave_speed: params.wave_speed.value(),
+        };
+        let ipc_client = Arc::new(IpcClient::spawn(instance_id, initial_config, diag.clone()));
         Self {
-            params: Arc::new(HapticParams::default()),
-            ipc_client: Arc::new(Mutex::new(None)),
-            instance_id: new_instance_id(),
+            params,
+            ipc_client,
+            diag,
+            instance_id,
             mpe_state: [MpeData::default(); MIDI_CHANNELS],
             last_sent_wave_speed: None,
             last_sent_stimulus_type: None,
@@ -100,16 +113,6 @@ impl Default for HapticParams {
             .with_unit(" m/s")
             .with_step_size(0.01),
             stimulus_type: EnumParam::new("Stimulus Type", StimulusTypeParam::Wave),
-        }
-    }
-}
-
-fn send_or_log(client: &IpcClient, cmd: HapticCommand) -> bool {
-    match client.send_command(cmd) {
-        Ok(()) => true,
-        Err(e) => {
-            nih_log!("Failed to send command to haptic server: {}", e);
-            false
         }
     }
 }
@@ -140,39 +143,15 @@ impl Plugin for HapticPlugin {
     }
 
     fn initialize(&mut self, audio_io_layout: &AudioIOLayout, buffer_config: &BufferConfig, _context: &mut impl InitContext<Self>) -> bool {
-        nih_log!("Initializing HapticPlugin");
+        nih_log!("Initializing HapticPlugin (instance {})", self.instance_id);
         nih_log!("Audio layout: main_output_channels={:?}", audio_io_layout.main_output_channels);
         nih_log!("Buffer config: sample_rate={}, max_buffer_size={}", buffer_config.sample_rate, buffer_config.max_buffer_size);
 
-        // Try to connect to IPC server
-        match IpcClient::connect() {
-            Ok(client) => {
-                // Handshake first: register this instance's identity, its
-                // controller role (no status stream), and its initial
-                // note-type config, before any notes are sent.
-                let hello = HapticCommand::Hello {
-                    instance_id: self.instance_id,
-                    role: ClientRole::Controller,
-                    config: InstanceConfig {
-                        stimulus_type: self.params.stimulus_type.value().into(),
-                        wave_speed: self.params.wave_speed.value(),
-                    },
-                };
-                send_or_log(&client, hello);
-                *self.ipc_client.lock() = Some(client);
-                nih_log!("Connected to haptic server as instance {}", self.instance_id);
-            }
-            Err(e) => {
-                nih_log!("Failed to connect to haptic server: {}", e);
-                nih_log!("Plugin will continue without server connection");
-            }
-        }
-
-        // Force a parameter push on the first process() after (re)connecting
+        // The reconnecting IPC manager (spawned in Default) owns the connection
+        // and re-handshakes on every (re)connect; nothing to do here but force
+        // a fresh parameter push on the next process().
         self.last_sent_wave_speed = None;
         self.last_sent_stimulus_type = None;
-
-        nih_log!("HapticPlugin initialization complete");
         true
     }
 
@@ -183,96 +162,108 @@ impl Plugin for HapticPlugin {
             .unwrap_or_default()
             .as_micros() as u64;
 
-        let client_guard = self.ipc_client.lock();
-        if let Some(ref client) = *client_guard {
-            // Push parameter changes (and initial values) to the server
-            let wave_speed = self.params.wave_speed.value();
-            if self.last_sent_wave_speed != Some(wave_speed) {
-                let cmd = HapticCommand::SetParameter {
+        let client = self.ipc_client.clone();
+
+        // Parameter changes patch this instance's config: a live SetParameter
+        // (applied immediately by the server) and an update to the config the
+        // manager re-sends in Hello on the next reconnect.
+        let wave_speed = self.params.wave_speed.value();
+        let stimulus_type = self.params.stimulus_type.value();
+        if self.last_sent_wave_speed != Some(wave_speed)
+            || self.last_sent_stimulus_type != Some(stimulus_type)
+        {
+            client.set_config(InstanceConfig { stimulus_type: stimulus_type.into(), wave_speed });
+        }
+        if self.last_sent_wave_speed != Some(wave_speed)
+            && client
+                .send_command(HapticCommand::SetParameter {
                     timestamp_us: base_timestamp,
                     parameter: Parameter::WaveSpeed(wave_speed),
-                };
-                if send_or_log(client, cmd) {
-                    self.last_sent_wave_speed = Some(wave_speed);
-                }
-            }
-            let stimulus_type = self.params.stimulus_type.value();
-            if self.last_sent_stimulus_type != Some(stimulus_type) {
-                let cmd = HapticCommand::SetParameter {
+                })
+                .is_ok()
+        {
+            self.last_sent_wave_speed = Some(wave_speed);
+        }
+        if self.last_sent_stimulus_type != Some(stimulus_type)
+            && client
+                .send_command(HapticCommand::SetParameter {
                     timestamp_us: base_timestamp,
                     parameter: Parameter::StimulusType(stimulus_type.into()),
-                };
-                if send_or_log(client, cmd) {
-                    self.last_sent_stimulus_type = Some(stimulus_type);
-                }
-            }
+                })
+                .is_ok()
+        {
+            self.last_sent_stimulus_type = Some(stimulus_type);
+        }
 
-            // Process MIDI events, merging each into the per-channel MPE cache
-            while let Some(event) = context.next_event() {
-                let timing_offset = event.timing() as u64 * 1000; // Convert samples to microseconds (rough estimate)
-                let timestamp_us = base_timestamp + timing_offset;
+        // Process MIDI events, merging each into the per-channel MPE cache, and
+        // accumulate diagnostics locally to apply with one lock at the end.
+        let mut on = 0u64;
+        let mut off = 0u64;
+        let mut mpe = 0u64;
+        let mut dropped = 0u64;
+        let mut log: Vec<String> = Vec::new();
+        while let Some(event) = context.next_event() {
+            let timing_offset = event.timing() as u64 * 1000; // samples -> microseconds (rough)
+            let timestamp_us = base_timestamp + timing_offset;
 
-                match event {
-                    NoteEvent::NoteOn { note, velocity, channel, .. } => {
-                        let ch = (channel as usize) % MIDI_CHANNELS;
-                        // Strike velocity seeds pressure so non-MPE keyboards
-                        // (which never send pressure) still produce output.
-                        self.mpe_state[ch].pressure = velocity;
-                        nih_log!("NoteOn: note={}, velocity={:.3}, channel={}, mpe={:?}", note, velocity, channel, self.mpe_state[ch]);
-                        send_or_log(client, HapticCommand::NoteOn {
-                            timestamp_us,
-                            note,
-                            velocity: (velocity * 127.0) as u8,
-                            channel: channel as u8,
-                            mpe: self.mpe_state[ch],
-                        });
-                    }
-                    NoteEvent::NoteOff { note, channel, .. } => {
-                        nih_log!("NoteOff: note={}, channel={}", note, channel);
-                        send_or_log(client, HapticCommand::NoteOff {
-                            timestamp_us,
-                            note,
-                            channel: channel as u8,
-                        });
-                    }
-                    NoteEvent::PolyPressure { pressure, channel, .. }
-                    | NoteEvent::MidiChannelPressure { pressure, channel, .. } => {
-                        let ch = (channel as usize) % MIDI_CHANNELS;
-                        self.mpe_state[ch].pressure = pressure;
-                        send_or_log(client, HapticCommand::MpeUpdate {
-                            timestamp_us,
-                            channel: channel as u8,
-                            mpe: self.mpe_state[ch],
-                        });
-                    }
-                    NoteEvent::MidiPitchBend { channel, value, .. } => {
-                        let ch = (channel as usize) % MIDI_CHANNELS;
-                        // nih-plug pitch bend is [0, 1] with 0.5 centered;
-                        // protocol wants [-1, 1]
-                        self.mpe_state[ch].pitch_bend = value * 2.0 - 1.0;
-                        send_or_log(client, HapticCommand::MpeUpdate {
-                            timestamp_us,
-                            channel: channel as u8,
-                            mpe: self.mpe_state[ch],
-                        });
-                    }
-                    NoteEvent::MidiCC { channel, cc, value, .. } if cc == CC_TIMBRE => {
-                        let ch = (channel as usize) % MIDI_CHANNELS;
-                        self.mpe_state[ch].timbre = value;
-                        send_or_log(client, HapticCommand::MpeUpdate {
-                            timestamp_us,
-                            channel: channel as u8,
-                            mpe: self.mpe_state[ch],
-                        });
-                    }
-                    _ => {}
+            match event {
+                NoteEvent::NoteOn { note, velocity, channel, .. } => {
+                    let ch = (channel as usize) % MIDI_CHANNELS;
+                    // Strike velocity seeds pressure so non-MPE keyboards
+                    // (which never send pressure) still produce output.
+                    self.mpe_state[ch].pressure = velocity;
+                    let ok = client.send_command(HapticCommand::NoteOn {
+                        timestamp_us,
+                        note,
+                        velocity: (velocity * 127.0) as u8,
+                        channel: channel as u8,
+                        mpe: self.mpe_state[ch],
+                    }).is_ok();
+                    on += 1;
+                    if !ok { dropped += 1; }
+                    log.push(format!("on  n{note} v{} ch{channel}{}", (velocity * 127.0) as u8, if ok { "" } else { "  DROPPED" }));
                 }
+                NoteEvent::NoteOff { note, channel, .. } => {
+                    let ok = client.send_command(HapticCommand::NoteOff {
+                        timestamp_us,
+                        note,
+                        channel: channel as u8,
+                    }).is_ok();
+                    off += 1;
+                    if !ok { dropped += 1; }
+                    log.push(format!("off n{note} ch{channel}{}", if ok { "" } else { "  DROPPED" }));
+                }
+                NoteEvent::PolyPressure { pressure, channel, .. }
+                | NoteEvent::MidiChannelPressure { pressure, channel, .. } => {
+                    let ch = (channel as usize) % MIDI_CHANNELS;
+                    self.mpe_state[ch].pressure = pressure;
+                    if client.send_command(HapticCommand::MpeUpdate { timestamp_us, channel: channel as u8, mpe: self.mpe_state[ch] }).is_err() { dropped += 1; }
+                    mpe += 1;
+                }
+                NoteEvent::MidiPitchBend { channel, value, .. } => {
+                    let ch = (channel as usize) % MIDI_CHANNELS;
+                    // nih-plug pitch bend is [0, 1] with 0.5 centered; protocol wants [-1, 1]
+                    self.mpe_state[ch].pitch_bend = value * 2.0 - 1.0;
+                    if client.send_command(HapticCommand::MpeUpdate { timestamp_us, channel: channel as u8, mpe: self.mpe_state[ch] }).is_err() { dropped += 1; }
+                    mpe += 1;
+                }
+                NoteEvent::MidiCC { channel, cc, value, .. } if cc == CC_TIMBRE => {
+                    let ch = (channel as usize) % MIDI_CHANNELS;
+                    self.mpe_state[ch].timbre = value;
+                    if client.send_command(HapticCommand::MpeUpdate { timestamp_us, channel: channel as u8, mpe: self.mpe_state[ch] }).is_err() { dropped += 1; }
+                    mpe += 1;
+                }
+                _ => {}
             }
-        } else {
-            // Log when no IPC client is available, but only occasionally to avoid spam
-            static LOG_COUNTER: AtomicU32 = AtomicU32::new(0);
-            if LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % 4800 == 0 {
-                nih_log!("No IPC client available for MIDI processing (logged occasionally)");
+        }
+        if on + off + mpe + dropped > 0 {
+            let mut d = self.diag.lock();
+            d.notes_on += on;
+            d.notes_off += off;
+            d.mpe_updates += mpe;
+            d.sends_dropped += dropped;
+            for line in log {
+                d.log(line);
             }
         }
 
@@ -287,9 +278,7 @@ impl Plugin for HapticPlugin {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let ipc_client = self.ipc_client.clone();
-        editor::create(params, ipc_client)
+        editor::create(self.params.clone(), self.ipc_client.clone(), self.diag.clone())
     }
 }
 
