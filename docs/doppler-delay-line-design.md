@@ -56,23 +56,26 @@ flowchart LR
 
 Everything inside the audio callback is allocation- and lock-free: the engine is *owned* by the callback, commands and layout hot-reloads arrive on `rtrb` SPSC rings, and voice snapshots leave on a third ring (dropped when full).
 
-## 3. The delay line
+## 3. The delay line — scatter writes, sequential read
 
-Each `WaveStimulus` owns 32 independent delay lines — one per transducer — because each transducer sits at a different distance and needs its own tap. A delay line is a heap-allocated ring buffer (`Box<[f32; 16384]>`) with a single write head and a **fractional read tap** placed `τᵢ · sample_rate` samples behind it, linearly interpolated between the two neighbouring samples so that delay can vary continuously:
+Each `WaveStimulus` owns 32 independent delay lines — one per transducer — because each transducer sits at a different distance and needs its own tap. A delay line is a heap-allocated ring buffer (`Box<[f32; 16384]>`).
+
+The arrangement matters. For a **moving source and fixed listener**, the delay is a function of *emission* time: a sample emitted at frame *n*, when the source is at `xₛ(n)`, arrives at the fixed transducer at frame `a(n) = n + τᵢ(n)`. The line therefore uses **interpolating writes and a fixed (sequential) read** — each emitted sample is *scattered* into its fractional arrival slot (split linearly across the two straddling cells, **accumulating**), and a read pointer advancing exactly one cell per frame consumes whatever has arrived at the current frame, zeroing the slot behind it:
 
 ```
-      write head (advances 1/frame)
-           ▼
-  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
-  │  │  │▒▒│  │  │  │  │  │ ●│  │  │  │  │  │  │   ring, 16384 frames
-  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘   (~10.9 s @ 1.5 kHz)
-                           ▲
-              read tap, delay τᵢ·rate behind the head
-              (fractional: lerp between neighbours;
-               moves as the source moves → Doppler)
+   read pointer (advances 1/frame,               scatter-write:
+   consumes & zeroes this slot)                  emission n lands at
+           ▼                                      arrival a(n) = n + τᵢ(n)
+  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐   ▲       ▲
+  │  │  │  │▒▒│  │  │  │  │▓▓│▓▓│  │  │  │  │  │   split across
+  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘   two cells, +=
+     read side ←───── τᵢ·rate ─────→ write side    (bunches when the
+                                                    source approaches)
 ```
 
-Per frame, each line does one write, one interpolated read, and the output is scaled by the distance attenuation `1 / (1 + 2d)`. Delays beyond capacity are **clamped, never wrapped** — a wrap would read the just-written sample, i.e. silently produce *zero* delay, which is precisely the latent bug the 1×2 m table exposed (see §6).
+This is the physically correct model, and it is *not* what a single fractional **read** tap behind a fixed write head does — that evaluates τ at *reception* time (the moving-*listener* model) and, on a fast approach, drives the read tap into the write head, reading the line backwards. Scatter-writes have no such failure: an approaching source simply bunches successive arrivals into adjacent cells — the physically correct concentration of energy, which yields a Doppler **amplitude** gain as well as the frequency shift (verified in capture: channel RMS swings ~2.4× over an orbit as the source nears and recedes). A receding source thins the arrivals out.
+
+Per frame each line does one two-cell scatter-write and one sequential read. Distance attenuation `1 / (1 + 2d)` is applied *at the write* (each wavefront carries its own emission-time spreading loss into the line); the read is raw. Delays beyond capacity are **clamped, never wrapped** — a wrap would lap the read pointer and collapse the delay, which is precisely the latent bug the 1×2 m table exposed (see §6).
 
 ## 4. Keeping the model stable: three protective layers
 
@@ -82,7 +85,7 @@ The physics is one line; almost all of the engineering is making a *time-varying
 flowchart TD
     A["Discrete MPE updates<br/>(client send rate, quantised to<br/>audio-block boundaries)"]
     B["<b>1 · MPE interpolator</b><br/>linear ramp over the measured update<br/>spacing (5–50 ms), then two cascaded<br/>15 ms one-poles"]
-    C["<b>2 · Source velocity limit</b><br/>effective position chases the request at<br/>≤ 0.8 × wave speed; snaps only at note-on"]
+    C["<b>2 · Source velocity limit</b><br/>effective position chases the request at<br/>≤ 0.5 × wave speed; snaps only at note-on"]
     D["<b>3 · Delay clamp (backstop)</b><br/>τ clamped to buffer capacity —<br/>unreachable for realistic layouts"]
     E["Smooth, causal τᵢ(t)<br/>→ clean Doppler"]
     A --> B --> C --> D --> E
@@ -90,7 +93,7 @@ flowchart TD
 
 **Layer 1 — MPE interpolation** (`MpeInterp`). Controller updates arrive as discrete steps, further staircased to audio-block boundaries by the command queue. Feeding steps straight into the delay computation frequency-modulates the lines at the update rate, spraying an FM sideband comb around the carrier. Each new target is instead ramped linearly over roughly the *measured* arrival spacing (clamped 5–50 ms) — making smoothness independent of the client's send cadence — and the ramp output passes through two cascaded 15 ms one-poles (the second pole buys ~19 dB of extra sideband suppression for ~15 ms of position lag). Verified by buffer capture: in-band artefacts fell from −41.6 to −53 dB at c = 1 m/s.
 
-**Layer 2 — subsonic source** (`SOURCE_SPEED_FRACTION = 0.8`). If the source outruns its own waves, some delay shrinks faster than one sample per sample and the read tap overtakes the write head — the delay line is read *backwards* and the Doppler model collapses. The effective source position therefore chases the MPE-requested position at no more than 0.8 × c. The position snaps directly to the request at note-on only (a new note must not sweep in from wherever the stolen slot's previous voice sat). The viewer visualises this pair: a ring at the requested position, a cross at the effective source, a tether while it catches up.
+**Layer 2 — subsonic source** (`SOURCE_SPEED_FRACTION = 0.5`). With scatter-writes, an emission's arrival index advances by `da/dn = 1 + v_r/c` per frame, where `v_r` is the source's radial velocity toward a transducer. If the source outran its waves (`v_r → −c` on approach) `da/dn` would fall to zero and successive arrivals would invert; run the other way and they would skip cells, leaving dropout gaps. Holding the table-space source speed to 0.5 × c bounds `da/dn ∈ [0.5, 1.5]`, so arrivals stay strictly monotonic *and* gap-free — a plain 2-tap accumulate needs no special-casing (the earlier read-tap model needed this limit for a harder reason: to stop the read tap overtaking the write head; 0.8 × c sufficed there, 0.5 × c is the conservative bound the scatter model wants). The effective position therefore chases the MPE-requested position at no more than 0.5 × c, snapping directly to the request at note-on only (a new note must not sweep in from wherever the stolen slot's previous voice sat). The viewer visualises this pair: a ring at the requested position, a cross at the effective source, a tether while it catches up.
 
 **Layer 3 — capacity clamp.** A last-resort clamp of τ to the buffer length. When it engages, Doppler silently dies for that transducer (a clamped delay is a constant delay), so the design goal is to make it unreachable — which is what the rate architecture below achieves. The wave-speed floor (0.25 m/s) is chosen so a full-table propagation still fits.
 
@@ -122,13 +125,13 @@ Each protective mechanism above earned its place by a concrete, captured failure
 
 | Symptom | Root cause | Fix |
 |---|---|---|
-| Far-corner transducer sounded *immediately* (no propagation delay) on the 1×2 m table | Worst-case delay (diagonal ÷ 20 m/s ≈ 112 ms) exceeded the then-100 ms buffer; the overflow path wrapped and read the just-written sample | Bigger buffers, clamp-not-wrap semantics (§3) |
+| Far-corner transducer sounded *immediately* (no propagation delay) on the 1×2 m table | Worst-case delay (diagonal ÷ 20 m/s ≈ 112 ms) exceeded the then-100 ms buffer; the overflow path collapsed the delay to ~zero | Bigger buffers, clamp-not-wrap semantics (§3) |
 | Pitch *steps* at the orbit period; Doppler vanishing over arcs of the orbit | Delay hitting the capacity clamp — a clamped delay is Doppler-free | Two-rate render stretching capacity to ~10.9 s (§5) |
 | Sideband comb around the carrier at the audio-block/MPE-send rate | Stepped position targets frequency-modulating the delay lines | Measured-spacing ramp + double one-pole (§4, layer 1) |
-| Garbled output on fast MPE jumps | Source moving supersonically; read tap overtaking the write head | 0.8 × c source velocity limit (§4, layer 2) |
+| Garbled output on fast MPE jumps | Source moving supersonically: under the old read-tap line the read tap overtook the write head (line read backwards) | Scatter-write line (§3) removes the overtake failure entirely; 0.5 × c source velocity limit keeps scatter arrivals monotonic and gap-free (§4, layer 2) |
 | Audible high-frequency images on monitors | Linear-interp upsampler images at ~−50 dB | Polyphase Kaiser-sinc reconstruction, images at −107 dB (§5) |
 
-The debugging instrument for all of these is the headless capture harness (`orbit_capture_writes_debug_buffers` in `engine.rs`): it drives `process_block` with the viewer's exact orbit command stream against a dummy 32-channel sink and writes raw 32-channel f32 output for offline spectral analysis. Design-level claims above (image rejection, sideband levels, pitch-jump counts) were verified against those captures, and the load-bearing properties are pinned by unit tests (delay-not-wrap, velocity limit, per-branch DC gain and image rejection, block-size invariance).
+The debugging instrument for all of these is the headless capture harness (`orbit_capture_writes_debug_buffers` in `engine.rs`): it drives `process_block` with the viewer's exact orbit command stream against a dummy 32-channel sink and writes raw 32-channel f32 output for offline spectral analysis. Design-level claims above (image rejection, sideband levels, pitch-jump counts) were verified against those captures, and the load-bearing properties are pinned by unit tests (scatter-line Doppler direction and amplitude gain, delay-not-wrap, velocity limit, per-branch DC gain and image rejection, block-size invariance).
 
 ## 7. Boundaries of the model
 

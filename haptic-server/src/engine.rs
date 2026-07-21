@@ -50,11 +50,14 @@ const MIN_WAVE_SPEED: f32 = 0.25; // m/s — floor chosen so a full-table propag
 const MAX_WAVE_SPEED: f32 = 1000.0; // m/s
 
 /// Maximum speed of the effective source position, as a fixed fraction of
-/// the stimulus's wave speed. Keeps the source subsonic relative to its own
-/// waves: an MPE jump would otherwise move the source faster than
-/// propagation, collapsing delay ordering (delays shrinking by more than
-/// one sample per sample reads the delay lines backwards).
-const SOURCE_SPEED_FRACTION: f32 = 0.8;
+/// the stimulus's wave speed. Keeps the source comfortably subsonic relative
+/// to its own waves. With the scatter-write delay line (see `DelayLine`), an
+/// emission's arrival index advances by da/dn = 1 + v_r/c per frame, where
+/// v_r is the source's radial velocity toward a transducer. Holding the
+/// table-space source speed to 0.5·c bounds da/dn ∈ [0.5, 1.5]: arrivals stay
+/// monotonic (no order inversion on approach) and never skip a ring cell (no
+/// dropout gaps on recession), so 2-tap linear scatter needs no special-casing.
+const SOURCE_SPEED_FRACTION: f32 = 0.5;
 
 /// Capacity of the IPC → audio thread command ring buffer. Sized for a
 /// worst-case burst of MPE traffic within one audio callback.
@@ -711,9 +714,29 @@ impl MpeInterp {
 
 // Delay line for wave propagation
 #[derive(Clone)]
+/// A propagation delay line for a *moving source, fixed listener*, using
+/// **scatter writes and a sequential read** (interpolating write / fixed
+/// read). This is the physically correct arrangement for a moving source:
+/// the delay is a function of *emission* time — a sample emitted at frame n,
+/// when the source is at xₛ(n), arrives at the fixed transducer at frame
+/// a(n) = n + τ(n). We therefore deposit each emitted sample into its arrival
+/// slot (linearly scattered across the two neighbouring cells, accumulating)
+/// and read the buffer sequentially at the current frame.
+///
+/// The alternative — a fixed write head with an interpolated read tap —
+/// evaluates τ at *reception* time (the moving-listener model) and lets a
+/// fast-approaching source drive the read tap into the write head, reading
+/// the line backwards. The scatter model has no such failure: a fast approach
+/// merely bunches writes (the physically correct energy/Doppler concentration,
+/// giving amplitude gain as well as the frequency shift). With `source_pos`
+/// held to ≤ SOURCE_SPEED_FRACTION·c (0.5·c), the arrival index advances by
+/// da/dn = 1 + v_r/c ∈ [0.5, 1.5] per frame, so arrivals never invert (no
+/// order reversal on approach) and never skip a cell (no dropout gaps on
+/// recession) — a plain 2-tap accumulate suffices, no special-casing.
 struct DelayLine {
     buffer: Box<[f32; MAX_DELAY_SAMPLES]>, // Move large buffer to heap
-    write_pos: f32,
+    /// Clock / read pointer, advances exactly 1 per frame.
+    pos: f32,
     size: usize,
 }
 
@@ -721,45 +744,44 @@ impl DelayLine {
     fn new() -> Self {
         Self {
             buffer: Box::new([0.0; MAX_DELAY_SAMPLES]), // Allocate on heap
-            write_pos: 0.0,
+            pos: 0.0,
             size: MAX_DELAY_SAMPLES,
         }
     }
 
-    // Fractional delay with linear interpolation
+    /// Scatter `input` into its arrival slot `delay_samples` ahead of the read
+    /// pointer, then read (and consume) the sample arriving at the current
+    /// frame. Write-then-read so a near-zero delay is heard this frame.
     fn write_and_read(&mut self, input: f32, delay_samples: f32) -> f32 {
-        // Write current input
-        let write_idx = self.write_pos as usize;
-        self.buffer[write_idx] = input;
-
-        // A delay beyond capacity would make read_pos negative even after
-        // the wrap correction; the negative-to-usize cast then reads index 0
-        // (i.e. the sample just written - no delay at all). Clamp instead.
+        // Beyond capacity the scatter would lap the read pointer; clamp so the
+        // longest propagation is delayed at the capacity limit, never wrapped.
         let delay_samples = delay_samples.clamp(0.0, (self.size - 2) as f32);
 
-        // Read with fractional delay
-        let read_pos = self.write_pos - delay_samples;
-        let read_pos = if read_pos < 0.0 {
-            read_pos + self.size as f32
-        } else {
-            read_pos
-        };
+        // Scatter-write: deposit the emission linearly across the two cells
+        // straddling its fractional arrival index, accumulating so bunched
+        // arrivals (an approaching source) superpose correctly.
+        let arrival = self.pos + delay_samples;
+        let a0 = arrival.floor() as usize % self.size;
+        let a1 = (a0 + 1) % self.size;
+        let frac = arrival.fract();
+        self.buffer[a0] += input * (1.0 - frac);
+        self.buffer[a1] += input * frac;
 
-        let idx0 = read_pos.floor() as usize % self.size;
-        let idx1 = (idx0 + 1) % self.size;
-        let frac = read_pos.fract();
+        // Sequential read: the sample scheduled to arrive at this frame. Zero
+        // the slot after reading so the ring cell is clean for its next lap.
+        let read_idx = self.pos as usize % self.size;
+        let output = self.buffer[read_idx];
+        self.buffer[read_idx] = 0.0;
 
-        let output = self.buffer[idx0] * (1.0 - frac) + self.buffer[idx1] * frac;
-
-        // Advance write position
-        self.write_pos = (self.write_pos + 1.0) % self.size as f32;
+        // Advance the clock
+        self.pos = (self.pos + 1.0) % self.size as f32;
 
         output
     }
 
     fn reset(&mut self) {
         self.buffer.as_mut().fill(0.0);
-        self.write_pos = 0.0;
+        self.pos = 0.0;
     }
 }
 
@@ -844,9 +866,9 @@ impl Stimulus for WaveStimulus {
             mpe.timbre.clamp(0.0, 1.0) * length,
         );
 
-        // The effective source chases the requested position at no more
-        // than SOURCE_SPEED_FRACTION of the wave speed, so the source can
-        // never outrun its own waves
+        // The effective source chases the requested position at no more than
+        // SOURCE_SPEED_FRACTION of the wave speed, keeping arrival indices in
+        // the scatter-write delay lines monotonic and gap-free (see DelayLine)
         if self.snap_position {
             self.snap_position = false;
             self.source_pos = self.requested_pos;
@@ -877,10 +899,12 @@ impl Stimulus for WaveStimulus {
             let delay_time = distance / self.wave_speed.max(MIN_WAVE_SPEED); // per-stimulus wave speed, floor avoids div by zero
             let delay_samples = delay_time * ctx.sample_rate;
 
-            let delayed = self.delay_lines[i].write_and_read(source, delay_samples);
-            let attenuated = delayed / (1.0 + distance * 2.0); // Distance attenuation
-
-            output[i] = attenuated;
+            // Distance attenuation is applied at emission (each wavefront
+            // carries its own emission-time attenuation into the delay line);
+            // the sequential read is then raw. Doppler amplitude gain from
+            // bunched arrivals rides on top of this geometric spreading loss.
+            let emitted = source / (1.0 + distance * 2.0);
+            output[i] = self.delay_lines[i].write_and_read(emitted, delay_samples);
         }
 
         // Update phase
@@ -1245,6 +1269,76 @@ mod tests {
         assert!(near_peak > 0.0, "near transducer should sound quickly");
         assert_eq!(far_early_peak, 0.0, "far corner must stay silent until the wave arrives (~108 ms)");
         assert!(far_late_peak > 0.0, "far corner should sound once the wave arrives");
+    }
+
+    #[test]
+    fn scatter_delay_line_shifts_pitch_with_source_motion() {
+        // The scatter-write / sequential-read delay line must produce Doppler
+        // directly from a changing delay: a shrinking delay (approaching
+        // source) raises the observed frequency, a growing delay (receding)
+        // lowers it, and neither direction produces read-backwards garbage or
+        // dropout gaps at up to 0.5 samples/sample of delay change (the 0.5·c
+        // source-speed bound). We drive one line with a fixed-frequency sine
+        // while ramping the delay, and compare zero-crossing rates.
+        let fs = 1500.0_f32; // internal render rate
+        let f0 = 100.0_f32;
+        let d_rate = 0.3_f32; // |dδ/dn| samples per sample, < 0.5
+        let n = 1500usize; // one second of internal frames
+        // Start high enough that the delay stays comfortably positive across
+        // the full shrinking sweep (500 − 0.3·1500 = 50 samples at the end).
+        let d_start = 500.0_f32;
+
+        // Returns (zero_crossings, peak_abs, rms) of the delay-line output for
+        // a delay that ramps at `slope` samples/sample from `d_start`.
+        let run = |slope: f32| -> (usize, f32, f32) {
+            let mut line = DelayLine::new();
+            let mut prev = 0.0f32;
+            let mut crossings = 0usize;
+            let mut peak = 0.0f32;
+            let mut sumsq = 0.0f64;
+            let mut counted = 0usize;
+            for i in 0..n {
+                let phase = 2.0 * std::f32::consts::PI * f0 * i as f32 / fs;
+                let input = phase.sin();
+                let delay = d_start + slope * i as f32;
+                let out = line.write_and_read(input, delay);
+                // Skip the initial fill (until the read pointer reaches the
+                // first scattered arrivals ~d_start frames in).
+                if i > d_start as usize + 50 {
+                    if prev <= 0.0 && out > 0.0 {
+                        crossings += 1;
+                    }
+                    peak = peak.max(out.abs());
+                    sumsq += (out as f64) * (out as f64);
+                    counted += 1;
+                    prev = out;
+                }
+            }
+            let rms = (sumsq / counted.max(1) as f64).sqrt() as f32;
+            (crossings, peak, rms)
+        };
+
+        let (approach, approach_peak, approach_rms) = run(-d_rate); // delay shrinking
+        let (stationary, _, stationary_rms) = run(0.0);
+        let (recede, _recede_peak, recede_rms) = run(d_rate); // delay growing
+
+        // Doppler direction: approaching raises pitch, receding lowers it.
+        assert!(
+            approach > stationary && stationary > recede,
+            "expected approach {approach} > stationary {stationary} > recede {recede} zero-crossings"
+        );
+
+        // The shift tracks the classic f0·(1 − dδ/dn): at dδ/dn = ∓0.3 the
+        // observed frequency is ≈ 130 Hz / 70 Hz, a clear ordered separation
+        // over the counted window (the ordering above pins the direction).
+
+        // No read-backwards garbage on approach: bunching gives bounded gain
+        // (~1/(1−0.3) ≈ 1.43), not an explosion.
+        assert!(approach_peak < 2.0, "approach peak {approach_peak} should stay bounded");
+        assert!(approach_rms > stationary_rms, "approaching source should be louder (Doppler gain)");
+
+        // No dropout gaps on recession: the signal thins but stays live.
+        assert!(recede_rms > 0.2 * stationary_rms, "receding output collapsed: rms {recede_rms}");
     }
 
     #[test]
