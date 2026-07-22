@@ -22,8 +22,10 @@
 //! renders at 120 fps (see the on-screen fps counter).
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -56,6 +58,399 @@ const TEST_CHANNEL: u8 = 15;
 
 /// Minimum interval between outgoing MPE position updates.
 const MPE_SEND_INTERVAL: Duration = Duration::from_millis(8);
+
+const MAX_SERVER_LOG_LINES: usize = 200;
+const MANAGED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+// ---------------------------------------------------------------------------
+// Unified application / server supervision
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppOptions {
+    socket_path: String,
+    connect_only: bool,
+    server_bin: Option<PathBuf>,
+    config_path: PathBuf,
+    dummy_audio: bool,
+    test_tone: bool,
+}
+
+fn parse_options(
+    args: impl IntoIterator<Item = String>,
+    environment_socket: Option<String>,
+    environment_server_bin: Option<String>,
+    process_id: u32,
+) -> Result<AppOptions, String> {
+    let mut connect_only = false;
+    let mut server_bin = environment_server_bin.map(PathBuf::from);
+    let mut config_path = PathBuf::from("haptic.toml");
+    let mut dummy_audio = false;
+    let mut test_tone = false;
+    let mut socket_path = None;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--connect-only" => connect_only = true,
+            "--headless" | "--dummy-audio" => dummy_audio = true,
+            "--test-tone" => test_tone = true,
+            "--server-bin" => {
+                server_bin = Some(PathBuf::from(next_option_value(&mut args, "--server-bin")?));
+            }
+            "--config" => {
+                config_path = PathBuf::from(next_option_value(&mut args, "--config")?);
+            }
+            "--socket" => socket_path = Some(next_option_value(&mut args, "--socket")?),
+            unknown => return Err(format!("unknown argument {unknown}; use --help")),
+        }
+    }
+
+    let socket_path = socket_path.or(environment_socket).unwrap_or_else(|| {
+        if dummy_audio {
+            format!("/tmp/haptic-vst-app-{process_id}.sock")
+        } else {
+            SOCKET_PATH.to_string()
+        }
+    });
+
+    Ok(AppOptions {
+        socket_path,
+        connect_only,
+        server_bin,
+        config_path,
+        dummy_audio,
+        test_tone,
+    })
+}
+
+fn next_option_value(
+    args: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<String, String> {
+    args.next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{option} requires a value"))
+}
+
+fn print_usage() {
+    eprintln!(
+        "Usage: haptic-viewer [--connect-only] [--server-bin PATH] [--config PATH] [--headless|--dummy-audio] [--test-tone] [--socket PATH]\n\
+         \n\
+         By default the application attaches to a live server at the selected\n\
+         endpoint or starts and supervises a sibling haptic-server executable.\n\
+         \n\
+         --connect-only           Never start or stop a server.\n\
+         --server-bin PATH        Server executable to start when needed.\n\
+         --config PATH            Layout passed to a managed server.\n\
+         --headless, --dummy-audio  Start a managed 48 kHz memory sink.\n\
+         --test-tone              Start a managed server in hardware test-tone mode.\n\
+         --socket PATH            Server endpoint for attachment and launch.\n\
+         HAPTIC_SERVER_BIN        Environment alternative to --server-bin.\n\
+         HAPTIC_SOCKET_PATH       Environment alternative to --socket."
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerMode {
+    ConnectOnly,
+    External,
+    Managed,
+    Stopped,
+    Failed,
+}
+
+struct ServerSupervisor {
+    options: AppOptions,
+    mode: ServerMode,
+    child: Option<Child>,
+    lifetime: Option<ChildStdin>,
+    logs: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl ServerSupervisor {
+    fn new(options: AppOptions) -> Self {
+        let mut supervisor = Self {
+            mode: if options.connect_only {
+                ServerMode::ConnectOnly
+            } else {
+                ServerMode::Stopped
+            },
+            options,
+            child: None,
+            lifetime: None,
+            logs: Arc::new(Mutex::new(VecDeque::new())),
+        };
+
+        if supervisor.options.connect_only {
+            push_server_log(
+                &supervisor.logs,
+                "Connect-only mode: waiting for an external server".to_string(),
+            );
+        } else if server_reachable(&supervisor.options.socket_path) {
+            supervisor.mode = ServerMode::External;
+            push_server_log(
+                &supervisor.logs,
+                format!(
+                    "Attached to external server at {}",
+                    supervisor.options.socket_path
+                ),
+            );
+        } else {
+            supervisor.start_managed();
+        }
+
+        supervisor
+    }
+
+    fn start_managed(&mut self) {
+        if self.child.is_some() || self.options.connect_only {
+            return;
+        }
+        if server_reachable(&self.options.socket_path) {
+            self.mode = ServerMode::External;
+            push_server_log(
+                &self.logs,
+                format!("Using external server at {}", self.options.socket_path),
+            );
+            return;
+        }
+
+        let Some(server_bin) = resolve_server_binary(self.options.server_bin.as_ref()) else {
+            self.mode = ServerMode::Failed;
+            push_server_log(
+                &self.logs,
+                "Could not find haptic-server. Build it beside haptic-viewer, set HAPTIC_SERVER_BIN, or pass --server-bin PATH."
+                    .to_string(),
+            );
+            return;
+        };
+
+        let mut command = Command::new(&server_bin);
+        command
+            .arg("--managed-lifetime-stdin")
+            .arg("--socket")
+            .arg(&self.options.socket_path)
+            .arg("--config")
+            .arg(&self.options.config_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if self.options.dummy_audio {
+            command.arg("--headless");
+        }
+        if self.options.test_tone {
+            command.arg("--test-tone");
+        }
+
+        push_server_log(
+            &self.logs,
+            format!("Starting managed server: {}", server_bin.display()),
+        );
+        match command.spawn() {
+            Ok(mut child) => {
+                self.lifetime = child.stdin.take();
+                if let Some(stdout) = child.stdout.take() {
+                    capture_server_output(stdout, self.logs.clone());
+                }
+                if let Some(stderr) = child.stderr.take() {
+                    capture_server_output(stderr, self.logs.clone());
+                }
+                self.child = Some(child);
+                self.mode = ServerMode::Managed;
+            }
+            Err(error) => {
+                self.mode = ServerMode::Failed;
+                push_server_log(
+                    &self.logs,
+                    format!("Failed to start {}: {error}", server_bin.display()),
+                );
+            }
+        }
+    }
+
+    fn poll(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                push_server_log(&self.logs, format!("Managed server exited: {status}"));
+                self.child = None;
+                self.lifetime = None;
+                self.mode = if server_reachable(&self.options.socket_path) {
+                    ServerMode::External
+                } else {
+                    ServerMode::Failed
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                push_server_log(
+                    &self.logs,
+                    format!("Could not poll managed server: {error}"),
+                );
+                self.mode = ServerMode::Failed;
+            }
+        }
+    }
+
+    fn stop_managed(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        push_server_log(&self.logs, "Stopping managed server".to_string());
+        self.lifetime = None;
+
+        let deadline = Instant::now() + MANAGED_SHUTDOWN_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    push_server_log(&self.logs, format!("Managed server stopped: {status}"));
+                    self.mode = ServerMode::Stopped;
+                    return;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        push_server_log(
+            &self.logs,
+            "Managed server did not stop after stdin EOF; terminating it".to_string(),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        self.mode = ServerMode::Stopped;
+    }
+
+    fn restart_managed(&mut self) {
+        self.stop_managed();
+        self.start_managed();
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, connected: bool) {
+        self.poll();
+        ui.horizontal(|ui| {
+            let (colour, label) = match self.mode {
+                ServerMode::Managed if connected => {
+                    (egui::Color32::from_rgb(64, 200, 120), "managed server")
+                }
+                ServerMode::Managed => (
+                    egui::Color32::from_rgb(220, 170, 60),
+                    "managed server starting",
+                ),
+                ServerMode::External if connected => {
+                    (egui::Color32::from_rgb(80, 160, 230), "external server")
+                }
+                ServerMode::External => (
+                    egui::Color32::from_rgb(220, 170, 60),
+                    "external server unavailable",
+                ),
+                ServerMode::ConnectOnly if connected => (
+                    egui::Color32::from_rgb(80, 160, 230),
+                    "connect-only · attached",
+                ),
+                ServerMode::ConnectOnly => (
+                    egui::Color32::from_rgb(150, 150, 150),
+                    "connect-only · waiting",
+                ),
+                ServerMode::Stopped => (egui::Color32::from_rgb(150, 150, 150), "server stopped"),
+                ServerMode::Failed => (
+                    egui::Color32::from_rgb(220, 80, 80),
+                    "managed server failed",
+                ),
+            };
+            ui.colored_label(colour, format!("● {label}"));
+            ui.separator();
+            ui.weak(&self.options.socket_path);
+
+            match self.mode {
+                ServerMode::Managed => {
+                    if ui.button("restart").clicked() {
+                        self.restart_managed();
+                    }
+                    if ui.button("stop").clicked() {
+                        self.stop_managed();
+                    }
+                }
+                ServerMode::Stopped | ServerMode::Failed => {
+                    if ui.button("start server").clicked() {
+                        self.start_managed();
+                    }
+                }
+                ServerMode::ConnectOnly | ServerMode::External => {}
+            }
+        });
+
+        egui::CollapsingHeader::new("server log")
+            .default_open(matches!(self.mode, ServerMode::Failed))
+            .show(ui, |ui| {
+                let logs = self.logs.lock();
+                for line in logs.iter().rev().take(12).rev() {
+                    ui.monospace(line);
+                }
+            });
+    }
+}
+
+impl Drop for ServerSupervisor {
+    fn drop(&mut self) {
+        self.stop_managed();
+    }
+}
+
+fn server_reachable(socket_path: &str) -> bool {
+    UnixStream::connect(socket_path).is_ok()
+}
+
+fn resolve_server_binary(explicit: Option<&PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return path.is_file().then(|| path.clone());
+    }
+
+    let name = format!("haptic-server{}", std::env::consts::EXE_SUFFIX);
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            let sibling = parent.join(&name);
+            if sibling.is_file() {
+                return Some(sibling);
+            }
+        }
+    }
+
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let workspace_candidate = PathBuf::from("target").join(profile).join(name);
+    workspace_candidate.is_file().then_some(workspace_candidate)
+}
+
+fn capture_server_output(reader: impl Read + Send + 'static, logs: Arc<Mutex<VecDeque<String>>>) {
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => push_server_log(&logs, line),
+                Err(error) => {
+                    push_server_log(&logs, format!("Could not read server output: {error}"));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn push_server_log(logs: &Mutex<VecDeque<String>>, line: String) {
+    let mut logs = logs.lock();
+    logs.push_back(line);
+    while logs.len() > MAX_SERVER_LOG_LINES {
+        logs.pop_front();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared state between the socket reader thread and the UI thread
@@ -490,6 +885,7 @@ enum VoiceFilter {
 
 struct ViewerApp {
     shared: Arc<Mutex<Shared>>,
+    server: ServerSupervisor,
     fps: RateCounter,
     test: TestControls,
     /// Which voices the field visualisation includes.
@@ -570,6 +966,10 @@ impl eframe::App for ViewerApp {
                 VoiceFilter::Instance(id) => v.instance_id == id,
             })
             .collect();
+
+        egui::TopBottomPanel::top("server").show(ctx, |ui| {
+            self.server.ui(ui, connected);
+        });
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1044,14 +1444,27 @@ fn draw_table(
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let socket_path = args
+    if args
         .iter()
-        .position(|argument| argument == "--socket")
-        .and_then(|index| args.get(index + 1))
-        .cloned()
-        .or_else(|| std::env::var("HAPTIC_SOCKET_PATH").ok())
-        .unwrap_or_else(|| SOCKET_PATH.to_string());
+        .any(|argument| argument == "--help" || argument == "-h")
+    {
+        print_usage();
+        return Ok(());
+    }
+    let options = parse_options(
+        args,
+        std::env::var("HAPTIC_SOCKET_PATH").ok(),
+        std::env::var("HAPTIC_SERVER_BIN").ok(),
+        std::process::id(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("{error}");
+        print_usage();
+        std::process::exit(2);
+    });
+    let socket_path = options.socket_path.clone();
     eprintln!("Viewer socket: {socket_path}");
+    let server = ServerSupervisor::new(options);
     let shared = Arc::new(Mutex::new(Shared::default()));
     // Stable, non-zero identity for this viewer's own (test-console) instance.
     let instance_id = {
@@ -1069,17 +1482,18 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([620.0, 1020.0])
-            .with_title("Haptic Viewer"),
+            .with_title("Haptic"),
         vsync: true,
         multisampling: 4,
         ..Default::default()
     };
     eframe::run_native(
-        "Haptic Viewer",
+        "Haptic",
         options,
         Box::new(|_cc| {
             Ok(Box::new(ViewerApp {
                 shared,
+                server,
                 fps: RateCounter::default(),
                 test: TestControls::default(),
                 filter: VoiceFilter::All,
@@ -1099,4 +1513,56 @@ fn main() -> eframe::Result<()> {
             }))
         }),
     )
+}
+
+#[cfg(test)]
+mod app_option_tests {
+    use super::*;
+
+    #[test]
+    fn normal_mode_uses_production_socket_and_manages_a_server() {
+        let options = parse_options(Vec::new(), None, None, 42).unwrap();
+        assert_eq!(options.socket_path, SOCKET_PATH);
+        assert!(!options.connect_only);
+        assert!(!options.dummy_audio);
+    }
+
+    #[test]
+    fn headless_mode_gets_an_isolated_application_socket() {
+        let options = parse_options(vec!["--headless".into()], None, None, 42).unwrap();
+        assert_eq!(options.socket_path, "/tmp/haptic-vst-app-42.sock");
+        assert!(options.dummy_audio);
+    }
+
+    #[test]
+    fn explicit_values_override_environment_defaults() {
+        let options = parse_options(
+            vec![
+                "--connect-only".into(),
+                "--socket".into(),
+                "/tmp/explicit.sock".into(),
+                "--server-bin".into(),
+                "/tmp/explicit-server".into(),
+                "--config".into(),
+                "/tmp/layout.toml".into(),
+            ],
+            Some("/tmp/environment.sock".into()),
+            Some("/tmp/environment-server".into()),
+            42,
+        )
+        .unwrap();
+        assert!(options.connect_only);
+        assert_eq!(options.socket_path, "/tmp/explicit.sock");
+        assert_eq!(
+            options.server_bin,
+            Some(PathBuf::from("/tmp/explicit-server"))
+        );
+        assert_eq!(options.config_path, PathBuf::from("/tmp/layout.toml"));
+    }
+
+    #[test]
+    fn missing_option_value_is_rejected() {
+        let error = parse_options(vec!["--server-bin".into()], None, None, 42).unwrap_err();
+        assert_eq!(error, "--server-bin requires a value");
+    }
 }
