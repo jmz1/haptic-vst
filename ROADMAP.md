@@ -4,6 +4,14 @@
 
 ## Status update (2026-07-20, post-implementation)
 
+- **MIDI frequency transposition removed (2026-07-22).** Notes now use their
+  standard equal-tempered frequency and are clamped directly to the 20–200 Hz
+  haptic band. Under the project-wide Ableton octave convention, MIDI 60/C3 is
+  261.6 Hz before clamping and therefore outputs at the 200 Hz ceiling. Viewer,
+  scripted-client, and orbit-capture defaults moved from MIDI 60 to MIDI 36
+  (Ableton C1), preserving their previous 65.4 Hz audible pitch. The independent
+  100 Hz hardware `--test-tone` remains unchanged.
+
 - **Travelling Wave (`tw`/`TW`) implemented (2026-07-22).** Protocol v3 replaces
   the old in-phase placeholder's enum/VST slot with `TravellingWave`; `Wave`
   and `TravellingWave` are now the only runtime stimulus types. TW is an
@@ -154,7 +162,7 @@ The implementation deliberately simplified the Static Allocation design when por
 | G2 | **MPE updates dropped by server.** `EngineCommand::MpeUpdate` falls into the `_ => {}` arm; `mpe_update()` on stimuli is never called. | `engine.rs` `process()` |
 | G3 | **Plugin has no per-channel MPE state.** Each event overwrites the other MPE dimensions with defaults (a pitch-bend update sends `pressure: 1.0`, `timbre: 0.5`). Needs a per-channel `MpeData` cache merged into each outgoing update. | `haptic-plugin/src/lib.rs` |
 | G4 | **No IPC message framing.** Server does one `read()` → one `deserialize`. Coalesced or fragmented messages are corrupted or silently dropped — will bite as soon as MPE update rates rise. Needs length-prefixed framing on both ends. | `haptic-server/src/ipc.rs`, `haptic-plugin/src/ipc_client.rs` |
-| G5 | **Frequency mapping is audio-centric.** MIDI 69 → 440 Hz; only notes ≈ E0–G3 land in the transducers' 20–200 Hz band. Needs a deliberate note→frequency map for the haptic range (design decision: transpose, compress, or table-driven). | `engine.rs` `note_on()` |
+| G5 | **Frequency mapping is audio-centric.** Resolved by deliberate direct mapping: standard equal-tempered MIDI frequency, no transposition, hard-clamped to 20–200 Hz. | `engine.rs` `note_on()` |
 
 ### Real-time hygiene
 | # | Issue | Location |
@@ -183,7 +191,7 @@ Context for prioritisation: a multichannel interface is available but the table 
 2. **MPE state tracking in plugin (G3).** Per-channel `MpeData` cache (16 entries); merge each incoming dimension and send the merged struct. Include initial pitch-bend/timbre state at NoteOn.
 3. **MPE routing in server (G2).** Deliver `MpeUpdate` to stimuli owned by that channel via the note map from step 1. Apply simple one-pole smoothing to decoded MPE values in the stimulus (the existing `JMZTODO` in `engine.rs`).
 4. **IPC framing (G4).** Length-prefixed (u32 LE) bincode frames both directions; accumulating read buffer on the server; bounded write with disconnect detection on the client.
-5. **Haptic frequency mapping (G5).** Map the playable MIDI range onto 20–200 Hz. Suggested default: keep equal-temperament ratios but transpose so middle C ≈ 65 Hz, with min/max clamps; make the mapping a server-side function that a config value can later select.
+5. **Haptic frequency mapping (G5).** Implemented as standard equal-tempered MIDI frequency with no transposition and 20–200 Hz min/max clamps. MIDI 60 (Ableton C3) consequently reaches the 200 Hz ceiling.
 6. **Disentangle velocity overloading.** Velocity currently sets amplitude *and* wave speed *and* stimulus type. Keep velocity→amplitude; move stimulus-type selection and wave speed to plugin parameters (restores DAW automation, which the current design lost when `SetWaveSpeed` was removed). Requires a `SetParameter`-style command in the protocol.
 
 *Exit criterion: a held MPE note can be started, bent, pressed, moved and released, with correct per-note behaviour, verified by recording the 32-channel output (or metering) — no hangs, no stuck notes, no dropped MPE.*

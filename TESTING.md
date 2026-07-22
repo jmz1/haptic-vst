@@ -77,7 +77,10 @@ level/phase data are taken *before* the copy to the physical device, so
 every cell is live even on a stereo fallback device. Routing only selects
 what you *hear*.
 
-Colour code (per-note mode): hue = phase at that transducer relative to
+Note names throughout the viewer use Ableton's octave convention: MIDI note 60
+is C3. Frequencies are not transposed; standard MIDI frequency is clamped to
+20–200 Hz, so C3 and higher notes display/output at the 200 Hz ceiling. Colour
+code (per-note mode): hue = phase at that transducer relative to
 the source oscillator (blue = in phase, hue rotates with phase lag);
 brightness = local amplitude. The white cross is the source position.
 The header shows note, frequency, wave speed, wavelength, render fps
@@ -88,7 +91,7 @@ The header shows note, frequency, wave speed, wavelength, render fps
 `tools/test_note.py` speaks the wire protocol directly:
 
 ```bash
-python3 tools/test_note.py                          # 2 s middle-C note
+python3 tools/test_note.py                          # 2 s C1 / 65.4 Hz note
 python3 tools/test_note.py --note 48 --velocity 80 --duration 5
 python3 tools/test_note.py --orbit                  # circle the source
 python3 tools/test_note.py --wave-speed 100

@@ -359,7 +359,7 @@ impl Default for TestControls {
     fn default() -> Self {
         Self {
             playing: None,
-            note: 60,
+            note: haptic_protocol::DEFAULT_TEST_NOTE,
             velocity: 100,
             stimulus_type: StimulusType::Wave,
             wave_speed: 1.0,
@@ -505,7 +505,23 @@ const NOTE_NAMES: [&str; 12] = [
 ];
 
 fn note_name(note: u8) -> String {
-    format!("{}{}", NOTE_NAMES[note as usize % 12], note as i16 / 12 - 1)
+    // Ableton Live's octave convention: MIDI note 60 is C3 (rather than C4
+    // in scientific pitch notation), and MIDI note 0 is C-2.
+    format!("{}{}", NOTE_NAMES[note as usize % 12], note as i16 / 12 - 2)
+}
+
+#[cfg(test)]
+mod note_name_tests {
+    use super::note_name;
+
+    #[test]
+    fn uses_ableton_octave_numbers() {
+        assert_eq!(note_name(0), "C-2");
+        assert_eq!(note_name(haptic_protocol::DEFAULT_TEST_NOTE), "C1");
+        assert_eq!(note_name(48), "C2");
+        assert_eq!(note_name(60), "C3");
+        assert_eq!(note_name(69), "A3");
+    }
 }
 
 /// What the table area reported this frame.
@@ -1067,7 +1083,12 @@ fn main() -> eframe::Result<()> {
                 fps: RateCounter::default(),
                 test: TestControls::default(),
                 filter: VoiceFilter::All,
-                sounding_params: (60, 100, StimulusType::Wave, 20.0),
+                sounding_params: (
+                    haptic_protocol::DEFAULT_TEST_NOTE,
+                    100,
+                    StimulusType::Wave,
+                    20.0,
+                ),
                 last_live_config: (
                     1.0,
                     SpatialScaleMode::Speed,

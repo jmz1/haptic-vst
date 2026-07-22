@@ -1,4 +1,6 @@
 use crate::config::TransducerLayout;
+#[cfg(test)]
+use haptic_protocol::DEFAULT_TEST_NOTE;
 use haptic_protocol::{
     distance_gain, effective_wavelength, DistanceDecay, HapticCommand, InstanceConfig, MpeData,
     Parameter, SpatialScaleMode, StimulusType, TravellingWaveConfig, VoiceInfo, DEFAULT_ATTEN_D0_M,
@@ -97,12 +99,11 @@ pub struct VoiceSnapshot {
     pub voices: [VoiceInfo; MAX_ACTIVE_VOICES],
 }
 
-/// Map a MIDI note onto the transducers' haptic band. Equal-temperament
-/// ratios are preserved but transposed two octaves down so middle C (60)
-/// lands at ~65.4 Hz, then clamped to the 20-200 Hz band. Kept as a free
-/// function so a config value can later select between mappings.
+/// Map a MIDI note to its standard equal-tempered frequency, then clamp it to
+/// the transducers' 20-200 Hz band. There is no octave transposition. MIDI 60
+/// (Ableton C3) is 261.6 Hz and therefore saturates at the 200 Hz ceiling.
 pub fn note_to_haptic_frequency(note: u8) -> f32 {
-    let f = 440.0 * 2.0_f32.powf((note as f32 - 69.0) / 12.0) / 4.0;
+    let f = 440.0 * 2.0_f32.powf((note as f32 - 69.0) / 12.0);
     f.clamp(MIN_HAPTIC_FREQ, MAX_HAPTIC_FREQ)
 }
 
@@ -1687,12 +1688,14 @@ mod tests {
 
     #[test]
     fn frequency_mapping_targets_haptic_band() {
-        // Middle C lands near 65 Hz
-        assert!((note_to_haptic_frequency(60) - 65.4).abs() < 0.5);
-        // Octave relationship preserved inside the band
-        let c3 = note_to_haptic_frequency(48);
-        let c4 = note_to_haptic_frequency(60);
-        assert!((c4 / c3 - 2.0).abs() < 1e-3);
+        // Standard equal-tempered frequencies are unchanged inside the band.
+        let c0 = note_to_haptic_frequency(24);
+        let c1 = note_to_haptic_frequency(36);
+        assert!((c0 - 32.703).abs() < 0.01);
+        assert!((c1 / c0 - 2.0).abs() < 1e-3);
+        assert!((note_to_haptic_frequency(DEFAULT_TEST_NOTE) - 65.406).abs() < 0.01);
+        // MIDI 60 / Ableton C3 is above the haptic band and saturates.
+        assert_eq!(note_to_haptic_frequency(60), MAX_HAPTIC_FREQ);
         // Extremes clamp to the transducer band
         assert_eq!(note_to_haptic_frequency(0), 20.0);
         assert_eq!(note_to_haptic_frequency(127), 200.0);
@@ -2888,7 +2891,7 @@ mod tests {
     ///
     /// Optional env: HAPTIC_CAPTURE_WAVE_SPEED (1.0), HAPTIC_CAPTURE_SECS
     /// (13), HAPTIC_CAPTURE_SR (48000), HAPTIC_CAPTURE_BLOCK (512),
-    /// HAPTIC_CAPTURE_ORBIT_PERIOD (6), HAPTIC_CAPTURE_NOTE (60),
+    /// HAPTIC_CAPTURE_ORBIT_PERIOD (6), HAPTIC_CAPTURE_NOTE (36 / Ableton C1),
     /// HAPTIC_CAPTURE_MPE_MS (8).
     #[test]
     #[ignore]
@@ -2908,7 +2911,7 @@ mod tests {
         let sample_rate = env_f32("HAPTIC_CAPTURE_SR", 48000.0);
         let block = env_f32("HAPTIC_CAPTURE_BLOCK", 512.0) as usize;
         let orbit_period = env_f32("HAPTIC_CAPTURE_ORBIT_PERIOD", 6.0);
-        let note = env_f32("HAPTIC_CAPTURE_NOTE", 60.0) as u8;
+        let note = env_f32("HAPTIC_CAPTURE_NOTE", DEFAULT_TEST_NOTE as f32) as u8;
         let mpe_interval = env_f32("HAPTIC_CAPTURE_MPE_MS", 8.0) as f64 / 1000.0;
 
         let layout = TransducerLayout::default();

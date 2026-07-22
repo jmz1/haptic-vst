@@ -22,6 +22,9 @@ pub const DEFAULT_WAVE_SPEED: f32 = 20.0;
 pub const DEFAULT_WAVELENGTH_M: f32 = 0.2;
 pub const DEFAULT_ATTEN_D0_M: f32 = 0.5;
 pub const DEFAULT_ATTEN_EXPONENT: f32 = 1.0;
+/// MIDI 36 / Ableton C1 is 65.4 Hz without transposition, preserving the
+/// previous default test-note pitch when MIDI 60 was shifted down two octaves.
+pub const DEFAULT_TEST_NOTE: u8 = 36;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct MpeData {

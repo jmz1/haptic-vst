@@ -87,7 +87,8 @@ The system converts MIDI notes into spatial haptic stimuli with wave propagation
   path) and drains the queue once per callback. A `(channel, note) → pool slot` ownership
   map keyed by `(instance_id, channel, note)` routes note-off and MPE updates to the owning stimulus and implements voice stealing
   (oldest-in-release first, else oldest). MIDI notes map to the 20–200 Hz haptic band
-  (equal temperament transposed so middle C ≈ 65 Hz); MPE values are one-pole smoothed
+  (standard equal temperament with no transposition, clamped to 20–200 Hz);
+  MIDI 60 / Ableton C3 therefore saturates at 200 Hz. MPE values are one-pole smoothed
   inside each stimulus (~15 ms). The engine has two fixed eight-voice pools:
   `WaveStimulus` uses scatter-write delay lines and `TravellingWaveStimulus`
   evaluates an instantaneous radial phasor without propagation history,
