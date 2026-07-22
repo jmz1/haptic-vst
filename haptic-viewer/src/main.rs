@@ -42,6 +42,8 @@ use haptic_protocol::{
 use parking_lot::Mutex;
 
 const TRANSDUCERS: usize = 32;
+const TRANSDUCER_RADIUS_M: f32 = 0.09;
+const DISPLAY_EDGE_PADDING_PX: f32 = 8.0;
 
 /// Wave-speed floor mirroring the engine's `MIN_WAVE_SPEED`, used when the
 /// viewer reconstructs per-transducer delays geometrically from a voice's
@@ -1033,15 +1035,17 @@ impl eframe::App for ViewerApp {
         });
 
         let mut interaction = TableInteraction::default();
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(layout) = layout else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("waiting for layout broadcast…");
-                });
-                return;
-            };
-            interaction = draw_table(ui, &layout, &shown, routing.as_ref());
-        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(0))
+            .show(ctx, |ui| {
+                let Some(layout) = layout else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("waiting for layout broadcast…");
+                    });
+                    return;
+                };
+                interaction = draw_table(ui, &layout, &shown, routing.as_ref());
+            });
 
         // Apply table interactions
         if let Some((output, source)) = interaction.route_to_output {
@@ -1285,19 +1289,13 @@ fn draw_table(
     let mut interaction = TableInteraction::default();
     let size = ui.available_size();
     let (response, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
-    let avail = response.rect.shrink(12.0);
+    // Eight screen pixels are enough to keep the source cross and outline
+    // clear of the panel edge. Everything else should be usable display area.
+    let avail = response.rect.shrink(DISPLAY_EDGE_PADDING_PX);
 
-    // World bounds: the table extent, padded so overridden transducers and
-    // the source marker stay visible
-    let pad = 0.10;
-    let (mut min_x, mut min_y) = (-pad, -pad);
-    let (mut max_x, mut max_y) = (layout.table_m.0 + pad, layout.table_m.1 + pad);
-    for &(x, y) in layout.positions.iter() {
-        min_x = min_x.min(x - pad);
-        min_y = min_y.min(y - pad);
-        max_x = max_x.max(x + pad);
-        max_y = max_y.max(y + pad);
-    }
+    // The configured table is the viewport. Only transducers outside it grow
+    // the world bounds, and then only enough to keep their circles visible.
+    let (min_x, min_y, max_x, max_y) = table_world_bounds(layout);
     let world_w = max_x - min_x;
     let world_h = max_y - min_y;
     let scale = (avail.width() / world_w).min(avail.height() / world_h);
@@ -1331,7 +1329,7 @@ fn draw_table(
     );
 
     // Transducer circles
-    let radius = (0.09 * scale).clamp(5.0, 40.0);
+    let radius = (TRANSDUCER_RADIUS_M * scale).clamp(5.0, 40.0);
     let pointer = response.interact_pointer_pos();
     let circle_under = |p: egui::Pos2| {
         layout
@@ -1448,6 +1446,49 @@ fn draw_table(
     }
 
     interaction
+}
+
+fn table_world_bounds(layout: &LayoutView) -> (f32, f32, f32, f32) {
+    let (mut min_x, mut min_y) = (0.0_f32, 0.0_f32);
+    let (mut max_x, mut max_y) = layout.table_m;
+    for &(x, y) in &layout.positions {
+        min_x = min_x.min(x - TRANSDUCER_RADIUS_M);
+        min_y = min_y.min(y - TRANSDUCER_RADIUS_M);
+        max_x = max_x.max(x + TRANSDUCER_RADIUS_M);
+        max_y = max_y.max(y + TRANSDUCER_RADIUS_M);
+    }
+    (min_x, min_y, max_x, max_y)
+}
+
+#[cfg(test)]
+mod table_layout_tests {
+    use super::{table_world_bounds, LayoutView, TRANSDUCERS, TRANSDUCER_RADIUS_M};
+
+    #[test]
+    fn table_bounds_add_no_padding_for_inset_transducers() {
+        let layout = LayoutView {
+            positions: [(0.5, 1.0); TRANSDUCERS],
+            gains: [1.0; TRANSDUCERS],
+            table_m: (1.0, 2.0),
+        };
+        assert_eq!(table_world_bounds(&layout), (0.0, 0.0, 1.0, 2.0));
+    }
+
+    #[test]
+    fn table_bounds_keep_outside_transducers_visible() {
+        let mut positions = [(0.5, 1.0); TRANSDUCERS];
+        positions[0] = (-0.2, 2.3);
+        let layout = LayoutView {
+            positions,
+            gains: [1.0; TRANSDUCERS],
+            table_m: (1.0, 2.0),
+        };
+        let (min_x, min_y, max_x, max_y) = table_world_bounds(&layout);
+        assert!((min_x - (-0.2 - TRANSDUCER_RADIUS_M)).abs() < f32::EPSILON);
+        assert_eq!(min_y, 0.0);
+        assert_eq!(max_x, 1.0);
+        assert!((max_y - (2.3 + TRANSDUCER_RADIUS_M)).abs() < f32::EPSILON);
+    }
 }
 
 fn main() -> eframe::Result<()> {
