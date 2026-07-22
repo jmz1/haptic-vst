@@ -93,8 +93,9 @@ Five principles guide development:
   multichannel device exists, the server deliberately falls back to the default
   device while retaining all 32 logical channels.
 - The delay engine renders at one thirty-second of the device rate and uses a
-  polyphase sinc reconstruction filter. Wave emissions use a bandlimited sinc
-  scatter kernel and generation-based delay-line clearing.
+  polyphase sinc reconstruction filter. Wave emissions use a 16-tap,
+  1024-phase bandlimited sinc scatter kernel, retained on the heap and borrowed
+  directly by the callback, plus generation-based delay-line clearing.
 - Layout and per-transducer gains come from `haptic.toml` and hot-reload off the
   audio thread. Invalid updates leave the accepted layout running.
 - The viewer displays all active Wave and TW voices, summed or filtered by
@@ -118,39 +119,7 @@ without weakening the real-time or protocol foundations. They are ordered by
 the amount of risk they remove from subsequent work, but can be advanced in
 small independent slices.
 
-### 1. Finish Wave scatter quality
-
-The callback-dependent Wave motion image has been removed. A persistent 1.5 Hz
-third-order XY controller now treats callback values as latest destinations and
-advances position, velocity, acceleration, and jerk at the internal rate. The
-default, 60/120 Hz client, and 64/512-frame capture cases all place the former
-110–200 Hz image below -60 dB; 64- and 512-frame default results differ by only
-0.02 dB in that band.
-
-The current 8-tap/128-phase fractional scatter still leaves a separate
-moving-source image near 449 Hz, around -38 dB integrated over 200–750 Hz. It
-does not appear in the stationary control and is independent of clipping,
-distance decay, callback partition, and the device-rate reconstruction FIR.
-
-Evaluate the measured 16-tap/1024-phase scatter configuration without copying
-its enlarged kernel onto the callback stack. The diagnostic combination
-reached -67.7 dB in 200–750 Hz and approximately -82 dB in adjacent image
-bands, but needs maximum-polyphony timing evidence before becoming production
-behaviour.
-
-The complete capture method, parameter sweep, physical Doppler bounds, and
-acceptance bands are in
-[`docs/wave-orbit-dsp-analysis.md`](docs/wave-orbit-dsp-analysis.md).
-
-**Next move:** remove the callback stack copy from scatter-kernel ownership,
-then benchmark and capture 16 taps/1024 phases at maximum Wave polyphony.
-
-**Done when:** the default steady orbit has less than -60 dB aggregate software
-energy outside its expected band across the relevant sample rates, the result
-passes maximum-polyphony callback timing, and a conservative physical capture
-does not expose a mechanically amplified residual spur.
-
-### 2. Make the server easier to extend
+### 1. Make the server easier to extend
 
 `haptic-server/src/engine.rs` currently owns voice lifecycle, instance
 configuration, Wave and TW implementation, delay DSP, reconstruction, routing,
@@ -182,7 +151,7 @@ extracted interfaces.
 unrelated delay, routing, or reconstruction internals, and every lifecycle path
 has one obvious owner.
 
-### 3. Make callback safety measurable
+### 2. Make callback safety measurable
 
 The callback has been manually hardened, but its allocation-free property is
 still an architectural claim rather than a continuously checked invariant.
@@ -204,7 +173,7 @@ covering the plugin callback.
 deallocate, lock, block, format, or log, and the ordinary 64-frame processing
 case remains covered.
 
-### 4. Bound and simplify transport work
+### 3. Bound and simplify transport work
 
 Framing, handshake validation, partial nonblocking writes, and disconnect
 cleanup are in place. Read-side work still needs an explicit per-client budget:
@@ -228,7 +197,7 @@ an observer or another controller.
 partial frames remain correct, and one client cannot starve cleanup or status
 publication.
 
-### 5. Publish accepted configuration state
+### 4. Publish accepted configuration state
 
 Layout updates currently travel to the engine and observer side through
 separate bounded paths. Monitor routing and layout displays should derive from

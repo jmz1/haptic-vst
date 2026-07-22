@@ -259,6 +259,18 @@ The analyzer reports per-channel time-domain statistics, aggregate band energy,
 and strongest spectral bins. Its dB bands are relative to total spectral
 energy across all logical channels.
 
+For a machine-local callback-cost check of the production scatter path at all
+eight Wave voices, run:
+
+```bash
+cargo test -p haptic-server --release \
+  maximum_wave_polyphony_callback_benchmark -- --ignored --nocapture
+```
+
+The harness reports p50, p99, and maximum callback time against the 64- and
+512-frame deadlines. It deliberately has no portable pass/fail timing
+threshold; retain the release-build output as evidence for DSP changes.
+
 The current default-orbit baseline, physical bounds, callback-cadence sweep,
 and scatter-kernel experiments are recorded in
 [`docs/wave-orbit-dsp-analysis.md`](docs/wave-orbit-dsp-analysis.md).

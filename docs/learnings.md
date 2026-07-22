@@ -70,9 +70,11 @@ when its interpolation error appears small in a static sample test.
 bandlimited deposit kernel. Test gain across fractional phases and relevant
 in-band frequencies, not only DC or stationary delays.
 
-The current eight-tap, 128-phase Kaiser-windowed sinc splat reduced measured
-motion spurs by roughly 20 dB compared with the linear deposit; stationary
-output remained near the f32 analysis floor.
+The production 16-tap, 1024-phase Kaiser-windowed sinc splat reduced the
+default moving-source `200–750 Hz` image from about -38 dB to -68 dB relative
+to total energy. The 64 KiB table stays heap-resident and is borrowed rather
+than copied into callback stack storage; stationary output remains near the
+f32 analysis floor.
 
 ## Capacity must be expressed in physical time
 

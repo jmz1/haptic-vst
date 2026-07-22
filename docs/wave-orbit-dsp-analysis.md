@@ -1,11 +1,11 @@
 # Wave orbit DSP analysis
 
-This records the reproducible baseline and first remediation for the Wave test
+This records the reproducible baseline and DSP remediation for the Wave test
 console's default moving source, measured on 2026-07-22. It separates intended
 moving-source physics from control-rate and fractional-delay artefacts. The XY
-motion controller described below is now production behaviour; alternative
-scatter-kernel sizes remain temporary diagnostic builds and were reverted after
-capture.
+motion controller and 16-tap/1024-phase scatter configuration described below
+are now production behaviour; the other experimental kernel sizes were used
+only for diagnosis.
 
 The original reported artefact was real and had two independent software
 causes:
@@ -14,9 +14,9 @@ causes:
    badly. Multiple MPE targets may be drained before any synthesis sample is
    rendered, resetting the interpolator and creating images of the Doppler
    sweep inside the 20–200 Hz operating band.
-2. The current 8-tap, 128-phase scatter kernel adds a separate narrow spur near
-   449 Hz. More taps suppress that spur; more fractional phases suppress a
-   different family near and above the 750 Hz internal Nyquist.
+2. The original 8-tap, 128-phase scatter kernel added a separate narrow spur
+   near 449 Hz. More taps suppress that spur; more fractional phases suppress
+   a different family near and above the 750 Hz internal Nyquist.
 
 There is also a deterministic start transient: a note starts at the table
 centre, then the first orbit target is 0.35 m away. The effective source spends
@@ -162,7 +162,7 @@ orbit radius and adds approximately 0.32 seconds of low-frequency lag; capture
 measured an effective steady speed near 0.360 m/s versus the requested
 0.3665 m/s.
 
-With the current 8-tap/128-phase scatter unchanged, the same analysis measured:
+With the original 8-tap/128-phase scatter unchanged, the same analysis measured:
 
 | Current scenario | `<45 Hz` | `110–200 Hz` | `200–750 Hz` | `750–2000 Hz` |
 |---|---:|---:|---:|---:|
@@ -178,9 +178,9 @@ and 512- versus 64-frame steady results now differ by only 0.02 dB there. The
 acceptance threshold. A deterministic unit test separately limits RMS and peak
 XY trajectory differences between 64- and 512-frame partitions.
 
-The unchanged approximately 449 Hz scatter spur now dominates the remaining
-software artefact. This is why the `200–750 Hz` figures do not improve with the
-motion controller and why scatter remediation remains a separate task.
+At this intermediate stage, the unchanged approximately 449 Hz scatter spur
+dominated the remaining software artefact. This is why the `200–750 Hz` figures
+did not improve with the motion controller alone.
 
 ## Start transient
 
@@ -206,7 +206,7 @@ stationary source. Temporary kernel builds produced:
 
 | Scatter kernel | `110–200 Hz` | `200–750 Hz` | `750–2000 Hz` |
 |---|---:|---:|---:|
-| 8 taps, 128 phases (current) | -66.1 dB | -37.7 dB | -64.6 dB |
+| 8 taps, 128 phases (original) | -66.1 dB | -37.7 dB | -64.6 dB |
 | 16 taps, 128 phases | -66.1 dB | -49.7 dB | -64.4 dB |
 | 32 taps, 128 phases | -66.1 dB | -49.4 dB | -63.8 dB |
 | 8 taps, 1024 phases | -82.7 dB | -37.9 dB | -82.7 dB |
@@ -226,11 +226,31 @@ moves upward (the strongest broad aggregate component was near 851 Hz), while
 the callback-duration-dependent control image remains. This distinguishes
 internal scatter error from device-rate FIR imaging.
 
-The 16-tap/1024-phase experiment is not a drop-in constant change without a
-small implementation review. It doubles scatter deposits and expands the
-kernel from 4 KiB to 64 KiB. `process_block()` currently copies the kernel into
-callback stack storage to simplify borrowing; that copy and stack footprint
-should be removed before adopting the larger table.
+The 16-tap/1024-phase configuration doubles scatter deposits and expands the
+kernel from 4 KiB to 64 KiB. Production adoption therefore also changed kernel
+ownership: `render_frame()` builds its context from disjoint field borrows, so
+the precomputed heap table is referenced directly and never copied onto the
+callback stack.
+
+Production captures at the supported-rate boundary points measured:
+
+| Device rate | `<45 Hz` | `110–200 Hz` | `200–750 Hz` | `750–2000 Hz` |
+|---:|---:|---:|---:|---:|
+| 44.1 kHz | -76.7 dB | -67.5 dB | -67.6 dB | -89.9 dB |
+| 48 kHz | -94.2 dB | -83.1 dB | -67.7 dB | -82.4 dB |
+| 96 kHz | -82.4 dB | -86.2 dB | -74.2 dB | -67.6 dB |
+
+Thus every aggregate band outside the expected 45–110 Hz steady Doppler range
+is below -60 dB at 44.1, 48, and 96 kHz. At 48 kHz the old 448.8 Hz line is no
+longer a dominant local peak; the strongest aggregate `200–750 Hz` bin is near
+611 Hz and is about -80 dB relative to the capture peak.
+
+A release-build maximum-polyphony harness drove all eight Wave voices with XY
+updates every callback. On the development machine, 64-frame callbacks
+measured p50 24.5 us, p99 117.0 us, and maximum 926.9 us against a 1333 us
+deadline. The 512-frame case measured p50 191.2 us, p99 305.5 us, and maximum
+503.2 us against a 10667 us deadline. These are machine-local timing evidence,
+not portable regression thresholds.
 
 ## Parameter sensitivity
 
@@ -274,29 +294,25 @@ mechanical coupling may dominate what is felt. Those require microphone,
 accelerometer, or electrical loopback capture; this software-only analysis
 cannot characterize them.
 
-## Recommended remediation and acceptance tests
+## Remaining validation
 
-Remaining work should proceed in this order:
+The software spur and callback-capacity targets are met. Further validation
+should proceed in this order:
 
-1. Evaluate the 16-tap/1024-phase scatter configuration after removing the
-   callback stack copy. Measure callback cost at maximum Wave polyphony before
-   adopting it.
-2. Pre-position an already-enabled test orbit before note-on and ease orbit
+1. Pre-position an already-enabled test orbit before note-on and ease orbit
    entry when toggled during a held note. This is a UI gesture issue rather
    than a reason to generate general motion server-side.
-3. Expand the deterministic spectral regression checks. Include
+2. Expand the deterministic spectral regression checks. Include
    stationary, onset, steady orbit, 60/120 Hz client cadence, 64–512 and
    variable callback partitions, 44.1/48/96 kHz device rates, speed/radius/
    period extremes, and Doppler-safe versus Doppler-over-band notes.
 
 For the default steady orbit, the first software acceptance target is
 aggregate energy below -60 dB relative to total outside 45–110 Hz, with no
-single mirrored sweep visible above that floor. The XY controller now meets the
-target for the control-sensitive lower and upper bands across tested callback
-and client cadences. The diagnostic 16-tap/1024-phase build reached -82.9 dB in
-110–200 Hz, -67.7 dB in 200–750 Hz, and -82.4 dB in 750–2000 Hz when control
-delivery was regular, showing the remaining scatter target is also attainable.
-Onset should be evaluated against its wider 43.6–130.8 Hz cap-bound range.
+single mirrored sweep visible above that floor. The production XY controller
+and scatter kernel meet that target across the tested callback/client cadences
+and 44.1/48/96 kHz device rates. Onset should be evaluated against its wider
+43.6–130.8 Hz cap-bound range.
 
 Raw FFT ratios should remain diagnostic evidence rather than a universal
 psychoacoustic or haptic threshold. Final acceptance also needs a physical

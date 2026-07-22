@@ -94,8 +94,9 @@ read and clear                            scatter emission n
       sequential time ──────────────────▶
 ```
 
-The deposit uses an eight-tap Kaiser-windowed sinc splat selected from 128
-fractional phases. Each phase is normalized to unit DC gain. A constant
+The deposit uses a 16-tap Kaiser-windowed sinc splat selected from 1024
+fractional phases. Each phase is normalized to unit DC gain. The 64 KiB table
+is precomputed on the heap and borrowed directly by the callback. A constant
 half-kernel lookahead is included in every scheduled delay so all taps land in
 unread cells and nearby transducers retain distinct short delays.
 
@@ -241,10 +242,6 @@ capture in the engine is the deeper evidence tool when this path changes.
 - The internal render rate is derived from the device rate rather than fixed at
   a universal rate with a general resampler. Device selection prefers 48 kHz to
   keep the tested operating point stable.
-- The current eight-tap, 128-phase scatter table leaves measurable moving-delay
-  images even when the control trajectory is clean. Sixteen taps and 1024
-  phases are a promising measured configuration, subject to callback-cost and
-  kernel-ownership work documented in the orbit DSP analysis.
 - Multiple Wave voices sum before the final bound; there is no perceptual
   loudness normalization or automatic polyphonic headroom policy.
 - MPE pitch bend is spatial x, so note frequency is latched. Continuous pitch

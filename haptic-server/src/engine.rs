@@ -48,9 +48,9 @@ const FIR_LEN: usize = FIR_TAPS_PER_PHASE * RENDER_DECIMATION;
 /// kernel is precomputed at `SPLAT_PHASES` fractional phases and each phase is
 /// normalised to unit sum (flat DC, so bunched arrivals still give the correct
 /// Doppler amplitude gain — the deposit is bandlimited, not attenuated).
-const SPLAT_TAPS: usize = 8;
+const SPLAT_TAPS: usize = 16;
 const SPLAT_HALF: usize = SPLAT_TAPS / 2; // taps cover cells base-(HALF-1)..=base+HALF
-const SPLAT_PHASES: usize = 128;
+const SPLAT_PHASES: usize = 1024;
 const SPLAT_LEN: usize = SPLAT_TAPS * SPLAT_PHASES;
 
 // Haptic frequency band of the transducers
@@ -736,10 +736,22 @@ impl StimulusEngine {
     }
 
     /// Synthesize one frame of all active stimuli into `output`.
-    fn render_frame(&mut self, context: &ProcessContext<'_>, output: &mut [f32; TRANSDUCER_COUNT]) {
+    ///
+    /// Build the context here so Rust can borrow the voice pools mutably while
+    /// borrowing the layout and heap-owned scatter kernel immutably. Keeping
+    /// those borrows field-local avoids copying the kernel onto the audio
+    /// callback stack; at 16 taps and 1024 phases that table is 64 KiB.
+    fn render_frame(&mut self, sample_rate: f32, output: &mut [f32; TRANSDUCER_COUNT]) {
+        let context = ProcessContext {
+            sample_rate,
+            dt: 1.0 / sample_rate,
+            transducer_positions: &self.layout.positions,
+            table_m: self.layout.table_m,
+            splat_kernel: &self.splat_kernel,
+        };
         output.fill(0.0);
-        self.wave_pool.process_all(context, output);
-        self.travelling_wave_pool.process_all(context, output);
+        self.wave_pool.process_all(&context, output);
+        self.travelling_wave_pool.process_all(&context, output);
 
         // Per-transducer gain, then safety limiting
         for (sample, &gain) in output.iter_mut().zip(self.layout.gains.iter()) {
@@ -765,18 +777,6 @@ impl StimulusEngine {
         self.drain_commands();
 
         let engine_rate = sample_rate / RENDER_DECIMATION as f32;
-        // Copy so the context doesn't hold a borrow of self across render_frame
-        // (the kernel is Copy — a 4 KB stack copy once per block, no alloc).
-        let positions = self.layout.positions;
-        let splat_kernel = *self.splat_kernel;
-        let context = ProcessContext {
-            sample_rate: engine_rate,
-            dt: 1.0 / engine_rate,
-            transducer_positions: &positions,
-            table_m: self.layout.table_m,
-            splat_kernel: &splat_kernel,
-        };
-
         let mut sum_squares = [0.0f32; TRANSDUCER_COUNT];
         let frames = data.len() / channels;
         let routes = self.monitor_routes;
@@ -785,7 +785,7 @@ impl StimulusEngine {
             if self.interp_phase >= RENDER_DECIMATION {
                 self.interp_phase = 0;
                 let mut cur = [0.0f32; TRANSDUCER_COUNT];
-                self.render_frame(&context, &mut cur);
+                self.render_frame(engine_rate, &mut cur);
                 self.history_pos = (self.history_pos + FIR_TAPS_PER_PHASE - 1) % FIR_TAPS_PER_PHASE;
                 self.history[self.history_pos] = cur;
             }
@@ -907,16 +907,7 @@ impl StimulusEngine {
     #[cfg(test)]
     pub fn process(&mut self, output: &mut [f32; TRANSDUCER_COUNT], sample_rate: f32) {
         self.drain_commands();
-        let positions = self.layout.positions;
-        let splat_kernel = *self.splat_kernel;
-        let context = ProcessContext {
-            sample_rate,
-            dt: 1.0 / sample_rate,
-            transducer_positions: &positions,
-            table_m: self.layout.table_m,
-            splat_kernel: &splat_kernel,
-        };
-        self.render_frame(&context, output);
+        self.render_frame(sample_rate, output);
         self.reap_finished_voices();
     }
 }
@@ -3068,6 +3059,94 @@ mod tests {
         engine.process_block(&mut data, TRANSDUCER_COUNT, SAMPLE_RATE, &mut levels);
         assert!(data.iter().all(|sample| sample.is_finite()));
         assert!(data.iter().all(|sample| sample.abs() <= 1.0));
+    }
+
+    /// Machine-local timing harness for the production Wave hot path. It
+    /// drives all eight Wave slots, updates every XY target once per callback,
+    /// and reports callback percentiles for both a low-latency and the default
+    /// block size. This is ignored because wall-clock thresholds are not
+    /// portable enough for an automated regression test.
+    #[test]
+    #[ignore]
+    fn maximum_wave_polyphony_callback_benchmark() {
+        use std::time::Instant;
+
+        const BENCHMARK_SECS: usize = 20;
+        const WARMUP_SECS: usize = 1;
+
+        for block_frames in [64usize, 512] {
+            let layout = TransducerLayout::default();
+            let (width, length) = layout.table_m;
+            let (mut engine, mut producer, _lp, _voices) = StimulusEngine::new(layout);
+            for channel in 0..MAX_WAVE_STIMULI as u8 {
+                send(
+                    &mut producer,
+                    EngineCommand::NoteOn {
+                        instance_id: 0,
+                        note: DEFAULT_TEST_NOTE + channel,
+                        velocity: 100,
+                        channel,
+                        mpe: full_mpe(),
+                    },
+                );
+            }
+
+            let callbacks_per_second = SAMPLE_RATE as usize / block_frames;
+            let total_callbacks = (WARMUP_SECS + BENCHMARK_SECS) * callbacks_per_second;
+            let measured_callbacks = BENCHMARK_SECS * callbacks_per_second;
+            let mut timings_us = Vec::with_capacity(measured_callbacks);
+            let mut data = vec![0.0f32; block_frames * TRANSDUCER_COUNT];
+            let mut levels = [0.0f32; TRANSDUCER_COUNT];
+
+            for callback in 0..total_callbacks {
+                let phase =
+                    std::f32::consts::TAU * callback as f32 / (6.0 * callbacks_per_second as f32);
+                for channel in 0..MAX_WAVE_STIMULI as u8 {
+                    let voice_phase =
+                        phase + std::f32::consts::TAU * channel as f32 / MAX_WAVE_STIMULI as f32;
+                    let radius = 0.35 * width.min(length);
+                    let sx = 0.5 * width + radius * voice_phase.cos();
+                    let sy = 0.5 * length + radius * voice_phase.sin();
+                    send(
+                        &mut producer,
+                        EngineCommand::MpeUpdate {
+                            instance_id: 0,
+                            channel,
+                            mpe: MpeData {
+                                pressure: 1.0,
+                                pitch_bend: 2.0 * sx / width - 1.0,
+                                timbre: sy / length,
+                            },
+                        },
+                    );
+                }
+
+                let started = Instant::now();
+                engine.process_block(&mut data, TRANSDUCER_COUNT, SAMPLE_RATE, &mut levels);
+                let elapsed_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+                if callback >= WARMUP_SECS * callbacks_per_second {
+                    timings_us.push(elapsed_us);
+                }
+            }
+
+            timings_us.sort_by(f64::total_cmp);
+            let percentile = |fraction: f64| {
+                let index = ((timings_us.len() - 1) as f64 * fraction).round() as usize;
+                timings_us[index]
+            };
+            let deadline_us = block_frames as f64 / SAMPLE_RATE as f64 * 1_000_000.0;
+            let p50 = percentile(0.50);
+            let p99 = percentile(0.99);
+            let max = *timings_us.last().unwrap();
+            eprintln!(
+                "max Wave polyphony: block={block_frames}, callbacks={}, p50={p50:.1}us ({:.1}% deadline), p99={p99:.1}us ({:.1}%), max={max:.1}us ({:.1}%)",
+                timings_us.len(),
+                100.0 * p50 / deadline_us,
+                100.0 * p99 / deadline_us,
+                100.0 * max / deadline_us,
+            );
+            assert!(data.iter().all(|sample| sample.is_finite()));
+        }
     }
 
     /// Debug harness, not a regression test: drives the engine exactly like
