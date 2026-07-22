@@ -345,6 +345,10 @@ Then:
 5. Use the Haptic application, not the plugin, for whole-server field and
    routing state.
 
+The plugin editor uses a compact 520×330 layout. Connection state stays pinned
+at the top right, build/protocol identity remains visible, and the configuration
+panel shows only parameters relevant to the selected Wave or TW scale mode.
+
 The plugin reconnects automatically and replays a coherent configuration after
 `HelloAccepted`. Starting the server before the host is convenient but not
 required.

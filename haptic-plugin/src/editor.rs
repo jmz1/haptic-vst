@@ -5,13 +5,27 @@ use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
 use std::sync::Arc;
 
+fn param_row<P: Param>(
+    ui: &mut egui::Ui,
+    label: &str,
+    param: &P,
+    setter: &ParamSetter<'_>,
+    slider_width: f32,
+) {
+    egui::Grid::new(label).num_columns(2).show(ui, |ui| {
+        ui.label(label);
+        ui.add(widgets::ParamSlider::for_param(param, setter).with_width(slider_width));
+        ui.end_row();
+    });
+}
+
 pub fn create(
     params: Arc<HapticParams>,
     ipc_client: Arc<IpcClient>,
     diag: Arc<Diagnostics>,
 ) -> Option<Box<dyn Editor>> {
     nih_log!("Creating plugin editor UI");
-    let editor_state = EguiState::from_size(560, 620);
+    let editor_state = EguiState::from_size(520, 330);
 
     create_egui_editor(
         editor_state,
@@ -24,137 +38,111 @@ pub fn create(
             egui_ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
             egui::CentralPanel::default().show(egui_ctx, |ui| {
-                ui.heading("Haptic Controller");
-                ui.label(
-                    "Controller client — sends this instance's note-type configuration \
-                     and MIDI to the server. Field visualisation lives in haptic-viewer.",
-                );
-                ui.monospace(format!(
-                    "build {BUILD_HASH} · protocol {}",
-                    haptic_protocol::PROTOCOL_VERSION
-                ));
-
-                ui.separator();
-
+                ui.spacing_mut().item_spacing.y = 4.0;
                 let connected = ipc_client.is_connected();
                 let d = diag.snapshot();
                 ui.horizontal(|ui| {
-                    ui.label("Server:");
-                    if connected {
-                        ui.colored_label(egui::Color32::GREEN, "● connected");
-                    } else {
-                        ui.colored_label(egui::Color32::RED, "● disconnected (retrying)");
-                    }
-                    ui.separator();
-                    ui.label(format!("instance {:04x}", diag.instance_id & 0xffff));
-                    if d.connect_generation > 1 {
-                        ui.separator();
-                        ui.label(format!("reconnects: {}", d.connect_generation - 1));
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let status = if connected {
+                            "● connected"
+                        } else {
+                            "● retrying"
+                        };
+                        let colour = if connected {
+                            egui::Color32::GREEN
+                        } else {
+                            egui::Color32::RED
+                        };
+                        ui.colored_label(colour, status)
+                            .on_hover_text(if connected {
+                                "Configuration and MIDI are being sent to the server"
+                            } else {
+                                "The plugin is retrying the server connection"
+                            });
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.heading("Haptic Controller");
+                        });
+                    });
                 });
 
-                ui.separator();
+                let mut identity = format!(
+                    "build {BUILD_HASH} · p{} · instance #{:04x}",
+                    haptic_protocol::PROTOCOL_VERSION,
+                    diag.instance_id & 0xffff,
+                );
+                if d.connect_generation > 1 {
+                    identity.push_str(&format!(" · reconnects {}", d.connect_generation - 1));
+                }
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&identity).monospace().weak()).truncate(),
+                )
+                .on_hover_text(&identity);
 
                 // The note-type configuration this instance is sending. These
                 // are host-automatable VST parameters (configuration), distinct
                 // from the performance gestures carried by MIDI/MPE.
                 ui.group(|ui| {
-                    ui.label("Note type — configuration sent to the server");
-                    egui::Grid::new("note_type_config")
-                        .num_columns(2)
-                        .spacing([12.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Stimulus type:");
-                            ui.add(widgets::ParamSlider::for_param(
-                                &params.stimulus_type,
-                                setter,
-                            ));
-                            ui.end_row();
-                            let tw = params.stimulus_type.value()
-                                == crate::StimulusTypeParam::TravellingWave;
-                            let speed_active = !tw
-                                || params.tw_scale_mode.value()
-                                    == crate::SpatialScaleModeParam::Speed;
-                            ui.label("Wave speed:");
-                            ui.add_enabled(
-                                speed_active,
-                                widgets::ParamSlider::for_param(&params.wave_speed, setter),
-                            );
-                            ui.end_row();
-                            ui.label("TW scale:");
-                            ui.add_enabled(
-                                tw,
-                                widgets::ParamSlider::for_param(&params.tw_scale_mode, setter),
-                            );
-                            ui.end_row();
-                            ui.label("TW wavelength:");
-                            ui.add_enabled(
-                                tw && params.tw_scale_mode.value()
-                                    == crate::SpatialScaleModeParam::Wavelength,
-                                widgets::ParamSlider::for_param(&params.tw_wavelength, setter),
-                            );
-                            ui.end_row();
-                            ui.label("Attenuation knee:");
-                            ui.add(widgets::ParamSlider::for_param(&params.atten_d0, setter));
-                            ui.end_row();
-                            ui.label("Attenuation exponent:");
-                            ui.add(widgets::ParamSlider::for_param(
-                                &params.atten_exponent,
-                                setter,
-                            ));
-                            ui.end_row();
-                        });
-                    if params.stimulus_type.value() == crate::StimulusTypeParam::TravellingWave {
-                        let frequency = 100.0;
-                        match params.tw_scale_mode.value() {
-                            crate::SpatialScaleModeParam::Speed => ui.weak(format!(
-                                "TW reference at 100 Hz: λ = {:.4} m",
-                                params.wave_speed.value() / frequency
-                            )),
-                            crate::SpatialScaleModeParam::Wavelength => ui.weak(format!(
-                                "TW reference at 100 Hz: c = {:.2} m/s",
-                                params.tw_wavelength.value() * frequency
-                            )),
-                        };
-                    }
-                });
+                    ui.strong("configuration");
+                    let tw =
+                        params.stimulus_type.value() == crate::StimulusTypeParam::TravellingWave;
 
-                ui.separator();
+                    param_row(ui, "type", &params.stimulus_type, setter, 220.0);
+
+                    if tw {
+                        param_row(ui, "scale", &params.tw_scale_mode, setter, 260.0);
+                        match params.tw_scale_mode.value() {
+                            crate::SpatialScaleModeParam::Speed => {
+                                param_row(ui, "speed", &params.wave_speed, setter, 300.0)
+                            }
+                            crate::SpatialScaleModeParam::Wavelength => {
+                                param_row(ui, "wavelength", &params.tw_wavelength, setter, 300.0)
+                            }
+                        }
+                    } else {
+                        param_row(ui, "speed", &params.wave_speed, setter, 300.0);
+                    }
+
+                    param_row(ui, "decay knee", &params.atten_d0, setter, 300.0);
+                    param_row(ui, "exponent", &params.atten_exponent, setter, 300.0);
+                });
 
                 // Incoming-MIDI diagnostics: confirms events are arriving from
                 // the host and being sent. `dropped` counts sends that failed
                 // (queue full / server down) — a fast pointer at why notes have
                 // "no effect".
                 ui.group(|ui| {
-                    ui.label("Incoming MIDI");
+                    ui.strong("MIDI");
                     ui.horizontal(|ui| {
-                        ui.label(format!("note-on: {}", d.notes_on));
-                        ui.separator();
-                        ui.label(format!("note-off: {}", d.notes_off));
-                        ui.separator();
-                        ui.label(format!("mpe: {}", d.mpe_updates));
-                        ui.separator();
+                        let spacing = ui.spacing().item_spacing.x;
+                        let cell_width = ((ui.available_width() - 3.0 * spacing) / 4.0).max(48.0);
+                        let cell_size = [cell_width, ui.spacing().interact_size.y];
+                        ui.add_sized(cell_size, egui::Label::new(format!("on {}", d.notes_on)));
+                        ui.add_sized(cell_size, egui::Label::new(format!("off {}", d.notes_off)));
+                        ui.add_sized(
+                            cell_size,
+                            egui::Label::new(format!("MPE {}", d.mpe_updates)),
+                        );
                         let dropped = d.sends_dropped;
                         let col = if dropped > 0 {
                             egui::Color32::from_rgb(220, 140, 60)
                         } else {
                             egui::Color32::GRAY
                         };
-                        ui.colored_label(col, format!("dropped: {dropped}"));
+                        ui.add_sized(
+                            cell_size,
+                            egui::Label::new(
+                                egui::RichText::new(format!("dropped {dropped}")).color(col),
+                            )
+                            .truncate(),
+                        );
                     });
                     if d.notes_on == 0 && d.notes_off == 0 && d.mpe_updates == 0 {
                         ui.colored_label(
                             egui::Color32::from_rgb(220, 140, 60),
-                            "No MIDI received yet — check the track's MIDI routing to this plugin.",
+                            "No MIDI yet — check the track's routing",
                         );
                     }
                 });
-
-                ui.separator();
-                ui.weak(format!(
-                    "Plugin v{} · socket /tmp/haptic-vst.sock",
-                    crate::HapticPlugin::VERSION
-                ));
             });
         },
     )
