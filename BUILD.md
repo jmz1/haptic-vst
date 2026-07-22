@@ -1,141 +1,182 @@
-# Building the Haptic VST Plugin
+# Building Haptic VST
 
-This project uses `nih_plug_xtask` for easy plugin building and bundling.
+Run commands from the workspace root. The repository uses a Cargo workspace
+and a small `xtask` wrapper around `nih_plug_xtask` for VST3 bundles.
 
-> **PATH note:** `cargo` lives in `~/.cargo/bin`, which is not on the
-> default shell PATH on this machine. Run
-> `echo 'source "$HOME/.cargo/env"' >> ~/.zshrc` once (new terminal after),
-> or prefix sessions with `export PATH="$HOME/.cargo/bin:$PATH"`.
+Testing and live-process sequencing are documented separately in
+[`TESTING.md`](TESTING.md).
 
-> **Testing:** build instructions are here; how to *run and test* the
-> system (server, viewer, plugin, scripted clients) is in `TESTING.md`.
+## Prerequisites
 
-## Quick Start
+- A current Rust toolchain installed through `rustup`.
+- `cargo` available on `PATH`. A normal rustup installation can be activated
+  for the current shell with:
 
-### Build Development Plugin
+  ```bash
+  source "$HOME/.cargo/env"
+  ```
+
+The plugin depends on the project's `jmz1/nih-plug` fork, so the first build
+may need network access to fetch Git dependencies.
+
+## Workspace checks
+
+Use the narrowest command while iterating. Before handing off Rust changes, run:
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace
+cargo test --workspace
+```
+
+Strict linting for larger changes:
+
+```bash
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+## Build the VST3 bundle
+
+Development bundle:
+
 ```bash
 cargo xtask bundle haptic-plugin
 ```
 
-### Build Release Plugin (Optimized)
+Optimized release bundle:
+
 ```bash
 cargo xtask bundle haptic-plugin --release
 ```
 
-### Build Universal Binary (macOS)
+macOS universal bundle, when both Rust targets are installed:
+
 ```bash
 cargo xtask bundle-universal haptic-plugin --release
 ```
 
-## Output Locations
+Output:
 
-Built plugins are placed in:
-```
-target/bundled/
-└── haptic-plugin.vst3    # VST3 format plugin
+```text
+target/bundled/haptic-plugin.vst3
 ```
 
-The plugin editor displays `build <hash> · protocol <version>`. The same values
-are written to `/Users/jmz/tmp/log/haptic-vst.log` when the library loads and an
-instance initializes. The hash covers the plugin source, shared protocol source,
-workspace manifests, and lockfile, so dirty-worktree rebuilds are distinguishable.
+VST3 bundles are directories. The outer directory timestamp is not a reliable
+build identity and a DAW may retain an already loaded library after rebuilding.
+The editor and plugin log show:
 
-(CLAP export is currently disabled in `haptic-plugin/src/lib.rs`; a stale
-`haptic-plugin.clap` may remain in `target/bundled/` from older builds.)
+```text
+build <content hash> · protocol <version>
+```
 
-## Installation
+The deterministic hash covers the plugin and shared protocol source, workspace
+manifests, and lockfile. Use it to distinguish dirty-worktree bundles and stale
+DAW-loaded binaries.
 
-### macOS
-Copy the plugin bundle to your DAW's plugin directory:
+CLAP export is currently disabled in `haptic-plugin/src/lib.rs`. A
+`haptic-plugin.clap` left in `target/bundled/` is stale and is not a supported
+output of the current workspace.
+
+## Build individual applications
+
+Server:
 
 ```bash
-mkdir -p ~/Library/Audio/Plug-Ins/VST3
-cp -r target/bundled/haptic-plugin.vst3 ~/Library/Audio/Plug-Ins/VST3/
+cargo build -p haptic-server --release
 ```
 
-### System Directories (macOS)
-- User: `~/Library/Audio/Plug-Ins/VST3/`
-- System-wide: `/Library/Audio/Plug-Ins/VST3/`
-
-## Running the Server
-
-The plugin requires the haptic server to be running:
+Viewer:
 
 ```bash
-cargo run --bin haptic-server
+cargo build -p haptic-viewer --release
 ```
 
-## Development Workflow
+Standalone controller host:
 
-1. **Start the server:**
-   ```bash
-   cargo run --bin haptic-server
-   ```
-
-2. **Build the plugin:**
-   ```bash
-   cargo xtask bundle haptic-plugin --release
-   ```
-
-3. **Install the plugin:**
-   ```bash
-   cp -r target/bundled/haptic-plugin.vst3 ~/Library/Audio/Plug-Ins/VST3/
-   ```
-
-4. **Load in your DAW** and send MIDI notes to test haptic feedback
-
-5. **Optionally start the visualiser** (`cargo run -p haptic-viewer
-   --release`) — see `TESTING.md` for the full testing workflow
-
-## Features
-
-- **VST3 Support**: Works with most modern DAWs (CLAP currently disabled)
-- **Real-time Processing**: Lock-free audio path in the server
-- **MIDI/MPE Input**: Velocity → amplitude, bend/pressure/slide → source
-  position and intensity
-- **DAW-automatable parameters**: Stimulus Type (`Wave`/`Travelling Wave`),
-  Wave Speed, TW Scale Mode/Wavelength, and shared distance-decay knee/exponent
-- **32-channel Output**: Direct control of haptic transducer arrays
-- **Logging**: Plugin log at `/Users/jmz/tmp/log/haptic-vst.log`
-  (override with `NIH_LOG`)
-- **Cross-platform**: macOS and Linux support
-
-## Standalone Mode
-
-### Build Standalone Binary
 ```bash
-cargo build --package haptic-plugin-standalone --release
+cargo build -p haptic-plugin-standalone --release
 ```
 
-### Run Standalone
+Corresponding binaries are placed under `target/release/`.
+
+For an ordinary development run, Cargo can build and start in one command:
+
 ```bash
-cargo run --package haptic-plugin-standalone
+cargo run -p haptic-server --release
+cargo run -p haptic-viewer --release
+cargo run -p haptic-plugin-standalone --release
 ```
 
-**Note**: The standalone version successfully initializes and connects to the haptic server, but may have GUI stability issues on macOS due to baseview library limitations. For production use, the VST3/CLAP versions in a DAW host are recommended.
+Use separate terminals for processes that need to run together. The DAW-free
+and headless workflows in `TESTING.md` are usually faster than rebuilding and
+reloading a plugin host.
 
-## Supported DAWs
+## Optional local installation on macOS
 
-Tested with:
-- **Logic Pro** (VST3/CLAP)
-- **Ableton Live** (VST3/CLAP) 
-- **Cubase** (VST3)
-- **FL Studio** (VST3)
-- **Reaper** (VST3/CLAP)
+Bundling does not install the plugin. If DAW integration is the test target,
+copy the completed bundle into the user's VST3 directory:
 
-## Troubleshooting
+```bash
+mkdir -p "$HOME/Library/Audio/Plug-Ins/VST3"
+ditto target/bundled/haptic-plugin.vst3 \
+  "$HOME/Library/Audio/Plug-Ins/VST3/haptic-plugin.vst3"
+```
 
-### Plugin Not Found
-- Ensure the plugin is in the correct directory
-- Restart your DAW after installation
-- Check DAW plugin scanner settings
+Installation is intentionally a separate manual action: ordinary builds and
+automated tests should not modify a DAW directory or start a GUI host.
 
-### No Haptic Output
-- Verify haptic-server is running: `cargo run --bin haptic-server`
-- Check server logs for connection status
-- Ensure 32-channel audio interface is connected
+After replacement, some DAWs must be fully quit and restarted before they
+unload the old dynamic library. Compare the build hash displayed by the plugin
+with the newly built bundle rather than relying on file timestamps.
 
-### Build Issues
-- Update Rust: `rustup update`
-- Clean build: `cargo clean`
-- For universal binaries: `rustup target add x86_64-apple-darwin`
+## Crate and feature details
+
+`haptic-plugin` builds both:
+
+- `cdylib`, used by the VST3 wrapper; and
+- `rlib`, used by `haptic-plugin-standalone`.
+
+Its `standalone` Cargo feature enables nih-plug's standalone support. Normal
+plugin bundling selects the wrapper configuration through the xtask tooling;
+the workspace does not expose separate user-facing VST3/CLAP feature flags.
+
+The supported export is VST3. Host compatibility should be verified in the
+actual target DAW rather than inferred from a generic format list.
+
+## Troubleshooting builds
+
+### Cargo is not found
+
+Activate the rustup environment as shown under Prerequisites, or invoke Cargo
+from the path reported by `rustup`.
+
+### A build is unexpectedly stale
+
+- Confirm the editor's content hash and protocol version.
+- Build the release bundle again with `cargo xtask bundle haptic-plugin
+  --release`.
+- Replace the installed bundle rather than copying into an extra nested
+  directory.
+- Fully restart the host if it has already loaded the previous library.
+
+### Universal build target is missing
+
+Install the needed targets, for example:
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
+Then rerun the universal bundle command.
+
+### A dependency or generated output is inconsistent
+
+Start with non-destructive diagnostics:
+
+```bash
+cargo check --workspace
+cargo tree -p haptic-plugin
+```
+
+Avoid using `cargo clean` as a routine fix; it removes the entire workspace
+build cache and usually obscures the actual dependency or host-loading issue.

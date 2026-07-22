@@ -1,0 +1,231 @@
+# Wave
+
+Wave is the propagation-based stimulus in `haptic-server`. It models a
+sinusoidal point source moving across the table and schedules each emitted
+sample to arrive at every transducer after the appropriate distance-dependent
+delay. Source motion changes the spacing of those arrivals, producing Doppler
+frequency and amplitude behaviour as an outcome of the propagation model.
+
+This document describes current behaviour and the engineering decisions that
+protect it. Travelling Wave, the instantaneous alternative, is documented in
+[`travelling-wave.md`](travelling-wave.md).
+
+## What it is
+
+For transducer `i` at position `x_i`, a source at `x_s(t)`, and wave speed `c`,
+the physical delay of an emission is:
+
+```text
+tau_i(t) = |x_i - x_s(t)| / c
+```
+
+For a source signal `s(t)`, a fixed listener receives the sample emitted at
+time `t` at arrival time:
+
+```text
+a_i(t) = t + tau_i(t)
+```
+
+If the source approaches a transducer, consecutive arrivals become closer
+together. Frequency rises and energy is concentrated. If it recedes, arrivals
+spread apart, frequency falls, and energy is diluted. There is no separate
+“Doppler effect” stage in the engine; adding one would double-count behaviour
+already present in the arrival schedule.
+
+The current Wave voice combines:
+
+- a standard-MIDI-frequency sinusoidal oscillator clamped to 20–200 Hz;
+- attack, sustain, and release envelope state;
+- velocity and smoothed MPE pressure amplitude;
+- MPE-controlled requested source position;
+- a wave-speed-limited effective source position;
+- configurable distance decay; and
+- 32 independent fractional arrival buffers, one per transducer.
+
+Wave speed and stimulus type are taken from the owning instance at note-on.
+Changing Wave speed while a note is held does not rewrite that voice's existing
+propagation history; the viewer test console retriggers held Wave notes when
+speed changes to make this latching visible.
+
+## Signal path
+
+```text
+MIDI/MPE
+   │
+   ▼
+measured-spacing ramp + two controller smoothers
+   │
+   ├── pressure ───────────────┐
+   └── requested position      │
+             │                 │
+             ▼                 │
+    speed-limited source       │
+             │                 ▼
+oscillator × envelope × velocity/pressure
+             │
+             ▼
+32 bandlimited scatter writes at emission-time distance and gain
+             │
+             ▼
+32 sequential arrival reads
+             │
+             ▼
+voice mixing → layout gains → sinc reconstruction → routing → device
+```
+
+The source oscillator advances at the engine's internal render rate. The delay
+model carries emitted energy; note-off closes the source envelope but does not
+discard arrivals already in flight.
+
+## Scatter writes and sequential reads
+
+For a moving source and fixed listener, delay must be evaluated at **emission
+time**. Each emitted sample is therefore scattered into its future fractional
+arrival position, and the buffer is read sequentially:
+
+```text
+read and clear                            scatter emission n
+      ▼                                  near n + tau_i(n)
+  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+  │  │  │  │  │  │▁▃▅█▅▃▁│  │  │  │  │
+  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+      sequential time ──────────────────▶
+```
+
+The deposit uses an eight-tap Kaiser-windowed sinc splat selected from 128
+fractional phases. Each phase is normalized to unit DC gain. A constant
+half-kernel lookahead is included in every scheduled delay so all taps land in
+unread cells and nearby transducers retain distinct short delays.
+
+Every delay cell also carries a generation tag. Reset, voice stealing, and
+panic advance the generation instead of clearing the large buffers inside the
+audio callback. A cell from an older generation behaves as zero when read or
+accumulated.
+
+The read pointer advances by exactly one internal sample each frame, consumes
+the accumulated arrival, and logically clears that cell. Delays beyond the
+available capacity are clamped rather than wrapped; wrapping would lap the read
+pointer and turn a long physical delay into a false short one.
+
+## Source motion and causality
+
+The plugin/viewer sends discrete MPE updates, usually quantised to client and
+audio-block cadence. Applying those positions as steps produces block-rate
+frequency sidebands. Wave therefore uses three layers of motion control:
+
+1. Incoming targets ramp over their measured update spacing.
+2. Two cascaded approximately 15 ms one-pole smoothers remove remaining corners
+   while keeping gesture latency modest.
+3. The effective source chases the smoothed request at no more than half the
+   configured wave speed.
+
+The final limit is a causality/stability condition for scatter scheduling, not
+merely aesthetic smoothing. With radial speed bounded by `0.5*c`, the arrival
+index advances within approximately `[0.5, 1.5]` cells per emission. Successive
+arrivals remain monotonic and do not leave pathological gaps or reverse order.
+
+The viewer shows the requested position as a ring and the effective source as a
+cross, joined while the source is catching up.
+
+## Distance decay and headroom
+
+Wave and TW share the radial distance gain:
+
+```text
+g(d) = (1 + d / d0)^(-p)
+```
+
+Defaults are `d0 = 0.5 m` and `p = 1`, exactly equivalent to the earlier
+`1 / (1 + 2d)` rule. `p = 0` deliberately disables falloff.
+
+For Wave, gain is evaluated at emission time and carried into the arrival
+buffer. A live decay change affects new emissions, not energy already in
+flight. This differs from TW, whose instantaneous output uses the latest
+smoothed decay directly.
+
+Approach at the maximum `0.5*c` source speed can bunch arrivals by as much as
+`1 / (1 - 0.5) = 2`. The default per-transducer layout gain is therefore 0.5,
+reserving 6 dB for that physically meaningful amplification before final
+output bounds. Explicit layout gains can change the policy and must be tested
+with maximum-occupancy material.
+
+## Two-rate rendering and reconstruction
+
+Delay lines run at `device_rate / 32`. At a preferred 48 kHz device rate this is
+1.5 kHz, comfortably above twice the 200 Hz stimulus ceiling. The lower internal
+rate makes long physical delays inexpensive: the 16,384-cell buffers cover
+about 10.9 seconds at 1.5 kHz rather than 341 ms at 48 kHz.
+
+Device-rate samples are reconstructed with a 512-tap polyphase
+Kaiser-windowed sinc filter, 16 taps per interpolation phase. The filter both
+interpolates and suppresses images above the internal Nyquist. Its group delay
+is operational latency shared by all channels, not a spatial propagation
+difference.
+
+Final samples are bounded after reconstruction. Bounding only internal frames
+would not protect against reconstruction overshoot.
+
+## Voice lifetime
+
+A Wave voice has two related lifetimes:
+
+- **source lifetime:** the envelope can still emit new energy; and
+- **tail lifetime:** scheduled arrivals may still remain in the buffers.
+
+Note-off begins release from the envelope's current value, including during
+attack. Once the source becomes silent, the voice continues sequential reads
+until its latest possible arrival has passed. Only then may the slot and owner
+be reaped. Panic is intentionally different: it invalidates generations and
+ownership immediately.
+
+Disconnect releases the owning instance's voices through the same lifecycle
+machinery, so closing a viewer or plugin connection cannot leave a permanent
+sustain.
+
+## Observation limits
+
+The server publishes current frequency, speed/wavelength, decay, requested and
+effective positions, and amplitude for each Wave voice. It does not publish
+oscillator phase or 32 delay-line histories.
+
+The viewer can therefore draw a useful geometric phase field from present
+distance and wavelength, but it cannot reproduce exact delayed audio while the
+source moves or a tail drains. The UI must continue calling this a
+phase-aligned geometric preview.
+
+## Why it works this way
+
+Several completed investigations established the current design:
+
+- A fixed write head with an interpolated read tap evaluates delay at reception
+  time. That is a moving-listener model and can make the tap overtake or reverse
+  near the write head. Moving-source physics requires emission-time scatter
+  writes.
+- A two-tap linear scatter kernel has fractional-phase-dependent gain. Sweeping
+  delay turns that into audible granulation/warble. The bandlimited normalized
+  sinc splat keeps in-band gain nearly constant across phases.
+- Delay capacity expressed at the device rate was too short for a 1×2 m table
+  at low wave speeds. Internal-rate delay storage turns capacity into a
+  physical-time margin large enough for realistic layouts.
+- Directly stepping block-rate MPE targets creates an FM sideband comb. Measured
+  spacing ramps plus smoothing make trajectory quality much less dependent on
+  client send cadence.
+- Discarding a voice when its envelope ends loses physically emitted release
+  energy. Source and tail activity must be tracked separately.
+
+Representative numerical evidence and the regression tests protecting these
+lessons are summarised in [`learnings.md`](learnings.md). The opt-in orbit
+capture in the engine is the deeper evidence tool when this path changes.
+
+## Open edges
+
+- The source is a point in a direct, unbounded medium. Physical table
+  boundaries, reflections, dispersion, and modes are not represented.
+- The internal render rate is derived from the device rate rather than fixed at
+  a universal rate with a general resampler. Device selection prefers 48 kHz to
+  keep the tested operating point stable.
+- Multiple Wave voices sum before the final bound; there is no perceptual
+  loudness normalization or automatic polyphonic headroom policy.
+- MPE pitch bend is spatial x, so note frequency is latched. Continuous pitch
+  would require an explicit future binding rather than an implicit change to
+  this stimulus.

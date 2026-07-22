@@ -1,192 +1,306 @@
 # Testing the haptic system
 
-How to run and test every part of the system — with or without a DAW/VST
-plugin, with or without the 32-channel interface. Build instructions live in
-`BUILD.md`; this document is about *driving* the system.
+This document covers automated, headless, viewer, DAW, and physical-device
+workflows. Build commands and bundle details live in [`BUILD.md`](BUILD.md).
 
-## 0. Prerequisite: cargo on PATH
+Prefer the smallest workflow that exercises the behaviour under test. Most
+engine, protocol, reconnect, and stimulus work can be verified without loading
+a DAW or opening an audio device.
 
-`rustup` installs to `~/.cargo/bin`, which is not on the shell PATH by
-default on this machine. Either prefix commands ad hoc:
+## Processes and roles
 
-```bash
-export PATH="$HOME/.cargo/bin:$PATH"
-```
-
-or fix it permanently (recommended):
-
-```bash
-echo 'source "$HOME/.cargo/env"' >> ~/.zshrc   # then open a new terminal
-```
-
-## 1. The three processes
-
-| Binary | Run with | Role |
+| Process | Typical command | Role |
 |---|---|---|
-| `haptic-server` | `cargo run -p haptic-server --release` | Real-time engine. Owns the audio device (32-ch if found, else default/stereo fallback), listens on `/tmp/haptic-vst.sock`. |
-| `haptic-viewer` | `cargo run -p haptic-viewer --release` | Phase visualiser **and test console**. Read-only unless you use its controls; auto-reconnects, so start order doesn't matter. |
-| VST3 plugin | loaded by a DAW | MIDI/MPE → server commands. Optional — the viewer can drive tests without it. |
+| server | `cargo run -p haptic-server --release` | Owns the engine, socket, layout, and physical audio device. |
+| viewer | `cargo run -p haptic-viewer --release` | Observes server state and provides routing/test controls. |
+| scripted client | `python3 tools/test_note.py` | Drives notes, MPE, parameters, and routing without a DAW. |
+| VST3 plugin | loaded by a DAW | Converts host MIDI/MPE and automation to controller commands. |
 
-Server flags: `--config <path>` (default `./haptic.toml`, hot-reloads on
-save), `--test-tone` (100 Hz burst cycling across all outputs, for hardware
-bring-up), `--headless`/`--dummy-audio` (48 kHz, 32-channel in-memory sink),
-and `--socket <path>` (transport/lock namespace override).
+If Cargo is not on `PATH` after a rustup installation:
 
-Normal mode owns the production `/tmp/haptic-vst.sock` singleton and opens a
-physical device. Headless mode opens no audio hardware and defaults to the
-per-process `/tmp/haptic-vst-test-<pid>.sock`, so it cannot block a production
-server or another headless run. For a stable dedicated test endpoint:
+```bash
+source "$HOME/.cargo/env"
+```
+
+## Server profiles
+
+Important server options:
+
+```text
+--config PATH             layout file; defaults to ./haptic.toml
+--test-tone               100 Hz channel-cycling hardware pattern
+--headless                paced 48 kHz, 32-channel memory sink
+--dummy-audio             alias for --headless
+--socket PATH             override socket and singleton namespace
+HAPTIC_SOCKET_PATH        environment alternative to --socket
+```
+
+Normal mode uses `/tmp/haptic-vst.sock` and opens a physical device. It refuses
+to replace another live server at that endpoint.
+
+Headless mode opens no physical audio device and defaults to:
+
+```text
+/tmp/haptic-vst-test-<pid>.sock
+```
+
+The per-process endpoint prevents test servers from contending with production
+or one another. Multi-process tests should choose an explicit stable endpoint:
+
+```bash
+cargo run -p haptic-server --release -- \
+  --headless --socket /tmp/haptic-vst-test.sock
+```
+
+An occupied explicit endpoint fails immediately; the server never waits for a
+test lock or unlinks another live server.
+
+## Fastest end-to-end test: headless plus script
+
+Terminal 1:
+
+```bash
+cargo run -p haptic-server --release -- \
+  --headless --socket /tmp/haptic-vst-test.sock
+```
+
+Terminal 2:
+
+```bash
+python3 tools/test_note.py --socket /tmp/haptic-vst-test.sock
+```
+
+Useful scripted variants:
+
+```bash
+python3 tools/test_note.py --socket /tmp/haptic-vst-test.sock --orbit
+python3 tools/test_note.py --socket /tmp/haptic-vst-test.sock \
+  --note 48 --velocity 80 --duration 5
+python3 tools/test_note.py --socket /tmp/haptic-vst-test.sock \
+  --wave-speed 100
+python3 tools/test_note.py --socket /tmp/haptic-vst-test.sock \
+  --type tw --scale-mode wavelength --wavelength 0.125 \
+  --atten-d0 0.75 --atten-p 1.5 --orbit
+python3 tools/test_note.py --socket /tmp/haptic-vst-test.sock \
+  --route 0:31 --route 1:13
+python3 tools/test_note.py --socket /tmp/haptic-vst-test.sock --panic
+```
+
+The default scripted note is MIDI 36 / Ableton C1 / 65.4 Hz. Frequencies are
+not transposed; the engine uses standard equal temperament and clamps to
+20–200 Hz.
+
+Use this workflow for:
+
+- protocol and handshake changes;
+- note/MPE/parameter lifecycle;
+- Wave and TW automation semantics;
+- reconnect and disconnect cleanup;
+- headless callback health; and
+- build-hash-independent debugging before DAW integration.
+
+## Viewer workflow without a plugin
+
+Terminal 1:
+
+```bash
+cargo run -p haptic-server --release
+```
+
+Terminal 2:
+
+```bash
+cargo run -p haptic-viewer --release
+```
+
+To avoid physical hardware, give both processes the same explicit headless
+socket instead:
 
 ```bash
 cargo run -p haptic-server --release -- \
   --headless --socket /tmp/haptic-vst-test.sock
 cargo run -p haptic-viewer --release -- \
   --socket /tmp/haptic-vst-test.sock
-python3 tools/test_note.py --socket /tmp/haptic-vst-test.sock --orbit
 ```
 
-`HAPTIC_SOCKET_PATH=/tmp/haptic-vst-test.sock` is supported by all clients,
-including `haptic-plugin-standalone`. An occupied explicit endpoint fails fast;
-the server never waits for another instance's lock.
+The viewer's controls are stacked to fit the default 620 px window width.
 
-## 2. Sequencing a test WITHOUT the plugin (viewer only)
+1. Choose **Wave** or **Travelling Wave (TW)** and start the test note.
+2. Note and velocity changes retrigger the held test voice.
+3. Wave speed retriggers a held Wave because speed is latched at note-on.
+4. TW speed/wavelength mode, spatial scale, and decay update live.
+5. Drag on the table or enable orbit to move the source.
+6. Left-click a transducer to route it to physical output 1; right-click routes
+   it to output 2. Badges show current routing.
 
-```bash
-cargo run -p haptic-server --release        # terminal 1
-cargo run -p haptic-viewer --release        # terminal 2
-```
+The viewer always displays all 32 logical channels. Device routing changes only
+what is copied to the available physical outputs.
 
-In the viewer's bottom panel:
+Note names use Ableton's octave convention: MIDI 60 is C3. C3 is 261.6 Hz
+before clamping and therefore produces/displays the 200 Hz ceiling. Hue shows
+relative spatial phase, brightness shows local amplitude, the cross is the
+effective source, and the ring is the requested position.
 
-The console is arranged in compact stacked rows and fits the default 620 px
-window width; enlarging the viewer should not be necessary to reach controls.
+The field display is a phase-aligned geometric preview. It does not reproduce
+synchronized oscillator phase or Wave delay-line history. A single TW voice's
+relative field uses the same closed-form helper as the engine.
 
-1. Choose **Wave** or **Travelling Wave (TW)**, then **▶ start test note** on
-   MIDI channel 15.
-2. **note / velocity** changes retrigger a held note. Wave speed retriggers a
-   held delay-line Wave, but updates TW live. TW speed/fixed-wavelength mode,
-   wavelength, decay knee, and exponent all update without retriggering.
-3. **Drag on the table** to move the source; the phase pattern re-forms
-   around it. **orbit** circles the source automatically (period slider).
-4. **Left-click a circle** → that logical channel plays on device output
-   1 (L). **Right-click** → output 2 (R). Badges show current routing.
-   Default routing is identity (output *n* ← channel *n*).
+## Automated Rust tests
 
-The engine always renders all 32 logical channels; the visualiser and its
-level/phase data are taken *before* the copy to the physical device, so
-every cell is live even on a stereo fallback device. Routing only selects
-what you *hear*.
-
-Note names throughout the viewer use Ableton's octave convention: MIDI note 60
-is C3. Frequencies are not transposed; standard MIDI frequency is clamped to
-20–200 Hz, so C3 and higher notes display/output at the 200 Hz ceiling. Colour
-code (per-note mode): hue = phase at that transducer relative to
-the source oscillator (blue = in phase, hue rotates with phase lag);
-brightness = local amplitude. The white cross is the source position.
-The header shows note, frequency, wave speed, wavelength, render fps
-(120 on a 120 Hz display) and status-message rate.
-
-## 3. Sequencing a test WITHOUT the viewer (scripted / headless)
-
-`tools/test_note.py` speaks the wire protocol directly:
-
-```bash
-python3 tools/test_note.py                          # 2 s C1 / 65.4 Hz note
-python3 tools/test_note.py --note 48 --velocity 80 --duration 5
-python3 tools/test_note.py --orbit                  # circle the source
-python3 tools/test_note.py --wave-speed 100
-python3 tools/test_note.py --type tw --scale-mode wavelength \
-  --wavelength 0.125 --atten-d0 0.75 --atten-p 1.5 --orbit
-python3 tools/test_note.py --route 0:31 --route 1:13  # monitor L←31, R←13
-python3 tools/test_note.py --panic                  # just silence everything
-python3 tools/test_note.py --socket /tmp/haptic-vst-test.sock
-```
-
-Protocol notes for writing your own clients:
-- Frames are `u32` little-endian length + bincode payload, both directions
-  (`haptic-protocol/src/lib.rs` is the schema; enum variant tags are
-  `u32` LE in declaration order).
-- Every connection must first send the exact-version `Hello` handshake. The
-  checked-in script does this; copy its current schema rather than hardcoding an
-  older enum layout.
-- Protocol v3 has only `Wave` and `TravellingWave`; the second enum/VST slot
-  deliberately migrated from the removed placeholder to TW.
-- Controllers receive one `HelloAccepted` frame and must wait for it before
-  reporting themselves connected; they receive no continuous status stream.
-  Observers receive the acknowledgement plus levels (~60 Hz), active voices,
-  layout, and routing, and must keep reading or they will be disconnected when
-  their socket buffer fills.
-
-## 4. Sequencing a test WITH the VST plugin
-
-```bash
-cargo run -p xtask -- bundle haptic-plugin --release
-mkdir -p ~/Library/Audio/Plug-Ins/VST3
-cp -r target/bundled/haptic-plugin.vst3 ~/Library/Audio/Plug-Ins/VST3/
-```
-
-1. Start `haptic-server` (and the viewer, if wanted — multiple clients are
-   fine and see the same state).
-2. Load "Haptic Controller" (VST3 instrument) in the DAW. Its GUI shows
-   connection and outgoing-MIDI diagnostics; whole-system visualisation is in
-   `haptic-viewer`. The plugin reconnects automatically, so start order does not
-   matter.
-3. Play MIDI/MPE. Velocity → amplitude; pitch bend → source x (full
-   table width); pressure → intensity; CC74/slide → source y (full table
-   length). Stimulus type, wave speed, TW scale mode/wavelength, and shared
-   decay controls are DAW-automatable and pushed to the server on change.
-4. The viewer shows every active Wave and Travelling Wave voice, with per-instance
-   filtering. Its phase display is a phase-aligned geometric preview; it does
-   not reconstruct synchronized oscillator phase or delay-line history.
-
-Plugin log: `/Users/jmz/tmp/log/haptic-vst.log` (override with `NIH_LOG`).
-
-There is also a standalone plugin host (`cargo run -p
-haptic-plugin-standalone`), but the DAW route is the reliable one (see
-BUILD.md note on baseview stability).
-
-To point the standalone client at an isolated headless server:
-
-```bash
-HAPTIC_SOCKET_PATH=/tmp/haptic-vst-test.sock \
-  cargo run -p haptic-plugin-standalone --release -- --midi-input "DEVICE NAME"
-```
-
-## 5. Automated tests
+Run all workspace tests:
 
 ```bash
 cargo test --workspace
 ```
 
-Covers: protocol framing and versioned handshakes, validation and disconnect
-cleanup, engine note/voice lifecycle, propagation tails, short-delay phase,
-MPE smoothing, reconstruction bounds, 48 kHz device-config preference,
-per-transducer gains/layout reload, monitor routing, configuration parsing, and
-end-to-end framed IPC over a real Unix socket.
+Before a Rust handoff, also run:
 
-Note: `cargo test` does **not** rebuild the `haptic-server` binary you run
-manually — run `cargo build --release` before live tests, or you'll be
-testing stale code.
+```bash
+cargo fmt --all -- --check
+cargo check --workspace
+cargo test --workspace
+```
 
-## 6. Health checks
+For a substantial callback or protocol change:
 
-- Server prints a line every 5 s: callback count, frames, p50/p99/max
-  callback time, stream errors. At 48 kHz the budget is ~10.7 ms per
-  512-frame callback; release builds sit around p50 ≈ 2 ms.
-- `--test-tone` for hardware bring-up: identifies each physical channel in
-  turn without needing any client.
-- Viewer header fps counter confirms the render rate on 120 Hz displays.
+```bash
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
 
-## 7. Troubleshooting
+Coverage includes:
 
-| Symptom | Cause / fix |
+- length-prefixed framing and exact-version handshakes;
+- invalid-command rejection, duplicate identities, and disconnect cleanup;
+- voice allocation, stealing, release, panic, and multi-instance isolation;
+- Wave delay/tail/smoothing/scatter/reconstruction behaviour;
+- TW closed-form field, scale modes, live automation, and lifecycle;
+- active-voice frame budget and observer snapshots;
+- layout parsing/reload and per-transducer gains;
+- 48 kHz output-config preference and monitor routing; and
+- framed end-to-end IPC over a real Unix socket.
+
+`cargo test` compiles test targets, but it does not replace a release binary
+already running in another terminal. Restart that process after rebuilding.
+
+## Targeted DSP capture
+
+The ignored engine test `orbit_capture_writes_debug_buffers` drives the Wave
+model with the viewer's orbit-style MPE stream and writes multichannel samples
+for offline analysis. It is intentionally excluded from ordinary test runs.
+
+Use it when changing:
+
+- delay scheduling or capacity;
+- source motion/smoothing;
+- scatter kernels;
+- internal render rate or reconstruction;
+- output headroom; or
+- Wave envelope/tail semantics.
+
+Run the ignored test deliberately and set its documented environment variables
+in `haptic-server/src/engine.rs` for the scenario under investigation. Evaluate
+at least:
+
+- non-finite samples;
+- peak and clamp incidence;
+- stationary noise/spurs;
+- orbit-period discontinuities;
+- expected Doppler direction and amplitude behaviour; and
+- reconstruction images and in-band sidebands.
+
+Numerical baselines are evidence for a scenario, not universal performance
+promises. Record a new baseline beside the relevant design change when the
+model intentionally changes.
+
+## Physical-device bring-up
+
+Only use physical mode when hardware behaviour is the test target.
+
+Start with the server's independent channel-cycling tone:
+
+```bash
+cargo run -p haptic-server --release -- --test-tone
+```
+
+It emits 100 Hz bursts in turn across the physical outputs. This verifies
+device selection, channel count/order, and cabling without depending on a
+client or MIDI mapping.
+
+The server reports selected device, sample rate, channel count, buffer range,
+callback p50/p99/max, frame count, and stream errors. It prefers a supported
+48 kHz `f32` mode for the selected channel layout and reports when another rate
+is necessary.
+
+After channel bring-up, use the viewer to route selected logical channels and
+exercise Wave/TW at conservative levels. Remember that the default layout gain
+is 0.5 but explicit `haptic.toml` gains override it.
+
+## VST3/DAW integration
+
+Use this only after headless and scripted tests pass.
+
+Build the bundle:
+
+```bash
+cargo xtask bundle haptic-plugin --release
+```
+
+Optionally install it on macOS:
+
+```bash
+mkdir -p "$HOME/Library/Audio/Plug-Ins/VST3"
+ditto target/bundled/haptic-plugin.vst3 \
+  "$HOME/Library/Audio/Plug-Ins/VST3/haptic-plugin.vst3"
+```
+
+Then:
+
+1. Start `haptic-server`; optionally start the viewer.
+2. Load **Haptic Controller** in the target host.
+3. Compare the editor's build hash and protocol version with the bundle under
+   test.
+4. Play MIDI/MPE and automate the patch parameters.
+5. Use the viewer, not the plugin, for whole-server field and routing state.
+
+The plugin reconnects automatically and replays a coherent configuration after
+`HelloAccepted`. Starting the server before the host is convenient but not
+required.
+
+A DAW may retain an old dynamic library after the bundle is replaced. If the
+displayed hash is stale, fully quit and restart the host. Repeated pre-Hello or
+protocol-version errors also indicate that an older client is still loaded.
+
+Plugin log location defaults to:
+
+```text
+/Users/jmz/tmp/log/haptic-vst.log
+```
+
+Override it with `NIH_LOG` where supported by the logging layer.
+
+## Wire notes for custom clients
+
+- Frames are `u32` little-endian length plus a bincode payload in both
+  directions.
+- Enum tags are currently bincode declaration-order `u32` values.
+- Every connection must send the exact current `Hello` before any command and
+  wait for `HelloAccepted`.
+- Protocol v3 has only `Wave` and `TravellingWave`; the second legacy stimulus
+  slot maps to TW.
+- Controllers receive only the acknowledgement and liveness failure.
+- Observers receive continuous status and must keep reading.
+- Copy the checked-in script's current schema or use `haptic-protocol`; do not
+  hardcode an older frame layout.
+
+## Troubleshooting current operation
+
+| Symptom | Likely cause or check |
 |---|---|
-| `cargo not found` | See §0. |
-| Viewer says "waiting for server" | Server not running, or it crashed — check its terminal. The viewer retries every 0.5 s. |
-| Plugin "Disconnected" | The client retries automatically; verify the server is running and its protocol version matches. |
-| Repeated `unexpected end of file` followed by `command before Hello` | The host has loaded a plugin predating the versioned handshake. Compare the editor's build hash with the log, rebuild the bundle, and fully restart the DAW so it unloads the old dynamic library. |
-| No sound on stereo device | Only outputs 1–2 exist; route the channels you want to hear onto them (viewer left/right-click). |
-| Server won't bind socket | Another live server owns `/tmp/haptic-vst.sock`; stop it first. A proven-stale socket is removed automatically. |
-| Observer client disconnected mid-test | It stopped reading status broadcasts — see §3. |
-| Viewer test note becomes a fixed sustained tone after a socket error | This was caused by observer write-side removal bypassing instance cleanup. Current builds buffer temporary backpressure and release viewer-owned voices on every terminal disconnect; rebuild/restart the server if this appears. |
-| Sound on AirPods | No 32-channel device found; the server fell back to the default output device. |
+| `cargo` not found | Activate the rustup environment shown at the top of this document. |
+| Viewer waits for server | Confirm both processes use the same socket path and inspect the server terminal. |
+| Plugin remains disconnected | Confirm protocol/build identity and that the server accepted the instance rather than merely accepting the socket. |
+| No sound on a stereo fallback | Route the desired logical channels to physical outputs 1 and 2 in the viewer. |
+| Server will not bind | Another live process owns the endpoint; stop it or choose an isolated test socket. |
+| Observer is removed during a long test | It is not consuming status fast enough or its bounded backlog remained full; inspect client/server output. |
+| Output comes from an unexpected device | No 32-channel device matched and the server deliberately selected the system default. |
+| VST editor shows an old hash | The DAW still has an older library loaded; replace the bundle and fully restart the host. |

@@ -1,219 +1,327 @@
-# Haptic VST — Status Review & Roadmap
+# Haptic VST Roadmap
 
-*Prepared 2026-07-20 as an implementation handoff brief. Supersedes the phase plans in `docs/planning/minimal-prototype-implementation-guide.md` for prioritisation purposes; that document remains the architectural reference. Historical planning documents live in `docs/planning/`.*
+This is the central planning and implementation-handoff document. It describes
+the system we have, the work that is active or plausibly next, and the research
+questions still worth exploring. Detailed current behaviour belongs in
+`ARCHITECTURE.md` and the feature documents under `docs/`.
 
-## Status update (2026-07-20, post-implementation)
+When work is completed, remove its issue narrative from this file. Fold any new
+capability into the current baseline, move reusable technical learning to the
+relevant design document or `docs/learnings.md`, and leave the execution history
+to tests and Git.
 
-- **MIDI frequency transposition removed (2026-07-22).** Notes now use their
-  standard equal-tempered frequency and are clamped directly to the 20–200 Hz
-  haptic band. Under the project-wide Ableton octave convention, MIDI 60/C3 is
-  261.6 Hz before clamping and therefore outputs at the 200 Hz ceiling. Viewer,
-  scripted-client, and orbit-capture defaults moved from MIDI 60 to MIDI 36
-  (Ableton C1), preserving their previous 65.4 Hz audible pitch. The independent
-  100 Hz hardware `--test-tone` remains unchanged.
+## Project direction
 
-- **Travelling Wave (`tw`/`TW`) implemented (2026-07-22).** Protocol v3 replaces
-  the old in-phase placeholder's enum/VST slot with `TravellingWave`; `Wave`
-  and `TravellingWave` are now the only runtime stimulus types. TW is an
-  allocation-free, eight-voice instantaneous radial phasor pool with the same
-  configurable distance decay as Wave and no delay lines, history, Doppler,
-  source-speed cap, or tail. Speed/fixed-wavelength scale, wavelength, `d0`,
-  and exponent are stable VST parameters and live-update held TW voices using
-  wavenumber/decay ramps. The plugin reconnect snapshot is sequence-checked,
-  snapshots carry effective scale/decay for up to 16 voices, and the viewer
-  and scripted client support `tw`. Closed-form 32-channel, fixed-wavelength,
-  automation, lifecycle, frame-budget, and socket tests cover the model. A
-  release headless 48 kHz/32-channel smoke test completed with p99 131 us and
-  max 253 us. See
-  [`docs/travelling-wave-implementation-plan.md`](docs/travelling-wave-implementation-plan.md).
+The project is a compositional instrument for spatial vibration across a table
+of up to 32 transducers. MIDI and MPE provide note and per-note expression;
+stable VST parameters provide track-level stimulus configuration and DAW
+automation. The server translates those controls into a 32-channel physical
+field in the 20–200 Hz range.
 
-- **Pre-Phase-E hardening tranche 1 complete (2026-07-21).** Added protocol
-  versioning and a mandatory one-shot `Hello`; the server rejects incompatible,
-  pre-handshake, duplicate-ID, and non-finite traffic, while finite normalized
-  values are clamped to their supported ranges. Socket
-  disconnects now reliably enqueue per-instance release/registry cleanup, with
-  command capacity reserved for lifecycle traffic. The plugin callback no longer
-  allocates/formats diagnostics, reads wall time, or locks diagnostic/config
-  mutexes. Delay-line reset is generation-based (no multi-megabyte callback
-  clear), layout reload no longer deallocates on the callback, low-speed release
-  tails drain, short delays retain relative phase, attack-time note-off is
-  continuous, velocity is linear for non-MPE input, and device output is bounded
-  after reconstruction. Every then-current voice appeared in snapshots; the viewer is
-  explicitly labelled as a phase-aligned geometric preview. Audio selection
-  still falls back to the default device but prefers 48 kHz wherever supported.
-  See `docs/code-review-remediation-plan.md` for completed and remaining work.
+The foundational idea is to place each transducer at a coordinate in an
+abstract space and sample a stimulus at those coordinates. The space may be a
+physical table, a more abstract topology, or eventually a mapped body plan.
+Wave-like models are compelling because motion, wavelength, interference, and
+propagation become perceptible and composable relationships rather than merely
+independent channel levels.
 
-- **Held-note reconnect regression fixed (2026-07-21).** Protocol v2 adds
-  `HelloAccepted`; the plugin now marks a connection and increments its
-  reconnect tracker only after the server has accepted its version, identity,
-  and engine registration. Finite MPE endpoint overshoot is clamped, and an
-  invalid post-handshake control sample is dropped without tearing down the
-  held-note connection. Controller sockets receive the one acknowledgement but
-  remain excluded from continuous observer broadcasts.
+Five principles guide development:
 
-- **VST build identity embedded (2026-07-21).** Each plugin build now carries a
-  deterministic source-content hash covering the plugin, shared protocol, and
-  workspace dependency lockfile. The editor displays the hash and protocol
-  version, and both are written to the plugin log at library load and instance
-  initialization, making stale DAW-loaded bundles directly identifiable.
+1. **Composition first.** A useful control must be recordable, editable, or
+   automatable in the Ableton/Push workflow unless it is purely operational.
+2. **Gesture and configuration are different layers.** MIDI/MPE carries note
+   performance; each plugin instance owns the parameters describing the kind of
+   stimulus it emits.
+3. **The server owns system truth.** It owns voices, layout, routing, rendering,
+   and hardware. The plugin is a controller; the viewer is the whole-system
+   observer.
+4. **Real-time behaviour is designed, not hoped for.** Callback work must be
+   allocation-free, lock-free, nonblocking, and bounded.
+5. **Models should remain inspectable.** Mathematical meaning, viewer behaviour,
+   offline tests, and captured output should agree closely enough to make
+   experimentation intelligible.
 
-- **Observer backpressure and stuck-note cleanup fixed (2026-07-21).** Status
-  writes now use a bounded per-client buffer with resumable partial writes;
-  transient nonblocking `WouldBlock` no longer drops the viewer or corrupts
-  framing. Terminal write failures and sustained backlog removal now enter the
-  same retried `DisconnectInstance` path as read-side closure, so a viewer-owned
-  test note cannot remain sounding after its connection disappears.
+## Current baseline
 
-- **Isolated headless server mode (2026-07-21).** `--headless` and
-  `--dummy-audio` run the complete engine against a wall-clocked 48 kHz,
-  32-channel memory sink without opening CoreAudio devices. They default to a
-  per-process `/tmp/haptic-vst-test-<pid>.sock` lock namespace, so production
-  and parallel test servers do not contend. `--socket` and
-  `HAPTIC_SOCKET_PATH` select a stable dedicated test endpoint across the
-  server, viewer, scripted client, and standalone/plugin client. Endpoint
-  collisions remain fail-fast; production singleton protection is unchanged.
+### Runtime architecture
 
-- **Phase A — complete.** All of G1–G5 and velocity disentanglement implemented and unit/integration tested (13 tests). Exit criterion verified against the live server with a scripted MPE lifecycle (note on → bend/pressure/timbre sweeps → note off → panic) over the socket.
-- **Phase B — complete except item 4.** Engine now owned by the audio callback (no locks on the audio path), `rtrb` SPSC command queue drained once per callback, `static mut` replaced with atomics, per-event success logging removed and MPE events unlogged. Health harness reports callback p50/p99/max and stream errors every 5 s; `--test-tone` implemented. 90 s stress at ~770 cmds/s: release build p50 ≈ 2.1 ms / max ≈ 4.5 ms against a ~10.7 ms budget, zero stream errors, zero queue overflows. Item 4 (per-block envelope/MPE processing) deferred — headroom makes it unnecessary for now.
-- **Phase C — complete.** `TransducerLevels` (per-block RMS, 32 logical channels pre-truncation) broadcast at ~60 Hz over the framed protocol; plugin reader thread feeds the egui grid, which renders live levels. Verified end-to-end at 60 Hz.
-- **Housekeeping:** dead `handle_command` removed (shared `From<HapticCommand>` conversion), `rtrb` adopted (crossbeam/parking_lot dropped from the server), stale `ARCHITECTURE.md` sections refreshed. CLAP export remains disabled in the working tree — decision still open.
-- **Phase D — complete.** TOML transducer layout (`haptic.toml`, `--config <path>`): physical metres (required by the wave model), `[table]` dimensions, `[grid]` shorthand plus `[[transducer]]` per-channel position/gain overrides, per-transducer gains applied in the engine. Default layout is a cell-centred 4×8 grid over a nominal 1 m × 2 m table. Hot reload via a 1 Hz mtime watcher feeding a second SPSC ring into the audio callback; invalid edits are rejected and the running layout kept. Verified live: gain edit attenuated a held note ~50× within ~1.5 s and restored cleanly.
-- **Delay-line overflow fixed.** The 1×2 m table exposed a latent bug: worst-case propagation delay (table diagonal at 20 m/s ≈ 112 ms) exceeded the 100 ms delay-line capacity, and the overflow path read the just-written sample (zero delay) instead. Buffers are now 16384 samples (~341 ms @ 48 kHz) with delays clamped, regression-tested. Default wave speed is now 20 m/s (engine and plugin parameter).
-- **Phase visualiser (`haptic-viewer`) implemented.** Standalone eframe/egui binary attached to the server socket as a status client (originally read-only; the test console below made it a full read/write client); works identically with real or dummy audio output. Server broadcasts `ServerStatus::Layout` (on connect + hot reload) and `ServerStatus::VoiceState` (most recent active delay-line voice: frequency, wave speed, source position, amplitude, actual per-transducer delays) at up to 250 Hz. Viewer renders the configured layout as circles; hue = relative phase (zero → blue, OKLCH h≈264°), lightness/chroma = local amplitude with binary-search chroma clamp into the sRGB gamut (clip-free hue sweeps); MPE source shown as a cross; vsync-paced continuous repaint renders at display refresh (120 fps on ProMotion; fps counter on screen). Note: clients that never read status are dropped by design when their socket buffer fills.
-- **Viewer test console + monitor routing.** MPE→source-position mapping now spans the configured table (bend −1..1 → x across width, timbre 0..1 → y along length; centre at bend 0/timbre 0.5) — resolves the earlier disproportion follow-up. The viewer starts/stops a test note (channel 15) with note/velocity/wave-speed sliders (retrigger on release), drag-on-table source placement, and an orbit mode. New `Parameter::MonitorRoute` connects any physical device output to any logical channel (engine applies routing when copying to the device; logical levels/phase stay pre-routing, so all 32 cells visualise even on stereo); left/right-click a cell routes it to output L/R, with badges showing current routing, and `ServerStatus::MonitorRouting` (device channel count + routes) broadcast on connect/change keeps all clients in sync.
-- **Source velocity limit + dual cursors.** The effective source position now chases the MPE-requested position at no more than a fixed fraction of the stimulus's wave speed (`SOURCE_SPEED_FRACTION = 0.8` in `engine.rs`), so the source can never outrun its own waves (an instant MPE jump previously moved delays faster than one sample per sample, reading the delay lines backwards / collapsing the Doppler model). Position snaps at note-on, then advances toward the request at up to 0.8·c; regression-tested. `VoiceState` gained `requested_pos` (protocol change — rebuild server, viewer, and plugin together); the viewer draws a ring at the requested position, a cross at the effective source, and a tether while it catches up.
-- **Orbit pitch-discontinuity + distortion debugged and fixed (buffer-capture verified).** Captures over two orbit periods (headless harness: `orbit_capture_writes_debug_buffers` in `engine.rs`, drives `process_block` with the viewer's exact orbit command stream against a dummy 32-ch sink) showed (a) pitch steps at the orbit period wherever a transducer's propagation delay crossed the 341 ms delay-line capacity clamp — Doppler vanishes while clamped — and (b) an FM sideband comb at the audio-block/MPE-send rate from the stepped position targets. Fixes: the engine now renders at `device_rate / RENDER_DECIMATION` (48 kHz → 1.5 kHz; Nyquist 750 Hz ≫ the 200 Hz band) with per-frame linear upsampling to the device rate, stretching delay capacity to ~10.9 s so the clamp is unreachable for realistic layouts (wave-speed floor lowered to 0.25 m/s, viewer slider aligned); and MPE targets are linearly ramped over their measured arrival spacing then smoothed by two cascaded 15 ms one-poles, making trajectory smoothness independent of client send cadence. Verified: c=1 m/s pitch-jump events 395→1, in-band junk −41.6→−53 dB; c=10 clean to −84 dB; per-sample delay-line cost also dropped 32×.
-- **Polyphase sinc reconstruction filter.** The linear-interp upsampler's images (~−50 dB above 1 kHz) were audible on monitors; replaced with a 512-tap Kaiser-windowed sinc (β=10, 16 taps/branch, cutoff at the internal Nyquist) evaluated polyphase — one filter serves as both interpolator and heavy reconstruction lowpass, unity DC gain per branch, ~5.3 ms group delay. Capture-verified: images fell −50 → −107 dB (f32 noise floor); in-band Doppler/junk metrics unchanged. Design-sanity unit test checks per-branch DC gain and >90 dB first-image rejection.
-- **Delay line switched to scatter-write / sequential-read (2026-07-21).** The delay line was fixed-write / interpolated-read — physically the moving-*listener* model (delay evaluated at reception time), and the reason the source needed a velocity cap to stop the read tap overtaking the write head. For a moving source and fixed listener the correct arrangement is **interpolating writes, fixed reads**: each emitted sample is scattered (2-tap linear, accumulating) into its emission-time arrival slot `n + τᵢ(n)` and a sequential read pointer consumes arrivals. This removes the read-backwards failure mode outright and adds the physically correct Doppler *amplitude* gain (bunched arrivals on approach) the old single-tap read couldn't produce. `SOURCE_SPEED_FRACTION` lowered 0.8 → 0.5 so the scatter arrival index stays monotonic and gap-free (`da/dn ∈ [0.5, 1.5]`) with no special-casing. Distance attenuation moved to the write. Verified: all engine tests pass, a new `scatter_delay_line_shifts_pitch_with_source_motion` unit test pins Doppler direction + amplitude gain, and the c=1 orbit capture shows a clean ~6 s periodic pitch *and* amplitude swing (RMS ~2.4×), bounded output, zero non-finite samples. Design doc §3–§6 updated. Two-rate render, polyphase sinc, MPE smoothing, snapshots, viewer untouched.
-- **Scatter deposit made bandlimited; output headroom trimmed (2026-07-21).** Live testing of the scatter-write line at low wave speed (c=2 m/s, 4 s orbit) surfaced two artifacts, both diagnosed from `orbit_capture` samples: (1) **warble** — the 2-tap linear deposit's gain varies with the fractional arrival phase, so a sweeping delay amplitude-modulates the output into granulation spurs (~−20 dB); (2) **popping** — the (real) Doppler bunching gain stacking on the near-field `1/(1+2d)` gain railed the ±1 clamp on close passes. Fixes: the deposit is now a **windowed-sinc splat** (`SPLAT_TAPS=8`, Kaiser β=9, 128 phases, unit-sum per phase — flat in-band gain < 0.1 dB across phases), cutting granulation spurs ~20 dB in both Doppler directions (isolated A/B: spreading −20→−41 dB, bunching −35→−56 dB; stationary at the −138 dB f32 floor) while keeping the full Doppler amplitude behaviour; and the default per-transducer gain is trimmed to 0.5 (`DEFAULT_TRANSDUCER_GAIN`, −6 dB), sized for the worst-case 2× bunching of an advancing source at the 0.5·c limit. Re-capture: peak 1.03→0.61, railed samples 1586→0. New unit test `splat_kernel_has_unit_dc_and_flat_in_band_gain_across_phases`; config default-gain tests updated. Design doc §3/§6 updated.
-- **Design docs started (2026-07-20).** `docs/doppler-delay-line-design.md` documents the delay-line Doppler source (emergent-Doppler model, stability layers, two-rate architecture, failure-mode history). `docs/syllabary-protocol.md` is a **draft** of the expressive note-type protocol on top of MPE (syllable vocabulary, four-layer control model bounded by Push 3 / Live 12 MPE, per-instance syllable selection, handshake + namespaced-parameter migration plan, configurable attenuation `d0`/`p` as the first namespaced params). Nothing from the draft is implemented; its migration step 1 (handshake + `instance_id`) also fixes a real latent bug — voice identity `(channel, note)` collides across concurrent plugin instances.
-- **Next:** finish the remaining structural hardening in
-  [`docs/code-review-remediation-plan.md`](docs/code-review-remediation-plan.md),
-  especially splitting the server monolith, formal callback allocation
-  instrumentation, bounded per-client decode work, and stable protocol
-  discriminants/capability negotiation. Physical boundary modes and reflected
-  propagation remain outside the Travelling Wave stimulus.
+- A VST3 controller plugin, standalone haptic server, and observer/test viewer
+  communicate over versioned, length-prefixed bincode frames on a Unix socket.
+- Each connection begins with `Hello` and is accepted only after exact protocol
+  version, role, identity, and configuration validation. A controller reports a
+  connection only after `HelloAccepted`.
+- Configuration and voice identity are per instance. Concurrent DAW tracks do
+  not share stimulus type or wave parameters, and voices are keyed by
+  `(instance_id, channel, note)`.
+- Disconnect, voice stealing, note-off, and panic all enter bounded lifecycle
+  paths intended to prevent indefinitely sustained voices.
+- The server audio callback owns the engine. Commands, layout updates, levels,
+  and voice snapshots cross thread boundaries through fixed-capacity rings or
+  bounded queues.
 
-## Architecture direction: multi-instance controllers, per-instance note-type config, observer viewer (design intent, 2026-07-21)
+### Sound and control model
 
-*Captured as the handoff record for the rework begun this session. This is syllabary migration step 1 made concrete.*
+- The engine has eight fixed Wave voices and eight fixed Travelling Wave voices.
+- **Wave** is a moving-source propagation model using per-transducer
+  scatter-write delay lines. It retains in-flight energy, produces Doppler
+  frequency and amplitude behaviour, and limits source motion to half the wave
+  speed to preserve monotonic arrivals.
+- **Travelling Wave (TW)** is an instantaneous radial phasor. It shares source
+  position, envelope, pressure, and distance decay with Wave, but has no delay
+  history, Doppler, source-speed cap, or propagation tail. Its spatial scale can
+  be expressed as speed or fixed wavelength and automated live.
+- MIDI frequencies use standard equal temperament with no transposition, then
+  clamp to the 20–200 Hz haptic band. Note names use Ableton's octave
+  convention; the default test note is MIDI 36 / C1 / 65.4 Hz.
+- Pitch bend maps to source x, CC74/timbre to source y, pressure to intensity,
+  and strike velocity to amplitude. Stimulus type, scale, and distance decay
+  are stable DAW parameters.
 
-**The problem (diagnosed from the code, not just symptoms).** The parameter channel is **write-only and unsynchronised**: `Parameter::WaveSpeed` / `StimulusType` / `MonitorRoute` travel only client→server, and no `ServerStatus` echoes current parameter state back. The server holds one **global** `wave_speed` / `stimulus_type`, applied to new notes at note-on. Both the plugin and the viewer keep their *own* local copy and push to that global, so it is **last-writer-wins** with no reconciliation — the two on-screen values (plugin 20 m/s, viewer 0.31 m/s in the 2026-07-21 screenshot) are disconnected local echoes, neither of which is server truth. Secondary bug: the plugin `wave_speed` FloatParam range is **20–500 m/s**, so the entire interesting low-c Doppler regime is unreachable from the host.
+### Rendering, observation, and operation
 
-**The principle.** Split control by intent: **MIDI/MPE = performance gesture** (which note, how hard, expressive modulation) vs **VST host parameters = configuration** (what *kind* of note this instance emits). Wave speed is config, not gesture — which is why deriving it from note velocity (an earlier, since-removed deviation) was a category error. This rule sorts any future control.
+- The engine always renders 32 logical transducer channels. Monitor routing
+  maps physical device outputs to those logical channels only at the final
+  hardware copy.
+- Physical devices prefer a supported 48 kHz `f32` configuration. If no
+  multichannel device exists, the server deliberately falls back to the default
+  device while retaining all 32 logical channels.
+- The delay engine renders at one thirty-second of the device rate and uses a
+  polyphase sinc reconstruction filter. Wave emissions use a bandlimited sinc
+  scatter kernel and generation-based delay-line clearing.
+- Layout and per-transducer gains come from `haptic.toml` and hot-reload off the
+  audio thread. Invalid updates leave the accepted layout running.
+- The viewer displays all active Wave and TW voices, summed or filtered by
+  instance. Its spatial field is a phase-aligned geometric preview, not an exact
+  reconstruction of synchronized oscillator phase and delay-line history.
+- Headless mode runs the complete engine against a paced 48 kHz, 32-channel
+  memory sink. It uses an isolated per-process socket by default and does not
+  contend with the production server or open audio hardware.
+- Automated tests cover protocol framing and handshakes, connection lifecycle,
+  voice ownership, Wave/TW signal models, routing, layout, reconstruction, and
+  real Unix-socket integration. An opt-in orbit capture provides deeper DSP
+  evidence when propagation behaviour changes.
 
-**The target architecture.** Split by role; the two features below turn out orthogonal once the roles are clean, sharing exactly one enabling primitive — **identity (`instance_id` + note-type) on both commands and status**.
+## Active priorities
 
-- **Plugin = controller/client only.** Owns and displays *its own outgoing configuration* (note type + that type's parameters). The in-plugin RMS grid pseudo-visualiser is **deprecated** — the plugin cannot honestly show system state, so it drops its `TransducerLevels`/`Layout` consumption and becomes (near) pure write-side, plus a connection indicator.
-- **Viewer = observer, 1:1 with the server.** The single renderer of *system* truth: all active voices, the summed field, routing, layout. Gains **filters** — which instance(s)/note-type(s)/voice(s), or the sum.
-- **Per-instance config replaces the global.** Each client registers an `instance_id` + `InstanceConfig` via a **handshake** on connect; notes from that instance inherit *that instance's* config at note-on. No shared global ⇒ no last-writer-wins contention (instance A's notes use A's config, B's use B's). Wave speed is already captured per-*stimulus* at note-on; it just needs to read the owning instance's config instead of a global.
-- **Voice identity becomes `(instance_id, channel, note)`**, fixing the latent cross-instance `(channel, note)` collision.
-- **Squaring multi-instance with the viewer:** many controllers fan *in* to one server; one observer watches the *whole* server (per-server, not per-instance). The only coupling is that the status stream must carry `instance_id`/note-type so the viewer's filters have something to filter on — the same identity primitive the multi-instance work introduces.
+These priorities prepare the existing system for broader stimulus research
+without weakening the real-time or protocol foundations. They are ordered by
+the amount of risk they remove from subsequent work, but can be advanced in
+small independent slices.
 
-**Implementation plan (milestones, committed independently).**
-1. **Plugin wave-speed range fix** — match the engine (0.25–1000 m/s, skewed so sub-20 is reachable). Isolated bug, unblocks low-c testing. ✅ *(done)*
-2. **Protocol** (`haptic-protocol`) — `HapticCommand::Hello { instance_id, role, config }`; `InstanceConfig { stimulus_type, wave_speed }`; `ClientRole { Controller, Observer }` (gates status delivery); replaced the single-voice `VoiceState` with a multi-voice `ActiveVoices` carrying per-voice `VoiceInfo` (`instance_id` + `note_type`, compact — the viewer recomputes phase/amplitude geometrically, so the 32-float delay array is dropped). `MonitorRoute` stays server-global. ✅ *(done — Hello/ActiveVoices roundtrip + frame-budget tests)*
-3. **Server** (`haptic-server`) — per-connection `instance_id` bound on `Hello` and stamped onto every command (`EngineCommand::from_wire`); fixed-capacity instance→config registry in the engine (linear scan, no audio-thread alloc); per-instance config applied at note-on; `(instance_id, channel, note)` voice identity; all active voices broadcast tagged with identity; status delivery gated by role (observers are streamed status, controllers receive only `HelloAccepted`). ✅ *(done — multi-instance isolation + socket handshake/stamping/gating tests)*
-4. **Plugin client-mode** — sends `Hello` (Controller) + config on connect; waits for `HelloAccepted`, then remains command-only apart from connection liveness checks; editor shows only connection status + this instance's note-type config (RMS grid deleted). ✅ *(done)*
-5. **Viewer** — sends `Hello` (Observer); consumes `ActiveVoices`; renders the summed complex field across voices (interference-correct) and per-voice cursors; a filter picker narrows to a single instance or sums all; its test console is its own instance, so its wave-speed slider no longer fights the plugin. ✅ *(done)*
+### 1. Make the server easier to extend
 
-Notes: coordinated protocol change — server, viewer and plugin rebuilt together. Interim server→client parameter echo deliberately skipped (per-instance config supersedes it). "Note type" is, for now, the `InstanceConfig` bundle (stimulus type + params) tagged by `instance_id`; note-type *filtering* is plumbed (`VoiceInfo.note_type`) but degenerate while all wave voices are `Wave` — it becomes meaningful as the syllabary vocabulary lands on the same identity primitive. Still open: the inverted `requested` vertical axis (trivial timbre→y flip); CLAP export; a human-readable instance label in the viewer's filter (currently a short id hash).
+`haptic-server/src/engine.rs` currently owns voice lifecycle, instance
+configuration, Wave and TW implementation, delay DSP, reconstruction, routing,
+snapshot construction, and much of their test suite. The fixed-capacity design
+is appropriate, but the concentration of responsibilities makes every new
+stimulus more difficult to review and increases the chance of missing one
+lifecycle path.
 
-> **Historical baseline below.** Sections 1–5 capture the 2026-07-20 audit and
-> the Phase A–E plan that drove the completed work summarized above. Statements
-> describing the “current” implementation in those sections are retained as
-> history and are not the present state. Current priorities are the status
-> update above and `docs/code-review-remediation-plan.md`.
+Work toward modules for:
 
-## 1. Where this codebase sits among the planning documents
+- voice ownership, allocation, stealing, release, and disconnect cleanup;
+- reusable envelope and controller smoothing;
+- Wave and TW stimulus implementations;
+- delay-line and scatter-kernel DSP;
+- device-rate reconstruction and output safety;
+- monitor routing; and
+- observer snapshots.
 
-Three architectures were planned across the project's documents:
+The split must be behavioural: do not introduce trait objects, dynamic
+allocation, shared locks, or cross-module abstractions that obscure callback
+cost. Move one coherent subsystem at a time while its existing tests remain
+green.
 
-1. **Single-plugin VST** ("Haptic VST Implementation Plan") — everything in one plugin. *Not implemented.*
-2. **Static Allocation Architecture** — rich stimulus engine design (ADSR, ParameterMapping, SpatialSweep, ChaoticNetwork, TransducerConfig with gain reduction). *Ancestor design; partially carried forward in simplified form.*
-3. **Hybrid / Minimal Prototype** ("Haptic VST Minimal Prototype - Implementation Guide", now at `docs/planning/minimal-prototype-implementation-guide.md`) — VST controller plugin + standalone haptic server over a Unix socket. **This is what the repo implements.**
+**Next move:** extract the delay-line/scatter kernel and reconstruction code
+with no numerical changes, then establish narrow module-level tests around the
+extracted interfaces.
 
-The implementation deliberately simplified the Static Allocation design when porting into the hybrid layout: ADSR became a fixed-time attack/sustain/release envelope, SpatialSweep and ChaoticNetwork were dropped in favour of a StandingWaveStimulus stub, and ParameterMapping and TransducerConfig were omitted.
+**Done when:** adding a fixed-capacity stimulus does not require modifying
+unrelated delay, routing, or reconstruction internals, and every lifecycle path
+has one obvious owner.
 
-### Deviations from the minimal prototype spec (deliberate, from git history)
+### 2. Make callback safety measurable
 
-- `SetWaveSpeed` command and plugin parameter removed; wave speed is now derived per-stimulus from note velocity (20–500 m/s over velocity 0–127).
-- Delay buffers moved to heap (`Box<[f32; 4800]>`) to fix a server stack overflow.
-- `rtrb` ring buffer replaced with `crossbeam_channel::unbounded` for the IPC→audio command path (rtrb remains an unused workspace dependency).
-- nih-plug and egui-baseview are consumed from forks (`github.com/jmz1/nih-plug`) carrying a macOS baseview crash fix; a standalone build target (`haptic-plugin-standalone`) was added and works.
-- CLAP export commented out (uncommitted working-tree change); VST3 only at present.
-- Extensive `nih_log!` diagnostics added throughout the plugin; log defaults to `/Users/jmz/tmp/log/haptic-vst.log`.
+The callback has been manually hardened, but its allocation-free property is
+still an architectural claim rather than a continuously checked invariant.
+The most important cases are not only steady rendering: allocation, voice
+stealing, panic, reconnect configuration, layout replacement, and delayed-tail
+cleanup must also remain bounded.
 
-## 2. Current feature set
+Add a focused harness capable of detecting allocation and deallocation while
+exercising both server and plugin callback-critical paths. Keep timing evidence
+separate from allocation evidence: callback histograms describe latency on a
+given machine, while an allocator guard should provide a deterministic failure
+when forbidden memory activity occurs.
 
-**Working:**
-- Cargo workspace: `haptic-protocol`, `haptic-server`, `haptic-plugin`, `haptic-plugin-standalone`, `xtask` (nih_plug_xtask bundling).
-- Plugin: VST3 + standalone; forwards NoteOn / NoteOff / PolyPressure / MidiPitchBend to the server as bincode `HapticCommand`s via a dedicated IPC worker thread; egui GUI with connection status and a static 4×8 transducer grid.
-- Server: cpal output with 32-channel device discovery and stereo fallback; Unix-socket listener with multi-client support; stimulus engine with WaveStimulus pool (8) and StandingWaveStimulus pool (4); velocity-based routing (< 64 → wave, ≥ 64 → standing); delay-line wave propagation with fractional (linear-interpolated) delays, distance attenuation and output clamping; Ctrl-C shutdown.
+**Next move:** choose a test-only allocator instrumentation strategy and pin
+server note bursts, voice stealing, panic, and layout application before
+covering the plugin callback.
 
-**Notable emergent property:** delay distances are recomputed every sample from the MPE-driven source position, so a moving source already produces genuine Doppler shift through the delay lines. No explicit Doppler code is needed — this should be preserved and validated, not reimplemented.
+**Done when:** the important callback transitions fail a test if they allocate,
+deallocate, lock, block, format, or log, and the ordinary 64-frame processing
+case remains covered.
 
-## 3. Gap analysis
+### 3. Bound and simplify transport work
 
-### Blocking playability
-| # | Issue | Location |
-|---|-------|----------|
-| G1 | **Note-off unimplemented.** No note→stimulus mapping; `EngineCommand::NoteOff` is a TODO. Stimuli sustain until pool exhaustion or Panic. | `haptic-server/src/engine.rs` |
-| G2 | **MPE updates dropped by server.** `EngineCommand::MpeUpdate` falls into the `_ => {}` arm; `mpe_update()` on stimuli is never called. | `engine.rs` `process()` |
-| G3 | **Plugin has no per-channel MPE state.** Each event overwrites the other MPE dimensions with defaults (a pitch-bend update sends `pressure: 1.0`, `timbre: 0.5`). Needs a per-channel `MpeData` cache merged into each outgoing update. | `haptic-plugin/src/lib.rs` |
-| G4 | **No IPC message framing.** Server does one `read()` → one `deserialize`. Coalesced or fragmented messages are corrupted or silently dropped — will bite as soon as MPE update rates rise. Needs length-prefixed framing on both ends. | `haptic-server/src/ipc.rs`, `haptic-plugin/src/ipc_client.rs` |
-| G5 | **Frequency mapping is audio-centric.** Resolved by deliberate direct mapping: standard equal-tempered MIDI frequency, no transposition, hard-clamped to 20–200 Hz. | `engine.rs` `note_on()` |
+Framing, handshake validation, partial nonblocking writes, and disconnect
+cleanup are in place. Read-side work still needs an explicit per-client budget:
+one busy sender should not monopolise an IPC iteration or delay status delivery
+to other clients. Buffer handling should also avoid repeated front-of-vector
+drains as traffic grows.
 
-### Real-time hygiene
-| # | Issue | Location |
-|---|-------|----------|
-| R1 | Engine wrapped in `Arc<Mutex>` with `try_lock` **per sample** in the audio callback; contention yields silent samples, and locking per sample is needless overhead. Restructure to lock once per callback (or eliminate the mutex entirely by owning the engine in the callback and feeding it via a lock-free queue). | `haptic-server/src/audio.rs` |
-| R2 | Command queue is `crossbeam_channel::unbounded` (heap-allocating sends, unbounded growth). Restore the planned `rtrb` SPSC ring buffer (already a workspace dep). | `engine.rs` |
-| R3 | Command draining happens inside per-sample `process()`; move to once per callback block. | `engine.rs` / `audio.rs` |
-| R4 | `static mut LOG_COUNTER` in plugin `process()` — unsound pattern; replace with `AtomicU32` or remove with the debug logging. | `haptic-plugin/src/lib.rs` |
-| R5 | Hot-path `nih_log!` calls on every MIDI event (and per-event socket sends) should be feature-gated or trace-level before performance work is meaningful. | `haptic-plugin/src/lib.rs` |
-| R6 | IPC listener polls with 1 ms sleep; timestamps are sent but never used for scheduling. Acceptable short-term; note as a latency floor. | `ipc.rs` |
+The intended change is operational rather than a transport rewrite:
 
-### Missing planned subsystems
-- **Status feedback (server→plugin):** `ServerStatus::TransducerLevels` and `PerformanceMetrics` exist in the protocol but are never sent or read; GUI grid is a placeholder.
-- **Configuration:** transducer layout hardcoded (4×8 grid, 5 cm pitch → 35 × 15 cm, far smaller than a body-sized table); no TOML config, gains/calibration, or hot reload.
-- **Envelope:** fixed 100 ms attack / 500 ms release; no ADSR, no velocity or MPE shaping.
-- **StandingWaveStimulus** outputs all transducers in phase — a placeholder, not a standing wave (no spatial node/antinode structure).
-- **Stimulus research track** (project outline): phasor-representation wave model, SpatialSweep, ChaoticNetwork — none started; the outline names "what wave model is computationally practical in real time" as the top research priority.
-- Docs partially stale: `ARCHITECTURE.md` still shows `MidiConfig` and pool details from earlier revisions; `BUILD.md`/`RUST_BUILD_GUIDE.md` should be re-verified after the next dependency touch.
+- cap bytes, frames, or commands decoded per client per iteration;
+- retain partial frames across iterations;
+- use read and compaction cursors instead of frequent prefix removal;
+- preserve lifecycle capacity under parameter or MPE floods; and
+- add fairness and fragmented/coalesced-frame tests.
 
-## 4. Prioritised work plan
+**Next move:** measure the current loop structure, define a conservative decode
+budget, and add a two-client test in which a flooding controller cannot starve
+an observer or another controller.
 
-Context for prioritisation: a multichannel interface is available but the table is not yet built, so validation is via metering, recording and visualisation rather than skin. Chosen focus: **playable end-to-end first, then real-time robustness.**
+**Done when:** per-client read, decode, and write work is explicitly bounded,
+partial frames remain correct, and one client cannot starve cleanup or status
+publication.
 
-### Phase A — Playable end-to-end
-1. **Note lifecycle (G1).** Add a `(channel, note) → (pool, slot)` map in the engine (fixed-size array, no allocation). Route NoteOff to the owning stimulus's `note_off()`; handle voice stealing when pools are full (steal oldest-in-release, else oldest).
-2. **MPE state tracking in plugin (G3).** Per-channel `MpeData` cache (16 entries); merge each incoming dimension and send the merged struct. Include initial pitch-bend/timbre state at NoteOn.
-3. **MPE routing in server (G2).** Deliver `MpeUpdate` to stimuli owned by that channel via the note map from step 1. Apply simple one-pole smoothing to decoded MPE values in the stimulus (the existing `JMZTODO` in `engine.rs`).
-4. **IPC framing (G4).** Length-prefixed (u32 LE) bincode frames both directions; accumulating read buffer on the server; bounded write with disconnect detection on the client.
-5. **Haptic frequency mapping (G5).** Implemented as standard equal-tempered MIDI frequency with no transposition and 20–200 Hz min/max clamps. MIDI 60 (Ableton C3) consequently reaches the 200 Hz ceiling.
-6. **Disentangle velocity overloading.** Velocity currently sets amplitude *and* wave speed *and* stimulus type. Keep velocity→amplitude; move stimulus-type selection and wave speed to plugin parameters (restores DAW automation, which the current design lost when `SetWaveSpeed` was removed). Requires a `SetParameter`-style command in the protocol.
+### 4. Publish accepted configuration state
 
-*Exit criterion: a held MPE note can be started, bent, pressed, moved and released, with correct per-note behaviour, verified by recording the 32-channel output (or metering) — no hangs, no stuck notes, no dropped MPE.*
+Layout updates currently travel to the engine and observer side through
+separate bounded paths. Monitor routing and layout displays should derive from
+state the engine has actually accepted, not from an optimistic IPC-thread
+mirror. This matters increasingly once configuration becomes richer or updates
+can be rejected.
 
-### Phase B — Real-time robustness
-1. Own the engine inside the audio callback; replace `Arc<Mutex>` + per-sample `try_lock` with an `rtrb` SPSC command queue drained once per callback (R1–R3).
-2. Replace `static mut` counter with atomics; gate hot-path logging behind a feature flag or `nih_trace!` (R4, R5).
-3. Add a simple latency/health harness: server prints buffer underruns and callback timing percentiles; a `--test-tone` mode that plays a known pattern across all 32 channels for interface bring-up (valuable with interface-only hardware).
-4. Process in blocks rather than per-sample where possible (envelope and MPE smoothing per block, oscillator phase per sample).
+Replace split best-effort publication with a small versioned accepted-state
+snapshot or acknowledgement path. Preserve off-callback parsing and avoid
+deallocating replaced state on the audio thread.
 
-*Exit criterion: no allocation, locking, or logging in the audio callback; clean 30-minute run at 48 kHz / 64-sample buffers with zero underruns while spamming MPE.*
+**Next move:** document the ownership and failure semantics of the existing
+layout and routing paths, then design the smallest versioned state publication
+that covers both.
 
-### Phase C — Feedback & visualisation (next after A/B)
-- Implement `ServerStatus::TransducerLevels` broadcast (~60 Hz, decimated RMS per transducer) using the framing from A4; render live levels in the egui grid. This becomes the primary validation instrument until the table exists.
+**Done when:** the viewer cannot display a layout or route the engine rejected,
+and dropped intermediate updates converge to the latest accepted state.
 
-### Phase D — Configuration
-- TOML transducer layout + per-transducer gain (the Static Allocation design's `TransducerConfig` is the model), hot reload via a config-swap command, realistic default layout sized for the actual table.
+## Next horizon
 
-### Phase E — Stimulus research track
-- Proper standing-wave stimulus (spatial phase structure), SpatialSweep with path definition, and the phasor-representation wave model experiment from the project outline. Recommend prototyping the phasor model offline (plot/render fields) before committing it to the real-time engine.
+### Stable protocol identifiers and capability negotiation
 
-## 5. Housekeeping
-- Decide the fate of the uncommitted change disabling CLAP export (commit it with rationale, or restore CLAP).
-- Remove or `#[cfg]`-gate dead code paths (`StimulusEngine::handle_command`, unused `rtrb` dep until Phase B re-adopts it).
-- Refresh `ARCHITECTURE.md` after Phase A (note map, framing, parameter flow) and keep `docs/planning/minimal-prototype-implementation-guide.md` as the historical handoff.
+Exact protocol version matching prevents silent bincode incompatibility, but
+enum declaration order is still the wire identity. Before third-party clients,
+dynamic descriptors, or a larger stimulus vocabulary, introduce explicit
+stable discriminants and a capability exchange. This should be designed after
+the server boundaries are clearer, because protocol types should reflect stable
+ownership rather than the current monolith.
+
+The design must also reconcile dynamic server descriptions with VST3's fixed
+host-visible parameter IDs. Candidate approaches include a stable superset of
+parameters, generic fixed slots, or separate plugin classes. Runtime addition
+of arbitrary DAW parameters is not a viable assumption.
+
+### Syllabary and expressive note vocabulary
+
+The longer-term composition model treats each stimulus family as a “syllable”:
+a small, nameable combination of synthesis model, MPE bindings, and stable
+track-level parameters. Wave and TW are the first concrete vocabulary. The
+next step is not immediately a generic descriptor protocol; it is to use real
+composition experiments to identify the next one or two useful syllables and
+the common lifecycle they actually require.
+
+The current design direction and open questions live in
+[`docs/composition.md`](docs/composition.md).
+
+### Hardware and perceptual validation
+
+Most correctness evidence currently comes from unit tests, headless runs,
+viewer geometry, monitoring, and buffer capture. When the table and interface
+are available, establish repeatable physical bring-up and calibration:
+
+- verify channel order, polarity, gain, and transducer heterogeneity;
+- measure usable output and resonances across 20–200 Hz;
+- evaluate the perceptual consequences of Wave motion, TW wavelength, decay,
+  and multi-voice headroom; and
+- feed measured constraints back into safe defaults rather than embedding
+  machine-specific assumptions in the synthesis model.
+
+## Research directions
+
+These are valuable questions, not scheduled features.
+
+### Boundaries, reflections, and richer spaces
+
+Wave currently models a point source propagating directly to fixed
+transducers; TW supplies an instantaneous radial phase field. Neither models
+physical table boundaries or reflections. Possible future work includes image
+sources, modal/standing structures, spatially varying wave speed or damping,
+and non-Euclidean coordinate spaces. Any candidate should first be formulated
+and rendered offline, with its perceptual purpose stated, before entering the
+real-time engine.
+
+This does not imply restoring the removed in-phase “Standing” placeholder. A
+future modal or reflected model would be a new, explicitly defined stimulus.
+
+### Body layouts and calibration layers
+
+The current layout is geometric and transducer-centric. A later translation
+layer may describe body plans, heterogeneous actuator types, local sensory
+sensitivity, or mappings from abstract spaces such as a torus or connectome.
+The central question is where calibration ends and composition begins: hardware
+compensation should not silently rewrite an authored spatial relationship.
+
+### Reactive and analysed inputs
+
+Max for Live or another DAW-side layer can translate audio analysis into stable
+VST automation without placing a general analysis or modulation engine in the
+server. Composition experiments should determine which reactive sources are
+musically useful before the wire protocol grows dedicated modulation concepts.
+
+### Output conditioning
+
+Potential high-pass filtering, DC protection, limiter policy, calibration EQ,
+and reconstruction changes should be treated as one output-safety problem.
+Any filter must be measured for phase, group delay, headroom, and interaction
+with the existing sinc reconstruction rather than added as an isolated fix.
+
+## Open decisions
+
+- **Plugin formats:** VST3 is the supported export. CLAP remains disabled; only
+  revisit it when there is a concrete host or distribution need.
+- **Human-readable instance identity:** the viewer currently exposes shortened
+  generated IDs. Track or scene labels would improve multi-instance sessions,
+  but ownership and persistence semantics need definition.
+- **Viewer vertical orientation:** confirm whether increasing timbre should map
+  toward the viewer's visual top or bottom and make the requested/effective
+  cursor convention consistent.
+- **Frequency expression:** note pitch is latched at note-on and pitch bend is
+  spatial x. A later syllable may need continuous pitch, but it should not take
+  that dimension away from existing stimuli without an explicit binding model.
+
+## Deferred or excluded
+
+- A DAW plugin that owns the audio device and complete synthesis engine: the
+  controller/server split is the established architecture.
+- Dynamic allocation or unbounded polyphony in the server callback.
+- A hidden compatibility implementation of the removed Standing placeholder.
+- Exact viewer reconstruction of Wave delay-line history without enough
+  synchronized engine state to make the claim truthful.
+- OSC, network transport, MIDI 2.0 discovery, or a general server modulation
+  matrix without a demonstrated composition need.
+
+## Related documents
+
+- [`README.md`](README.md) — project introduction and reading map.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — current runtime architecture and
+  real-time contracts.
+- [`docs/wave.md`](docs/wave.md) — delay-line Wave model.
+- [`docs/travelling-wave.md`](docs/travelling-wave.md) — instantaneous TW model.
+- [`docs/composition.md`](docs/composition.md) — composition workflow and
+  syllabary direction.
+- [`docs/learnings.md`](docs/learnings.md) — reusable lessons from completed
+  investigations.
+- [`BUILD.md`](BUILD.md) and [`TESTING.md`](TESTING.md) — build and verification
+  workflows.
+- [`docs/planning/README.md`](docs/planning/README.md) — frozen historical plans;
+  useful for provenance, not current state.

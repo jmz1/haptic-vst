@@ -1,732 +1,307 @@
-# Haptic VST Architecture and Rust Guide
+# Haptic VST Architecture
 
-This document explains the architecture of the 32-channel haptic VST plugin system and comprehensively covers the Rust features, syntax, and idioms used throughout the project.
+This document describes the system that runs now. Project direction and future
+work live in [`ROADMAP.md`](ROADMAP.md); build and operational procedures live
+in [`BUILD.md`](BUILD.md) and [`TESTING.md`](TESTING.md).
 
-Implementation status and priorities live in `ROADMAP.md`; the active hardening
-sequence lives in `docs/code-review-remediation-plan.md`. Code excerpts in the
-Rust-language tutorial sections are illustrative, while the “Data flow
-(current)” section below is the concise runtime reference.
+## System shape
 
-## Table of Contents
+Haptic VST separates DAW integration from real-time audio-device ownership.
+Many controller instances can send notes and configuration to one server, while
+one or more observers can inspect the server's combined state.
 
-1. [Project Overview](#project-overview)
-2. [Architecture Overview](#architecture-overview)
-3. [Rust Fundamentals Used](#rust-fundamentals-used)
-4. [Module-by-Module Analysis](#module-by-module-analysis)
-5. [Key Rust Patterns and Idioms](#key-rust-patterns-and-idioms)
-6. [Thread Safety and Concurrency](#thread-safety-and-concurrency)
-7. [Memory Management](#memory-management)
-8. [Error Handling](#error-handling)
-9. [Building and Running](#building-and-running)
-
-## Project Overview
-
-This is a real-time haptic stimulus system consisting of:
-- **VST3 Plugin**: A digital audio workstation (DAW) plugin that receives MIDI input
-- **Server Application**: A real-time audio processing engine that drives 32 haptic transducers
-- **IPC Protocol**: Inter-process communication between plugin and server via Unix domain sockets
-
-The system converts MIDI notes into spatial haptic stimuli with wave propagation simulation.
-
-## Architecture Overview
-
-```
-┌─────────────────┐    Unix Socket    ┌──────────────────┐
-│   VST3 Plugin   │ ──────────────→   │   Haptic Server  │
-│                 │   (IPC Protocol)  │                  │
-│ • MIDI Input    │                   │ • Stimulus Engine│
-│ • GUI Interface │                   │ • Audio Output   │
-│ • Parameter Ctrl│                   │ • 32 Channels    │
-└─────────────────┘                   └──────────────────┘
-                                              ▲
-                                              │ observer status + test control
-                                      ┌───────┴────────┐
-                                      │ Haptic Viewer  │
-                                      └────────────────┘
-        │                                       │
-        │                                       │
-    ┌───▼───┐                               ┌───▼────┐
-    │  DAW  │                               │ Audio  │
-    │       │                               │Hardware│
-    └───────┘                               └────────┘
+```text
+ Ableton / VST host
+        │ MIDI + MPE + automation
+        ▼
+ ┌───────────────────┐        framed Unix socket
+ │ Haptic Controller │ ─────────────────────────────┐
+ │ one per DAW track │                              │
+ └───────────────────┘                              ▼
+                                             ┌───────────────┐
+ ┌───────────────────┐   status + test       │ haptic-server │
+ │   haptic-viewer   │ ◀───────────────────▶ │ 32-ch engine  │
+ │ observer + console│                       └───────┬───────┘
+ └───────────────────┘                               │
+                                             monitor routing
+                                                     │
+                                                     ▼
+                                                audio device
 ```
 
-### Components
+The split establishes clear ownership:
 
-1. **haptic-protocol**: Shared data structures, message framing, and communication protocol
-2. **haptic-plugin**: VST3 plugin with GUI and MIDI processing
-3. **haptic-server**: Real-time audio engine with haptic stimulus generation
-4. **haptic-viewer**: Whole-server observer, geometric field preview, routing UI, and test console
-5. **haptic-plugin-standalone**: Standalone host for the controller plugin
+- The **plugin** owns one track's outgoing patch and translates host events to
+  commands. It does not claim to display whole-system state.
+- The **server** owns instance registration, voices, synthesis, layout, routing,
+  status publication, and the physical audio device.
+- The **viewer** is an observer of server state. Its test console is also a
+  controller instance with its own identity and configuration.
+- The **protocol crate** is the shared boundary. A protocol change is not
+  complete until every producer and consumer agrees.
 
-### Data flow (current)
+## Workspace map
 
-- **MIDI → plugin**: The plugin keeps a per-channel `MpeData` cache (16 entries). Each
-  incoming event (note on/off, poly/channel pressure, pitch bend, CC74 timbre) merges one
-  dimension into the cache, and the full merged struct is sent so no dimension is ever
-  overwritten with defaults. Note-on seeds pressure at unity for non-MPE
-  keyboards; strike velocity independently controls amplitude.
-- **Plugin → server IPC**: `HapticCommand`s are bincode-serialized into length-prefixed
-  (u32 LE) frames over a Unix socket. A dedicated worker thread owns the socket; the audio
-  thread hands it commands through a bounded channel (drops when full, never blocks).
-  The server reassembles frames with `FrameDecoder`, so coalesced or fragmented reads are
-  handled correctly. Every connection begins with an exact-version `Hello`; identity and
-  role are bound once and confirmed with `HelloAccepted` before the client reports itself
-  connected. Disconnect releases that instance's voices.
-- **Observer output**: framed status messages use bounded per-client buffers. Nonblocking
-  partial writes resume at the saved cursor; temporary backpressure is not a disconnect.
-  Terminal failure or sustained backlog enters the same retried per-instance cleanup path as
-  a read-side closure, preventing observer-owned test notes from sticking.
-- **Parameters**: stimulus type (`Wave`/`TravellingWave`), wave speed, TW
-  scale mode/wavelength, and shared distance-decay knee/exponent are stable
-  DAW-automatable parameters pushed as `SetParameter` commands. Wave speed is
-  latched for delay-line Wave voices but live/ramped for TW; decay is live for
-  new Wave emissions and direct TW output. Velocity maps to amplitude only.
-- **Server engine**: The IPC thread pushes `EngineCommand`s into an `rtrb` SPSC ring
-  buffer. The `StimulusEngine` is owned by the cpal audio callback (no locks on the audio
-  path) and drains the queue once per callback. A `(channel, note) → pool slot` ownership
-  map keyed by `(instance_id, channel, note)` routes note-off and MPE updates to the owning stimulus and implements voice stealing
-  (oldest-in-release first, else oldest). MIDI notes map to the 20–200 Hz haptic band
-  (standard equal temperament with no transposition, clamped to 20–200 Hz);
-  MIDI 60 / Ableton C3 therefore saturates at 200 Hz. MPE values are one-pole smoothed
-  inside each stimulus (~15 ms). The engine has two fixed eight-voice pools:
-  `WaveStimulus` uses scatter-write delay lines and `TravellingWaveStimulus`
-  evaluates an instantaneous radial phasor without propagation history,
-  Doppler, source-speed limiting, or a delay tail.
-- **Health**: the audio callback records timing into lock-free histogram stats, reported
-  every 5 s by a monitor thread; `--test-tone` plays a channel-cycling burst pattern for
-  interface bring-up.
-- **Headless profiles**: `--headless`/`--dummy-audio` replace CPAL with a
-  wall-clocked 48 kHz, 32-channel memory sink while leaving the engine, rings,
-  snapshots, and IPC active. Test profiles default to a per-process Unix socket;
-  `--socket`/`HAPTIC_SOCKET_PATH` select a stable dedicated endpoint. Test runs
-  therefore neither acquire the production socket singleton nor open hardware.
+| Path | Responsibility |
+|---|---|
+| `haptic-protocol` | Wire commands/status, frame codec, shared limits, stimulus configuration, and geometric TW helpers. |
+| `haptic-server` | IPC listener, connection lifecycle, fixed-capacity stimulus engine, CPAL output, layout loading, and headless sink. |
+| `haptic-plugin` | VST3 controller, MIDI/MPE merge state, automatable parameters, reconnect worker, and editor. |
+| `haptic-plugin-standalone` | Standalone host for the same controller plugin. |
+| `haptic-viewer` | Server observer, field visualisation, instance filtering, monitor routing, and test console. |
+| `xtask` | VST3 bundling commands. |
+| `tools/test_note.py` | DAW-free scripted protocol client. |
 
-## Rust Fundamentals Used
+The server is still concentrated in `haptic-server/src/engine.rs`; splitting
+its lifecycle, DSP, reconstruction, routing, and snapshot responsibilities is
+an active roadmap priority.
 
-### 1. Ownership and Borrowing
+## Protocol and connection lifecycle
 
-**Concept**: Rust's memory safety without garbage collection through ownership rules.
+Transport is a Unix-domain stream socket. Each message is:
 
-```rust
-// Ownership transfer (move)
-let (engine, command_producer) = StimulusEngine::new();
-// `engine` is later moved into the audio callback closure
-
-// Borrowing (references)
-fn process_audio(engine: &mut StimulusEngine) { // Mutable borrow
-    // Use engine without taking ownership
-}
-
-// Immutable reference
-fn read_config(config: &Config) { // Immutable borrow
-    // Can read but not modify
-}
+```text
+u32 little-endian payload length
+bincode payload
 ```
 
-**In our project**: Used extensively for passing audio buffers, configuration data, and sharing state between threads.
+The frame decoder accumulates fragmented reads and can yield multiple coalesced
+frames. Frames are bounded by the shared maximum size.
 
-### 2. Lifetimes
+Every connection must begin with exactly one `Hello` containing:
 
-**Concept**: Annotations that ensure references are valid for as long as needed.
+- the exact `PROTOCOL_VERSION`;
+- a client-supplied `instance_id`;
+- `Controller` or `Observer` role; and
+- the instance's initial `InstanceConfig`.
 
-```rust
-// From haptic-server/src/engine.rs
-pub struct ProcessContext<'a> {
-    pub sample_rate: f32,
-    pub dt: f32,
-    pub transducer_positions: &'a [(f32, f32); TRANSDUCER_COUNT],
-    //                        ^^^ Lifetime annotation
-}
+The server validates the handshake, rejects a duplicate live identity, reserves
+an engine registry slot, and replies with `HelloAccepted`. A plugin only marks
+itself connected after receiving that acknowledgement. Commands before `Hello`,
+incompatible versions, and invalid non-finite values are rejected before they
+reach the audio-thread queue. Finite control values are clamped to shared
+bounds where the protocol defines a bounded domain.
+
+Later commands do not carry an instance ID. The IPC layer stamps them with the
+identity bound to their connection before creating an internal
+`EngineCommand`. This prevents a client from controlling another instance's
+voices.
+
+Voice identity is:
+
+```text
+(instance_id, MIDI channel, MIDI note)
 ```
 
-**Explanation**: The `'a` lifetime ensures that `ProcessContext` cannot outlive the data it references. This prevents dangling pointers at compile time.
+On terminal connection loss the IPC layer retries a `DisconnectInstance`
+command until the engine can accept it. The engine releases the instance's
+voices and reclaims its fixed registry slot. Critical lifecycle capacity is
+kept available under control-message pressure.
 
-### 3. Traits
+Controllers receive the handshake acknowledgement but no continuous status.
+Observers receive layout, routing, active voices, and transducer levels and
+must continue reading. Status writes use bounded per-client buffers with
+resumable partial writes; temporary `WouldBlock` is backpressure, not immediate
+connection failure.
 
-**Concept**: Similar to interfaces in other languages, defining shared behavior.
+Protocol v3 still derives bincode enum identity from declaration order. Exact
+version matching makes incompatible builds fail clearly, but stable explicit
+discriminants and capability negotiation remain future work.
 
-```rust
-// From haptic-server/src/engine.rs
-pub trait Stimulus: Send + Sync {
-    fn process(&mut self, context: &ProcessContext<'_>) -> [f32; TRANSDUCER_COUNT];
-    fn is_active(&self) -> bool;
-    fn is_releasing(&self) -> bool;
-    fn note_on(&mut self, frequency: f32, velocity: u8, mpe: MpeData);
-    fn note_off(&mut self);
-    fn mpe_update(&mut self, mpe: MpeData);
-    fn reset(&mut self);
-    fn set_wave_speed(&mut self, wave_speed: f32) {}
-}
+## Plugin event and parameter flow
+
+The host calls `HapticPlugin::process()` on its audio thread. The plugin keeps a
+16-entry per-channel `MpeData` cache so an event that changes one expression
+dimension does not reset the others. It translates:
+
+- Note On/Off into voice lifecycle commands;
+- pitch bend into source x;
+- channel/poly pressure into intensity; and
+- CC74/timbre into source y.
+
+Strike velocity controls amplitude independently of pressure. Standard MIDI
+frequency is calculated without transposition and clamped to 20–200 Hz by the
+server. UI note names use Ableton's octave convention, where MIDI 60 is C3.
+
+The callback hands commands to a bounded nonblocking channel owned by the IPC
+worker. A full queue drops noncritical outgoing work instead of blocking the
+host audio thread. The worker owns the socket, handshake, reconnection, and
+configuration replay.
+
+Host-visible parameters are stable even when a selected stimulus does not use
+all of them:
+
+- stimulus type: Wave or Travelling Wave;
+- wave speed;
+- TW scale mode and wavelength; and
+- distance-decay knee and exponent.
+
+Each plugin instance publishes its complete configuration through a
+sequence-checked atomic snapshot. The reconnect worker retries until it reads a
+coherent snapshot; the plugin callback does not lock or allocate to publish it.
+
+Parameter apply timing is part of the sound:
+
+- stimulus type affects new notes;
+- Wave speed is latched for a delay-line Wave voice;
+- TW speed/wavelength mode and spatial scale update held TW voices with a
+  wavenumber ramp; and
+- decay changes affect TW directly and new Wave emissions, while already
+  scheduled Wave energy retains its emission-time gain.
+
+## Server threads and data movement
+
+The server has three principal execution contexts:
+
+1. **Audio callback or dummy-audio loop.** Owns `StimulusEngine`, drains engine
+   commands once per callback, renders audio, and publishes bounded levels and
+   voice snapshots.
+2. **IPC thread.** Owns the listener and clients, validates/decode commands,
+   pushes engine commands, and publishes observer status.
+3. **Configuration watcher.** Polls `haptic.toml` metadata at about 1 Hz,
+   parses changes off the audio thread, and offers accepted candidates to
+   bounded engine/observer paths.
+
+Shutdown is coordinated through an atomic flag. Audio callback timing is
+recorded through lock-free counters and logarithmic histogram buckets; a
+monitor thread formats and reports the results away from the callback.
+
+The important flows are:
+
+```text
+socket command   -> IPC validation -> rtrb command ring -> audio callback
+layout candidate -> config watcher -> bounded layout ring -> audio callback
+logical levels   <- IPC broadcast  <- bounded levels ring <- audio callback
+voice snapshot   <- IPC broadcast  <- bounded snapshot ring <- audio callback
 ```
 
-**Explanation**: 
-- `Send + Sync`: Trait bounds ensuring thread safety
-- All stimulus types must implement these methods
-- Enables polymorphism and code reuse
+## Real-time contract
 
-### 4. Generics and Type Parameters
+The audio callback and per-internal-frame stimulus paths must not:
 
-```rust
-// From haptic-server/src/engine.rs
-pub struct StimulusPool<T: Stimulus + Default, const N: usize> {
-    stimuli: [T; N],
-    active_mask: [bool; N],
-}
-//               ^^^^^^^^^^ Generic type with trait bounds
-//                              ^^^^^^^^^^^^^ Const generic for array size
+- allocate or deallocate;
+- acquire locks;
+- perform blocking operations or I/O;
+- format strings or routinely log;
+- depend on unbounded work supplied by another thread.
+
+The implementation supports this with:
+
+- fixed eight-slot pools for each stimulus type;
+- fixed owner and instance registries;
+- `rtrb` SPSC rings for cross-thread engine state;
+- bounded plugin command transport;
+- generation-tagged delay cells, so reset and panic do not clear megabytes;
+- precomputed FIR and scatter kernels; and
+- explicit drop/coalescing behaviour where noncritical state outruns a queue.
+
+The callback records timing through atomics, but the current project does not
+yet have a formal allocator guard covering every callback transition. That is
+an active roadmap item.
+
+## Engine lifecycle
+
+`StimulusEngine` owns two `StimulusPool`s:
+
+```text
+WaveStimulus             8 slots
+TravellingWaveStimulus   8 slots
 ```
 
-**Explanation**:
-- `T`: Generic type that must implement `Stimulus + Default`
-- `const N: usize`: Compile-time constant for array size
-- Enables code reuse for different stimulus types and pool sizes
-
-### 5. Pattern Matching
-
-```rust
-// From haptic-plugin/src/lib.rs
-match event {
-    NoteEvent::NoteOn { note, velocity, channel, .. } => {
-        let cmd = HapticCommand::NoteOn {
-            timestamp_us,
-            note,
-            velocity: (velocity * 127.0) as u8,
-            channel: channel as u8,
-            mpe: MpeData { /* ... */ },
-        };
-        let _ = client.send_command(cmd);
-    }
-    NoteEvent::NoteOff { note, channel, .. } => {
-        // Handle note off
-    }
-    _ => {} // Catch-all for unhandled events
-}
-```
-
-**Explanation**: Pattern matching is Rust's primary control flow mechanism, more powerful than switch statements in C.
-
-### 6. Error Handling with Result<T, E>
-
-```rust
-// From haptic-server/src/ipc.rs
-pub fn listen_loop(
-    running: Arc<AtomicBool>,
-    mut command_producer: rtrb::Producer<crate::engine::EngineCommand>
-) -> Result<(), Box<dyn std::error::Error>> {
-    //   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Result type
-    
-    let listener = UnixListener::bind(SOCKET_PATH)?;
-    //                                            ^ ? operator for error propagation
-    Ok(())
-}
-```
-
-**Explanation**: Rust uses `Result<T, E>` instead of exceptions. The `?` operator propagates errors up the call stack.
-
-### 7. Smart Pointers
-
-```rust
-// Arc: Atomic Reference Counter for shared ownership across threads
-let stats = Arc::new(AudioStats::new());
-
-// Mutex: Mutual exclusion for thread-safe access (plugin side only;
-// the server audio path is lock-free)
-let ipc_client = Arc::new(Mutex::new(Option::<IpcClient>::None));
-
-// Box: Heap allocation (similar to malloc/new)
-let error: Box<dyn std::error::Error> = Box::new(io_error);
-```
-
-## Module-by-Module Analysis
-
-### haptic-protocol/src/lib.rs
-
-**Purpose**: Shared data structures and constants for IPC communication.
-
-```rust
-use serde::{Deserialize, Serialize};
-//    ^^^^ External crate for serialization
-```
-
-**Key Rust Features**:
-- **Derive macros**: `#[derive(Serialize, Deserialize, Clone, Debug)]`
-  - Automatically generates implementations
-  - Similar to Python's dataclass or C++ template specialization
-  
-- **Enums with data**: 
-```rust
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum HapticCommand {
-    NoteOn {
-        timestamp_us: u64,
-        note: u8,
-        velocity: u8,
-        channel: u8,
-        mpe: MpeData,
-    },
-    NoteOff {
-        timestamp_us: u64,
-        note: u8,
-        channel: u8,
-    },
-    // ...
-}
-```
-**Explanation**: Unlike C enums, Rust enums can carry data. This is similar to tagged unions but type-safe.
-
-- **Struct definitions**:
-```rust
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct MpeData {
-    pub pressure: f32,    // 0.0 to 1.0
-    pub pitch_bend: f32,  // -1.0 to 1.0
-    pub timbre: f32,      // 0.0 to 1.0
-}
-```
-
-### haptic-plugin/src/lib.rs
-
-**Purpose**: Main VST3 plugin implementation using the NIH-plug framework.
-
-**Key Rust Features**:
-
-1. **Struct with trait implementations**:
-```rust
-pub struct HapticPlugin {
-    params: Arc<HapticParams>,
-    ipc_client: Arc<IpcClient>,
-    diag: Arc<Diagnostics>,                 // atomic counters, no callback lock
-    mpe_state: [MpeData; 16],                 // per-channel MPE merge cache
-    last_sent_wave_speed: Option<f32>,        // parameter push tracking
-    last_sent_stimulus_type: Option<StimulusTypeParam>,
-    // TW scale/wavelength and shared decay have equivalent tracking fields
-}
-
-impl Plugin for HapticPlugin {
-    const NAME: &'static str = "Haptic Controller";
-    // ...
-}
-```
-
-2. **Associated constants**: `const NAME: &'static str`
-   - Similar to static class members in C++
-   - `&'static str`: String slice with static lifetime
-
-3. **Option<T> type**:
-```rust
-last_sent_wave_speed: Option<f32>
-//                      ^^^^^^^^^^^ Option for an unsent/cached value
-```
-**Explanation**: Rust doesn't have null pointers. `Option<T>` is an enum: `Some(T)` or `None`.
-
-4. **Closure syntax**:
-```rust
-while let Some(event) = context.next_event() {
-    // Process event
-}
-```
-
-5. **Method chaining and builder pattern**:
-```rust
-FloatParam::new(
-    "Wave Speed",
-    20.0,
-    FloatRange::Skewed {
-        min: 0.25,
-        max: 1000.0,
-        factor: FloatRange::skew_factor(-2.5),
-    }
-)
-```
-
-### haptic-plugin/src/editor.rs
-
-**Purpose**: GUI implementation using egui (immediate mode GUI).
-
-**Key Rust Features**:
-
-1. **Function pointers and closures**:
-```rust
-create_egui_editor(
-    editor_state,
-    params.clone(),
-    |_ctx, _setter| {
-        // Initialize callback
-    },
-    move |egui_ctx, setter, _state| {
-        // Update callback - 'move' captures variables by value
-        // ...
-    },
-)
-```
-
-2. **Move semantics**: `move |args| { ... }`
-   - Transfers ownership of captured variables into the closure
-   - Essential for threading and callbacks
-
-3. **Method chaining for UI**:
-```rust
-ui.horizontal(|ui| {
-    ui.label("Wave Speed (m/s):");
-    ui.add(
-        ParamSlider::for_param(&params.wave_speed, setter).with_width(200.0)
-    );
-});
-```
-
-### haptic-server/src/engine.rs
-
-**Purpose**: Real-time audio processing engine with stimulus generation.
-
-**Key Rust Features**:
-
-1. **Const generics and arrays**:
-```rust
-const TRANSDUCER_COUNT: usize = 32;
-type TransducerArray = [f32; TRANSDUCER_COUNT];
-//                     ^^^^^^^^^^^^^^^^^^^^^^^ Fixed-size array
-```
-
-2. **Default trait implementation**:
-```rust
-#[derive(Default)]
-pub struct WaveStimulus {
-    delay_lines: [DelayLine; TRANSDUCER_COUNT],
-    frequency: f32,
-    // ...
-}
-```
-
-3. **Static methods**:
-```rust
-impl StimulusEngine {
-    pub fn new() -> Self {  // Associated function (static method)
-        // ...
-    }
-    
-    pub fn process(&mut self, output: &mut [f32; TRANSDUCER_COUNT], sample_rate: f32) {
-        // Instance method
-    }
-}
-```
-
-4. **Complex generic bounds**:
-```rust
-impl<T: Stimulus + Default, const N: usize> StimulusPool<T, N> {
-    pub fn new() -> Self {
-        Self {
-            stimuli: std::array::from_fn(|_| T::default()),
-            //       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Array initialization
-            active_mask: [false; N],
-        }
-    }
-}
-```
-
-5. **Lock-free SPSC ring buffer** (IPC thread → audio thread):
-```rust
-let (producer, consumer) = rtrb::RingBuffer::new(COMMAND_QUEUE_CAPACITY);
-// producer: rtrb::Producer<EngineCommand>  (owned by the IPC thread)
-// consumer: rtrb::Consumer<EngineCommand>  (owned by the engine / audio callback)
-```
-
-### haptic-server/src/audio.rs
-
-**Purpose**: Audio system interface using CPAL (Cross-Platform Audio Library).
-
-**Key Rust Features**:
-
-1. **Error propagation chain**:
-```rust
-pub fn run_audio_loop(
-    engine: StimulusEngine, 
-    running: Arc<AtomicBool>
-) -> Result<(), Box<dyn std::error::Error>> {
-    let host = cpal::default_host();
-    let device = host.output_devices()?  // ? propagates errors
-        .find(|d| {
-            // Closure with error handling
-        })
-        .unwrap_or_else(|| {  // Fallback if None
-            host.default_output_device().expect("No output device available")
-        });
-    // ...
-}
-```
-
-2. **Iterator methods**:
-```rust
-let device = host.output_devices()?
-    .find(|d| {  // find() returns Option<T>
-        if let Ok(mut configs) = d.supported_output_configs() {
-            configs.any(|c| c.channels() >= 32)  // any() returns bool
-        } else {
-            false
-        }
-    })
-```
-
-3. **Callback-owned engine (no locks on the audio path)**:
-```rust
-// The engine is moved into the callback closure; commands arrive via rtrb
-let mut engine = engine;
-let stream = device.build_output_stream(
-    &config.into(),
-    move |data: &mut [f32], _| {
-        engine.process_block(data, channels, sample_rate);
-    },
-    /* error callback */,
-    None,
-)?;
-```
-
-## Key Rust Patterns and Idioms
-
-### 1. RAII (Resource Acquisition Is Initialization)
-
-```rust
-{
-    let _guard = mutex.lock();  // Acquires lock
-    // Critical section
-} // Lock automatically released when _guard goes out of scope
-```
-
-### 2. Builder Pattern with Method Chaining
-
-```rust
-FloatParam::new("Wave Speed", 100.0, range)
-    .with_smoother(SmoothingStyle::Linear(50.0))
-    .with_unit(" m/s")
-    .with_value_to_string(formatters::float_formatter())
-```
-
-### 3. Type State Pattern
-
-```rust
-pub struct StimulusEngine {
-    // State transitions controlled by types
-    wave_pool: StimulusPool<WaveStimulus, MAX_WAVE_STIMULI>,
-    travelling_wave_pool: StimulusPool<TravellingWaveStimulus, 8>,
-}
-```
-
-### 4. Zero-Cost Abstractions
-
-```rust
-// This compiles to the same code as manual loop unrolling
-for (i, stimulus) in self.stimuli.iter_mut().enumerate() {
-    if self.active_mask[i] && stimulus.is_active() {
-        let output = stimulus.process(context);
-        // ...
-    }
-}
-```
-
-### 5. Newtype Pattern
-
-```rust
-struct Frequency(f32);  // Wraps f32 but with semantic meaning
-struct Velocity(u8);
-```
-
-## Thread Safety and Concurrency
-
-### 1. Send and Sync Traits
-
-```rust
-pub trait Stimulus: Send + Sync {
-    // Send: Can be transferred between threads
-    // Sync: Can be accessed from multiple threads simultaneously
-}
-```
-
-### 2. Atomic Types
-
-```rust
-use std::sync::atomic::{AtomicBool, Ordering};
-
-let running = Arc::new(AtomicBool::new(true));
-// Lock-free atomic operations
-running.store(false, Ordering::Relaxed);
-let is_running = running.load(Ordering::Relaxed);
-```
-
-### 3. Channel Communication
-
-```rust
-// Server: single-producer single-consumer ring buffer, no allocation on send
-let (mut producer, mut consumer) = rtrb::RingBuffer::new(1024);
-producer.push(command).ok();          // IPC thread; drops when full
-while let Ok(cmd) = consumer.pop() {  // audio callback, once per block
-    apply_command(cmd);
-}
-
-// Plugin: bounded MPMC channel from audio thread to the IPC worker thread
-let (tx, rx) = crossbeam_channel::bounded(256);
-tx.try_send(command).ok();            // never blocks the audio thread
-```
-
-### 4. Mutex for Shared Mutable State
-
-```rust
-let shared_data = Arc::new(Mutex::new(data));
-
-// Thread-safe access
-{
-    let mut guard = shared_data.lock();
-    guard.modify_data();
-} // Lock released automatically
-```
-
-## Memory Management
-
-### 1. Stack vs Heap Allocation
-
-```rust
-// Stack allocated (fixed size, fast)
-let array = [0.0f32; 32];
-let small_struct = Point { x: 1.0, y: 2.0 };
-
-// Heap allocated (dynamic size, slower)
-let vector = Vec::new();  // Growable array
-let boxed = Box::new(large_struct);  // Explicit heap allocation
-```
-
-### 2. Reference Counting
-
-```rust
-// Single threaded reference counting
-let rc_data = Rc::new(data);
-
-// Multi-threaded atomic reference counting
-let arc_data = Arc::new(data);
-let arc_clone = arc_data.clone();  // Increments reference count
-// When last Arc is dropped, data is deallocated
-```
-
-### 3. Copy vs Clone vs Move
-
-```rust
-// Copy: Implicit duplication for small types
-let a = 5i32;
-let b = a;  // a is copied, both a and b are valid
-
-// Clone: Explicit duplication
-let vec1 = vec![1, 2, 3];
-let vec2 = vec1.clone();  // Deep copy
-
-// Move: Transfer ownership (default for large types)
-let vec1 = vec![1, 2, 3];
-let vec2 = vec1;  // vec1 is no longer valid
-```
-
-## Error Handling
-
-### 1. Result<T, E> Type
-
-```rust
-fn might_fail() -> Result<String, std::io::Error> {
-    std::fs::read_to_string("file.txt")  // Returns Result
-}
-
-// Usage
-match might_fail() {
-    Ok(content) => println!("File content: {}", content),
-    Err(error) => eprintln!("Error reading file: {}", error),
-}
-```
-
-### 2. Error Propagation with ?
-
-```rust
-fn chain_operations() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = UnixListener::bind(path)?;  // Propagates error if bind fails
-    listener.set_nonblocking(true)?;           // Propagates error if this fails
-    Ok(())  // Success case
-}
-```
-
-### 3. Option<T> for Nullable Values
-
-```rust
-fn find_stimulus(&mut self) -> Option<&mut WaveStimulus> {
-    for (i, active) in self.active_mask.iter_mut().enumerate() {
-        if !*active {
-            *active = true;
-            return Some(&mut self.stimuli[i]);  // Found inactive stimulus
-        }
-    }
-    None  // No inactive stimulus available
-}
-
-// Usage
-if let Some(stimulus) = pool.find_stimulus() {
-    stimulus.note_on(note, velocity, mpe);
-}
-```
-
-## Building and Running
-
-### 1. Cargo Workspace
-
-```toml
-# Root Cargo.toml
-[workspace]
-members = ["haptic-protocol", "haptic-server", "haptic-plugin", "haptic-plugin-standalone", "xtask"]
-resolver = "2"
-
-[workspace.dependencies]
-serde = { version = "1.0", features = ["derive"] }
-bincode = "1.3"
-```
-
-**Explanation**: Workspaces allow multiple related packages in one repository with shared dependencies.
-
-### 2. Feature Flags
-
-```toml
-# haptic-plugin/Cargo.toml
-[dependencies]
-nih_plug = { git = "https://github.com/jmz1/nih-plug.git", features = ["vst3"] }
-```
-
-### 3. Build Commands
-
-```bash
-cargo build              # Build all workspace members
-cargo build --release    # Optimized build
-cargo run --bin haptic-server  # Run specific binary
-cargo test               # Run tests
-```
-
-## Comparison to C and Python
-
-### Memory Management
-- **C**: Manual malloc/free, prone to leaks and segfaults
-- **Python**: Garbage collection, automatic but with runtime overhead
-- **Rust**: Ownership system, memory safety at compile time with zero runtime cost
-
-### Error Handling
-- **C**: Return codes, easy to ignore
-- **Python**: Exceptions, can be caught anywhere in call stack
-- **Rust**: Result types, must be explicitly handled
-
-### Concurrency
-- **C**: Manual thread management, data races possible
-- **Python**: GIL limits true parallelism, thread-safe collections
-- **Rust**: Compile-time prevention of data races, zero-cost abstractions
-
-### Performance
-- **C**: Full control, minimal abstraction overhead
-- **Python**: Interpreted, slower but more productive
-- **Rust**: Zero-cost abstractions, C-like performance with safety
-
-## Learning Resources
-
-1. **The Rust Book**: https://doc.rust-lang.org/book/
-2. **Rust by Example**: https://doc.rust-lang.org/rust-by-example/
-3. **Rustlings**: Interactive exercises
-4. **Rust Standard Library Documentation**: https://doc.rust-lang.org/std/
-
-This haptic VST project demonstrates real-world Rust usage in a performance-critical, multi-threaded application with complex state management and external C library integration.
+Each pool has a parallel fixed owner table. Note On selects the sending
+instance's configured stimulus type, allocates a free slot, or steals
+deterministically—prefer an oldest releasing voice, otherwise an oldest active
+voice. Note Off and MPE update locate the slot through the instance/channel/note
+ownership key.
+
+An envelope closes the source on note-off. TW can finish when that envelope is
+inactive; Wave remains active until its latest possible scattered arrival has
+been consumed. Disconnect follows release semantics rather than leaving a
+sustained owner, while Panic resets all pools and ownership immediately.
+
+Both stimuli share concrete fixed-state components for envelope behaviour,
+controller smoothing, oscillator phase, and distance decay. They deliberately
+do not share propagation semantics. See [`docs/wave.md`](docs/wave.md) and
+[`docs/travelling-wave.md`](docs/travelling-wave.md).
+
+## Render path and output routing
+
+The engine produces 32 logical samples per internal render frame. At a 48 kHz
+device rate, internal synthesis runs at 1.5 kHz (`RENDER_DECIMATION = 32`),
+whose 750 Hz Nyquist remains above the 200 Hz stimulus ceiling. A 512-tap
+polyphase Kaiser-windowed sinc reconstructs device-rate samples with 16 taps per
+phase.
+
+Per device frame:
+
+1. Drain commands once at callback entry.
+2. Advance or reuse an internal 32-channel render frame.
+3. Sum active Wave and TW voices.
+4. Apply layout gains and bounded logical mixing.
+5. Reconstruct device-rate samples through the polyphase filter.
+6. Apply final output safety bounds.
+7. Copy the selected logical channels to physical device outputs according to
+   monitor routing.
+
+Logical levels and viewer state are measured before physical routing. A stereo
+fallback therefore does not turn the engine into a stereo engine: it merely
+allows two of the 32 logical channels to be auditioned at once.
+
+The default per-transducer gain is 0.5, reserving headroom for the maximum 2×
+Doppler arrival bunching allowed by the Wave source-speed limit. An explicit
+layout gain overrides the default.
+
+## Layout and device selection
+
+`haptic.toml` describes table dimensions, a grid shorthand, and optional
+per-channel position/gain overrides. The default is a cell-centred 4×8 layout
+over a nominal 1 m × 2 m table.
+
+A present but invalid startup configuration is a hard error. During hot reload,
+an invalid edit is reported and the running layout is kept. Parsing happens off
+the callback.
+
+The server searches for a device exposing at least 32 output channels. If none
+exists, it deliberately uses the system default device for development and
+monitoring. Within the selected channel layout it prefers a supported 48 kHz
+`f32` configuration; otherwise it chooses the closest supported rate and
+reports the deviation. The server currently requires `f32` output samples.
+
+## Observation contract
+
+Observers receive:
+
+- RMS levels for all 32 logical channels at about 60 Hz;
+- layout and physical routing state;
+- a fixed-capacity snapshot of up to 16 active voices; and
+- an explicit empty active-voice snapshot when nothing is sounding.
+
+`VoiceInfo` contains identity, note type, frequency, effective scale, decay,
+requested/effective position, and amplitude. It does not contain synchronized
+oscillator phase or Wave delay-line contents. The viewer therefore reconstructs
+relative spatial phase geometrically and phase-aligns voices for display.
+
+For a single TW voice, the relative phase and distance gain use the same shared
+closed-form helper as the engine and can match closely. For Wave, or for the
+absolute interference of multiple voices, the display remains a deliberately
+labelled preview rather than exact output truth.
+
+## Operational profiles
+
+### Production/audio-device mode
+
+- Uses `/tmp/haptic-vst.sock` unless overridden.
+- Refuses to replace another live server at that endpoint.
+- Removes a proven-stale socket selectively.
+- Opens the selected CPAL device.
+
+### Headless/dummy mode
+
+- Uses a paced 48 kHz, 32-channel memory sink.
+- Does not enumerate or open physical audio hardware.
+- Defaults to `/tmp/haptic-vst-test-<pid>.sock`.
+- Accepts `--socket` or `HAPTIC_SOCKET_PATH` for a stable test endpoint.
+
+Both profiles run the same engine, IPC, snapshots, layout watcher, and health
+reporting. Headless mode is therefore the preferred DAW-free integration path,
+not a reduced mock implementation.
