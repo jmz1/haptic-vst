@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
@@ -18,6 +19,7 @@ const DEFAULT_CONFIG_PATH: &str = "haptic.toml";
 struct ServerOptions {
     test_tone: bool,
     dummy_audio: bool,
+    managed_lifetime_stdin: bool,
     config_path: PathBuf,
     socket_path: String,
 }
@@ -65,6 +67,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create shared shutdown flag
     let running = Arc::new(AtomicBool::new(true));
+
+    // A supervising GUI starts the server with piped stdin and this flag. If
+    // the supervisor exits normally or crashes, the OS closes the pipe and the
+    // server shuts down rather than continuing to drive hardware as an orphan.
+    if options.managed_lifetime_stdin {
+        let managed_running = running.clone();
+        thread::spawn(move || managed_lifetime_stdin(managed_running));
+    }
 
     // Create stimulus engine - the IPC thread gets the command producer and
     // voice-snapshot consumer, the config watcher gets the layout producer
@@ -153,10 +163,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: haptic-server [--config PATH] [--test-tone] [--headless|--dummy-audio] [--socket PATH]\n\
+        "Usage: haptic-server [--config PATH] [--test-tone] [--headless|--dummy-audio] [--socket PATH] [--managed-lifetime-stdin]\n\
          \n\
          --headless, --dummy-audio  Use a timed 48 kHz/32-channel memory sink; no hardware.\n\
          --socket PATH              Override the Unix socket/lock namespace.\n\
+         --managed-lifetime-stdin   Exit when a supervising process closes stdin.\n\
          HAPTIC_SOCKET_PATH         Environment alternative to --socket.\n\
          \n\
          Headless mode defaults to /tmp/haptic-vst-test-<pid>.sock and therefore\n\
@@ -171,6 +182,7 @@ fn parse_options(
 ) -> Result<ServerOptions, Box<dyn std::error::Error>> {
     let mut test_tone = false;
     let mut dummy_audio = false;
+    let mut managed_lifetime_stdin = false;
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     let mut socket_path = None;
     let mut args = args.into_iter();
@@ -179,6 +191,7 @@ fn parse_options(
         match argument.as_str() {
             "--test-tone" => test_tone = true,
             "--headless" | "--dummy-audio" => dummy_audio = true,
+            "--managed-lifetime-stdin" => managed_lifetime_stdin = true,
             "--config" => {
                 config_path = PathBuf::from(next_option_value(&mut args, "--config")?);
             }
@@ -204,9 +217,35 @@ fn parse_options(
     Ok(ServerOptions {
         test_tone,
         dummy_audio,
+        managed_lifetime_stdin,
         config_path,
         socket_path,
     })
+}
+
+fn managed_lifetime_stdin(running: Arc<AtomicBool>) {
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    let mut byte = [0u8; 1];
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(0) => {
+                eprintln!("Managed supervisor closed; shutting down server");
+                running.store(false, Ordering::Relaxed);
+                return;
+            }
+            Ok(_) => {
+                // Input is not a command protocol. Reading and ignoring bytes
+                // simply keeps EOF as the lifetime signal.
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                eprintln!("Managed supervisor pipe failed ({error}); shutting down server");
+                running.store(false, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
 }
 
 fn next_option_value(
@@ -266,6 +305,7 @@ mod tests {
     fn production_mode_uses_real_audio_and_production_socket() {
         let options = parse_options(Vec::new(), None, 123).unwrap();
         assert!(!options.dummy_audio);
+        assert!(!options.managed_lifetime_stdin);
         assert_eq!(options.socket_path, haptic_protocol::SOCKET_PATH);
     }
 
@@ -290,5 +330,13 @@ mod tests {
         .unwrap();
         assert!(options.dummy_audio);
         assert_eq!(options.socket_path, "/tmp/haptic-vst-test.sock");
+    }
+
+    #[test]
+    fn managed_lifetime_is_explicit_and_independent_of_audio_profile() {
+        let options = parse_options(vec!["--managed-lifetime-stdin".into()], None, 123).unwrap();
+        assert!(options.managed_lifetime_stdin);
+        assert!(!options.dummy_audio);
+        assert_eq!(options.socket_path, haptic_protocol::SOCKET_PATH);
     }
 }
