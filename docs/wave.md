@@ -153,8 +153,8 @@ Wave and TW share the radial distance gain:
 g(d) = (1 + d / d0)^(-p)
 ```
 
-Defaults are `d0 = 0.5 m` and `p = 1`, exactly equivalent to the earlier
-`1 / (1 + 2d)` rule. `p = 0` deliberately disables falloff.
+Defaults are `d0 = 2 m` and `p = 1`, giving `1 / (1 + d/2)`.
+`p = 0` deliberately disables falloff.
 
 For Wave, gain is evaluated at emission time and carried into the arrival
 buffer. A live decay change affects new emissions, not energy already in
@@ -171,8 +171,9 @@ with maximum-occupancy material.
 
 Delay lines run at `device_rate / 32`. At a preferred 48 kHz device rate this is
 1.5 kHz, comfortably above twice the 200 Hz stimulus ceiling. The lower internal
-rate makes long physical delays inexpensive: the 16,384-cell buffers cover
-about 10.9 seconds at 1.5 kHz rather than 341 ms at 48 kHz.
+rate makes long physical delays inexpensive: the 34,000-cell buffers cover
+about 22.7 seconds at 1.5 kHz, enough for the default table diagonal at the
+0.1 m/s control floor.
 
 Device-rate samples are reconstructed with a 512-tap polyphase
 Kaiser-windowed sinc filter, 16 taps per interpolation phase. The filter both
@@ -200,16 +201,18 @@ Disconnect releases the owning instance's voices through the same lifecycle
 machinery, so closing a viewer or plugin connection cannot leave a permanent
 sustain.
 
-## Observation limits
+## Output observation
 
-The server publishes current frequency, speed/wavelength, decay, requested and
-effective positions, and amplitude for each Wave voice. It does not publish
-oscillator phase or 32 delay-line histories.
+The viewer does not attempt to reproduce the 32 delay-line histories from
+voice metadata. The server measures the final summed Wave/TW output after
+device-rate reconstruction and safety bounding, then publishes its 32-channel
+Hilbert analytic signal with synchronized source-oscillator references.
 
-The viewer can therefore draw a useful geometric phase field from present
-distance and wavelength, but it cannot reproduce exact delayed audio while the
-source moves or a tail drains. The UI must continue calling this a
-phase-aligned geometric preview.
+Consequently moving-source history, Doppler behaviour, interference, release
+energy, reconstruction response, and bounding are all present in the displayed
+field. Voice position and configuration remain observer metadata only for
+reference selection, labels, and source cursors. A selected Wave oscillator
+continues advancing until the measured propagation and filter tails are silent.
 
 ## Why it works this way
 

@@ -105,7 +105,7 @@ python3 tools/test_note.py --socket /tmp/haptic-vst-test.sock \
 python3 tools/test_note.py --socket /tmp/haptic-vst-test.sock --panic
 ```
 
-The default scripted note is MIDI 36 / Ableton C1 / 65.4 Hz. Frequencies are
+The default scripted note is MIDI 33 / Ableton A0 / 55 Hz. Frequencies are
 not transposed; the engine uses standard equal temperament and clamps to
 20–200 Hz.
 
@@ -152,9 +152,13 @@ cargo run -p haptic-viewer --release -- \
   --connect-only --socket /tmp/haptic-vst-test.sock
 ```
 
-The viewer's controls are stacked to fit the default 620 px window width.
+The viewer uses a compact two-column control grid at the default 620 px window
+width. Server paths and status text truncate instead of displacing lifecycle
+controls or the right-aligned FPS counter; hover truncated text to see it in
+full. Hover the table for its drag and monitor-routing gestures.
 
 1. Choose **Wave** or **Travelling Wave (TW)** and start the test note.
+   The viewer test console defaults to a 5 m/s wave speed.
 2. Note and velocity changes retrigger the held test voice.
 3. Wave speed retriggers a held Wave because speed is latched at note-on.
 4. TW speed/wavelength mode, spatial scale, and decay update live.
@@ -167,12 +171,18 @@ what is copied to the available physical outputs.
 
 Note names use Ableton's octave convention: MIDI 60 is C3. C3 is 261.6 Hz
 before clamping and therefore produces/displays the 200 Hz ceiling. Hue shows
-relative spatial phase, brightness shows local amplitude, the cross is the
-effective source, and the ring is the requested position.
+Hilbert phase relative to the selected source oscillator, brightness shows the
+magnitude of the final summed output, the cross is the effective source, and
+the ring is the requested position. Zero relative phase remains blue.
 
-The field display is a phase-aligned geometric preview. It does not reproduce
-synchronized oscillator phase or Wave delay-line history. A single TW voice's
-relative field uses the same closed-form helper as the engine.
+The field always includes every active voice and reacts to the measured
+post-reconstruction, post-bound logical output. The **reference** picker changes
+only the oscillator used as the phase origin. With different simultaneous
+pitches, expect rotation at their difference frequencies; this is intentional
+and is not smoothed into a stationary field. After note-off, the selected
+oscillator continues through the measured Wave/reconstruction/Hilbert tail; a
+bounded 250 ms filter-tail hold prevents another sustained voice from retaining
+an already-finished reference indefinitely.
 
 ## Automated Rust tests
 
@@ -202,8 +212,9 @@ Coverage includes:
 - invalid-command rejection, duplicate identities, and disconnect cleanup;
 - voice allocation, stealing, release, panic, and multi-instance isolation;
 - Wave delay/tail/smoothing/scatter/reconstruction behaviour;
+- final-output Hilbert magnitude/phase and reference-delay alignment;
 - TW closed-form field, scale modes, live automation, and lifecycle;
-- active-voice frame budget and observer snapshots;
+- measured-output frame budget and observer snapshots;
 - layout parsing/reload and per-transducer gains;
 - 48 kHz output-config preference and monitor routing; and
 - framed end-to-end IPC over a real Unix socket.

@@ -252,6 +252,12 @@ deadline. The 512-frame case measured p50 191.2 us, p99 305.5 us, and maximum
 503.2 us against a 10667 us deadline. These are machine-local timing evidence,
 not portable regression thresholds.
 
+After adding the 32-channel post-reconstruction Hilbert analyser, the same
+release harness measured 64-frame p50 37.6 us, p99 80.7 us, and maximum 166.1
+us; the 512-frame case measured p50 311.8 us, p99 446.0 us, and maximum 561.1
+us. The fixed analyser raises median callback work, as expected, while both
+tested block sizes retain substantial deadline margin.
+
 ## Parameter sensitivity
 
 The controlling dimensionless quantities are `v/c` for Doppler/time warping

@@ -1,5 +1,5 @@
 use crate::config::TransducerLayout;
-use crate::engine::VoiceSnapshot;
+use crate::engine::OutputSnapshot;
 use haptic_protocol::{
     encode_frame, FrameDecoder, FrameError, HapticCommand, InstanceConfig, MpeData, Parameter,
     ServerStatus, MAX_ATTEN_D0_M, MAX_ATTEN_EXPONENT, MAX_FRAME_SIZE, MAX_WAVELENGTH_M,
@@ -19,7 +19,7 @@ use std::time::Instant;
 /// Minimum interval between TransducerLevels broadcasts (~60 Hz).
 const LEVELS_BROADCAST_INTERVAL: Duration = Duration::from_millis(16);
 
-/// Minimum interval between ActiveVoices broadcasts. 4 ms (~250 Hz) keeps the
+/// Minimum interval between OutputState broadcasts. 4 ms (~250 Hz) keeps the
 /// socket well ahead of a 120 Hz display without flooding slow clients.
 const VOICE_BROADCAST_INTERVAL: Duration = Duration::from_millis(4);
 
@@ -65,7 +65,7 @@ pub fn listen_loop(
     running: Arc<AtomicBool>,
     command_producer: rtrb::Producer<crate::engine::EngineCommand>,
     levels_consumer: rtrb::Consumer<[f32; 32]>,
-    voice_consumer: rtrb::Consumer<VoiceSnapshot>,
+    output_consumer: rtrb::Consumer<OutputSnapshot>,
     layout: TransducerLayout,
     layout_consumer: rtrb::Consumer<TransducerLayout>,
     device_channels: Arc<AtomicU16>,
@@ -75,7 +75,7 @@ pub fn listen_loop(
         running,
         command_producer,
         levels_consumer,
-        voice_consumer,
+        output_consumer,
         layout,
         layout_consumer,
         device_channels,
@@ -88,7 +88,7 @@ fn listen_loop_at(
     running: Arc<AtomicBool>,
     mut command_producer: rtrb::Producer<crate::engine::EngineCommand>,
     mut levels_consumer: rtrb::Consumer<[f32; 32]>,
-    mut voice_consumer: rtrb::Consumer<VoiceSnapshot>,
+    mut output_consumer: rtrb::Consumer<OutputSnapshot>,
     mut layout: TransducerLayout,
     mut layout_consumer: rtrb::Consumer<TransducerLayout>,
     device_channels: Arc<AtomicU16>,
@@ -216,19 +216,22 @@ fn listen_loop_at(
             latest_levels = Some(levels);
         }
 
-        // Forward the freshest voice snapshot for phase visualisation
-        let mut latest_voice: Option<VoiceSnapshot> = None;
-        while let Ok(snapshot) = voice_consumer.pop() {
-            latest_voice = Some(snapshot);
+        // Forward the freshest measured-output snapshot for visualisation.
+        let mut latest_output: Option<OutputSnapshot> = None;
+        while let Ok(snapshot) = output_consumer.pop() {
+            latest_output = Some(snapshot);
         }
-        if let Some(v) = latest_voice {
+        if let Some(output) = latest_output {
             if last_voice_broadcast.elapsed() >= VOICE_BROADCAST_INTERVAL {
                 last_voice_broadcast = Instant::now();
-                let status = ServerStatus::ActiveVoices {
+                let status = ServerStatus::OutputState {
                     timestamp_us: now_us(),
-                    sample_rate: v.sample_rate,
-                    count: v.count,
-                    voices: v.voices,
+                    device_sample_rate: output.device_sample_rate,
+                    sample_index: output.sample_index,
+                    valid: output.valid,
+                    analytic: output.analytic,
+                    count: output.count,
+                    voices: output.voices,
                 };
                 if encode_frame(&status, &mut status_frame).is_ok() {
                     broadcast(&mut clients, &status_frame);

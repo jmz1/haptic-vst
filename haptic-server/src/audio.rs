@@ -85,7 +85,8 @@ struct TestTone {
     current_channel: usize,
 }
 
-const TEST_TONE_FREQ: f32 = 100.0;
+/// MIDI 33 / Ableton A0.
+const TEST_TONE_FREQ: f32 = 55.0;
 const TEST_TONE_BURST_SECS: f32 = 0.5;
 const TEST_TONE_LEVEL: f32 = 0.5;
 const PREFERRED_SAMPLE_RATE: u32 = 48_000;
@@ -291,7 +292,7 @@ pub fn run_audio_loop(
 }
 
 /// Run the complete engine on a wall-clocked in-memory 32-channel sink. This
-/// exercises command handling, DSP, levels, and voice snapshots without
+/// exercises command handling, DSP, levels, and measured-output snapshots without
 /// opening or locking any physical audio device.
 pub fn run_dummy_audio_loop(
     engine: StimulusEngine,

@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 /// Bincode encodes enum variants by declaration order, so protocol changes
 /// are coordinated and versioned. A server must reject a client whose version
 /// does not exactly match this value before accepting any other command.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Shared numeric limits used by every producer and the server validator.
 pub const MIDI_CHANNEL_COUNT: u8 = 16;
-pub const MIN_WAVE_SPEED: f32 = 0.25;
-pub const MAX_WAVE_SPEED: f32 = 1000.0;
+pub const MIN_WAVE_SPEED: f32 = 0.1;
+pub const MAX_WAVE_SPEED: f32 = 100.0;
 pub const MIN_WAVELENGTH_M: f32 = 0.00125;
 pub const MAX_WAVELENGTH_M: f32 = 50.0;
 pub const MIN_ATTEN_D0_M: f32 = 0.01;
@@ -20,11 +20,10 @@ pub const MIN_ATTEN_EXPONENT: f32 = 0.0;
 pub const MAX_ATTEN_EXPONENT: f32 = 4.0;
 pub const DEFAULT_WAVE_SPEED: f32 = 20.0;
 pub const DEFAULT_WAVELENGTH_M: f32 = 0.2;
-pub const DEFAULT_ATTEN_D0_M: f32 = 0.5;
+pub const DEFAULT_ATTEN_D0_M: f32 = 2.0;
 pub const DEFAULT_ATTEN_EXPONENT: f32 = 1.0;
-/// MIDI 36 / Ableton C1 is 65.4 Hz without transposition, preserving the
-/// previous default test-note pitch when MIDI 60 was shifted down two octaves.
-pub const DEFAULT_TEST_NOTE: u8 = 36;
+/// MIDI 33 / Ableton A0 is 55 Hz without transposition.
+pub const DEFAULT_TEST_NOTE: u8 = 33;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct MpeData {
@@ -89,7 +88,7 @@ impl Default for TravellingWaveConfig {
     }
 }
 
-/// Shared radial distance gain used by the engine and geometric viewer.
+/// Shared radial distance gain used by the engine and model-level tests.
 #[inline]
 pub fn distance_gain(distance_m: f32, decay: DistanceDecay) -> f32 {
     let base = 1.0 + distance_m.max(0.0) / decay.d0_m.max(MIN_ATTEN_D0_M);
@@ -191,15 +190,14 @@ pub enum ClientRole {
     Observer,
 }
 
-/// Maximum concurrently-visualised voices carried in an `ActiveVoices`
-/// status (wave and travelling-wave pools combined).
+/// Maximum concurrently-active oscillator references carried in an
+/// `OutputState` status (wave and travelling-wave pools combined).
 pub const MAX_ACTIVE_VOICES: usize = 16;
 
-/// Compact per-voice state for visualisation. The viewer recomputes each
-/// transducer's relative phase and local amplitude geometrically from the
-/// effective wavelength, decay, source position, and known layout — so no
-/// per-transducer array is transmitted, and many voices fit one frame.
-/// `instance_id` + `note_type` let the viewer filter or sum.
+/// Compact per-voice state accompanying the measured output field. Geometry
+/// remains useful for source cursors and labels, while `reference_phase` lets
+/// the viewer compare the final summed output with any active source
+/// oscillator. It is aligned to the analytic samples in the same `OutputState`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
 pub struct VoiceInfo {
     pub instance_id: u64,
@@ -217,6 +215,9 @@ pub struct VoiceInfo {
     /// Position MPE is asking the source to move to.
     pub requested_pos: (f32, f32),
     pub amplitude: f32,
+    /// Analytic phase, in radians, of this voice's source sine oscillator at
+    /// the time represented by `OutputState::analytic`.
+    pub reference_phase: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -255,7 +256,7 @@ pub enum HapticCommand {
     Panic, // Stop all
 }
 
-// The fixed ActiveVoices array deliberately keeps the wire schema bounded and
+// The fixed OutputState arrays deliberately keep the wire schema bounded and
 // mirrors the allocation-free audio-thread snapshot. Boxing it would add a
 // per-status allocation and make the schema's ownership less explicit.
 #[allow(clippy::large_enum_variant)]
@@ -291,15 +292,20 @@ pub enum ServerStatus {
         device_channels: u16,
         routes: [u8; 32],
     },
-    /// All currently active Wave and Travelling Wave voices, for phase
-    /// visualisation. Replaces the old single-voice `VoiceState`: the viewer
-    /// is the one observer of whole-server state, so it receives every voice
-    /// (tagged with `instance_id` + `note_type` for filtering / summing) and
-    /// reconstructs the per-transducer field itself. `count` entries of
-    /// `voices` are valid. `sample_rate` is the engine's internal render rate.
-    ActiveVoices {
+    /// Hilbert analytic signal measured from the final bounded sum of all
+    /// voices on every logical transducer, after device-rate reconstruction
+    /// and before physical monitor routing. `count` entries of `voices` are
+    /// valid oscillator references; selecting one never changes `analytic`.
+    OutputState {
         timestamp_us: u64,
-        sample_rate: f32,
+        device_sample_rate: f32,
+        /// Device-frame index at which the newest Hilbert output was
+        /// evaluated. The analytic signal and every `reference_phase` include
+        /// the same reconstruction and Hilbert group delay.
+        sample_index: u64,
+        /// False while the Hilbert history is initially filling.
+        valid: bool,
+        analytic: [(f32, f32); 32],
         count: u8,
         voices: [VoiceInfo; MAX_ACTIVE_VOICES],
     },
@@ -537,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn active_voices_roundtrips_within_frame_budget() {
+    fn output_state_roundtrips_within_frame_budget() {
         let mut voices = [VoiceInfo::default(); MAX_ACTIVE_VOICES];
         for (i, v) in voices.iter_mut().enumerate() {
             v.instance_id = i as u64 + 1;
@@ -547,15 +553,18 @@ mod tests {
             v.source_pos = (0.5, 1.0);
             v.amplitude = 0.5;
         }
-        let status = ServerStatus::ActiveVoices {
+        let status = ServerStatus::OutputState {
             timestamp_us: 1,
-            sample_rate: 1500.0,
+            device_sample_rate: 48_000.0,
+            sample_index: 1234,
+            valid: true,
+            analytic: [(0.25, -0.5); 32],
             count: MAX_ACTIVE_VOICES as u8,
             voices,
         };
         let mut buf = Vec::new();
         encode_frame(&status, &mut buf).unwrap();
-        // A full ActiveVoices frame must fit the framing budget.
+        // A full OutputState frame must fit the framing budget.
         assert!(
             buf.len() <= MAX_FRAME_SIZE,
             "frame {} > max {}",
@@ -565,20 +574,26 @@ mod tests {
         let mut dec = FrameDecoder::new();
         dec.extend(&buf);
         match dec.next_frame::<ServerStatus>().unwrap().unwrap() {
-            ServerStatus::ActiveVoices { count, voices, .. } => {
+            ServerStatus::OutputState {
+                count,
+                voices,
+                analytic,
+                ..
+            } => {
                 assert_eq!(count, MAX_ACTIVE_VOICES as u8);
                 assert_eq!(voices[3].note, 63);
                 assert_eq!(voices[3].instance_id, 4);
+                assert_eq!(analytic[0], (0.25, -0.5));
             }
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
-    fn default_distance_decay_matches_legacy_wave_gain() {
+    fn default_distance_decay_uses_two_metre_knee() {
         let decay = DistanceDecay::default();
         for distance in [0.0, 0.125, 0.5, 1.0, 2.25] {
-            let expected = 1.0 / (1.0 + 2.0 * distance);
+            let expected = 1.0 / (1.0 + distance / 2.0);
             assert!((distance_gain(distance, decay) - expected).abs() < 1e-6);
         }
     }
@@ -598,6 +613,6 @@ mod tests {
     fn travelling_wave_phasor_has_expected_phase_and_gain() {
         let (re, im) = travelling_wave_relative_phasor(0.125, 0.5, DistanceDecay::default());
         assert!(re.abs() < 1e-6);
-        assert!((im + 0.8).abs() < 1e-6);
+        assert!((im + 16.0 / 17.0).abs() < 1e-6);
     }
 }

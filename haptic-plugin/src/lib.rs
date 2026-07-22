@@ -156,8 +156,8 @@ impl Default for HapticParams {
                 // system is built for lives below ~20 m/s, and was previously
                 // unreachable from the host (old floor was 20 m/s).
                 FloatRange::Skewed {
-                    min: 0.25,
-                    max: 1000.0,
+                    min: haptic_protocol::MIN_WAVE_SPEED,
+                    max: haptic_protocol::MAX_WAVE_SPEED,
                     factor: FloatRange::skew_factor(-2.5),
                 },
             )

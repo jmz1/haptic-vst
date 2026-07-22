@@ -1,4 +1,5 @@
 use crate::config::TransducerLayout;
+use crate::output_analysis::{OutputAnalyzer, HILBERT_DELAY_SAMPLES};
 #[cfg(test)]
 use haptic_protocol::DEFAULT_TEST_NOTE;
 use haptic_protocol::{
@@ -15,11 +16,13 @@ const MAX_WAVE_STIMULI: usize = 8;
 const MAX_TRAVELLING_WAVE_STIMULI: usize = 8;
 const _: () = assert!(MAX_ACTIVE_VOICES >= MAX_WAVE_STIMULI + MAX_TRAVELLING_WAVE_STIMULI);
 // Delay-line capacity in *internal-rate* samples (see RENDER_DECIMATION):
-// 16384 samples at 48 kHz / 32 = 1.5 kHz is ~10.9 s of propagation — 8.3 s
-// covers the full default table at the 0.25 m/s wave-speed floor, so the
-// safety clamp below is unreachable for realistic layouts. Delays beyond
-// capacity are clamped, not wrapped.
-const MAX_DELAY_SAMPLES: usize = 16384;
+// 34,000 samples at the preferred 48 kHz / 32 = 1.5 kHz is ~22.7 s of
+// propagation. That covers the 2.236 m diagonal of the default 1x2 m table at
+// the 0.1 m/s wave-speed floor. Delays beyond capacity (possible with custom
+// out-of-table positions or higher non-preferred device rates) are clamped,
+// not wrapped. Buffers are heap-owned so this capacity does not inflate the
+// callback stack.
+const MAX_DELAY_SAMPLES: usize = 34_000;
 
 /// The wave field is synthesised at the device rate divided by this factor
 /// (48 kHz -> 1.5 kHz) and upsampled to the device rate at the output
@@ -108,13 +111,14 @@ const COMMAND_QUEUE_CAPACITY: usize = 1024;
 /// allocation on the audio thread.
 const MAX_INSTANCES: usize = 16;
 
-/// Per-block snapshot of every active Wave/TW voice, exported to the IPC thread
-/// for phase visualisation. Fixed-size (no allocation on the audio thread);
-/// `count` entries of `voices` are valid. Each `VoiceInfo` is tagged with its
-/// owning `instance_id` so the viewer can filter or sum.
+/// Per-block snapshot of the measured final output and every active oscillator
+/// reference, exported to the IPC thread. Fixed-size and callback-safe.
 #[derive(Clone, Copy)]
-pub struct VoiceSnapshot {
-    pub sample_rate: f32,
+pub struct OutputSnapshot {
+    pub device_sample_rate: f32,
+    pub sample_index: u64,
+    pub valid: bool,
+    pub analytic: [(f32, f32); TRANSDUCER_COUNT],
     pub count: u8,
     pub voices: [VoiceInfo; MAX_ACTIVE_VOICES],
 }
@@ -269,9 +273,8 @@ pub struct StimulusEngine {
     command_queue: rtrb::Consumer<EngineCommand>,
     layout_queue: rtrb::Consumer<TransducerLayout>,
 
-    // Voice snapshots out to the IPC thread (drops when full)
-    voice_producer: rtrb::Producer<VoiceSnapshot>,
-    last_voice_snapshot_count: u8,
+    // Final-output snapshots out to the IPC thread (drops when full)
+    output_producer: rtrb::Producer<OutputSnapshot>,
 
     // Physical output p plays logical channel monitor_routes[p]
     monitor_routes: [u8; TRANSDUCER_COUNT],
@@ -287,6 +290,13 @@ pub struct StimulusEngine {
     history_pos: usize,
     interp_phase: usize,
     fir: Box<[f32; FIR_LEN]>,
+
+    // Hilbert analysis of final bounded logical device samples. The device
+    // frame counters align every active oscillator reference to the same
+    // reconstruction and analysis group delay.
+    output_analyzer: OutputAnalyzer<TRANSDUCER_COUNT>,
+    device_frame_index: u64,
+    last_render_device_frame: u64,
 
     // Bandlimited scatter kernel for the delay lines (see design_splat_kernel)
     splat_kernel: Box<[f32; SPLAT_LEN]>,
@@ -399,11 +409,11 @@ impl StimulusEngine {
         Self,
         rtrb::Producer<EngineCommand>,
         rtrb::Producer<TransducerLayout>,
-        rtrb::Consumer<VoiceSnapshot>,
+        rtrb::Consumer<OutputSnapshot>,
     ) {
         let (producer, consumer) = rtrb::RingBuffer::new(COMMAND_QUEUE_CAPACITY);
         let (layout_producer, layout_consumer) = rtrb::RingBuffer::new(4);
-        let (voice_producer, voice_consumer) = rtrb::RingBuffer::new(256);
+        let (output_producer, output_consumer) = rtrb::RingBuffer::new(256);
 
         let engine = Self {
             wave_pool: StimulusPool::new(),
@@ -414,8 +424,7 @@ impl StimulusEngine {
             instances: [None; MAX_INSTANCES],
             command_queue: consumer,
             layout_queue: layout_consumer,
-            voice_producer,
-            last_voice_snapshot_count: 0,
+            output_producer,
             monitor_routes: std::array::from_fn(|i| i as u8),
             layout,
             history: [[0.0; TRANSDUCER_COUNT]; FIR_TAPS_PER_PHASE],
@@ -423,9 +432,12 @@ impl StimulusEngine {
             // Force a render on the very first device frame
             interp_phase: RENDER_DECIMATION - 1,
             fir: design_reconstruction_fir(),
+            output_analyzer: OutputAnalyzer::new(),
+            device_frame_index: 0,
+            last_render_device_frame: 0,
             splat_kernel: design_splat_kernel(),
         };
-        (engine, producer, layout_producer, voice_consumer)
+        (engine, producer, layout_producer, output_consumer)
     }
 
     /// Config for `instance_id`, or the default if the instance has not
@@ -788,6 +800,7 @@ impl StimulusEngine {
                 self.render_frame(engine_rate, &mut cur);
                 self.history_pos = (self.history_pos + FIR_TAPS_PER_PHASE - 1) % FIR_TAPS_PER_PHASE;
                 self.history[self.history_pos] = cur;
+                self.last_render_device_frame = self.device_frame_index;
             }
             // Polyphase reconstruction: device frame at phase p is the dot
             // product of branch p of the windowed-sinc filter with the
@@ -801,20 +814,28 @@ impl StimulusEngine {
                     *out += coeff * sample;
                 }
             }
-            for (sum, &sample) in sum_squares.iter_mut().zip(interp.iter()) {
+            // This is the canonical final logical output: all voices have
+            // already been summed, layout gain has been applied, and the
+            // device-rate reconstruction overshoot is bounded. The analyser
+            // sees this exact vector before physical monitor routing.
+            let mut logical = interp;
+            for sample in &mut logical {
+                *sample = sample.clamp(-1.0, 1.0);
+            }
+            self.output_analyzer
+                .process(&logical, self.device_frame_index, sample_rate);
+            for (sum, &sample) in sum_squares.iter_mut().zip(logical.iter()) {
                 *sum += sample * sample;
             }
             // Physical outputs play their routed logical channel (identity
             // by default; a stereo device can audition any of the 32)
             for (p, sample) in frame[..n].iter_mut().enumerate() {
-                // Reconstruction can overshoot even though the internal-rate
-                // mix was bounded. Enforce the hardware limit at the final
-                // device-rate output.
-                *sample = interp[routes[p] as usize].clamp(-1.0, 1.0);
+                *sample = logical[routes[p] as usize];
             }
             for sample in frame[n..].iter_mut() {
                 *sample = 0.0;
             }
+            self.device_frame_index = self.device_frame_index.wrapping_add(1);
         }
         // Zero any trailing partial frame rather than leave stale samples
         for sample in data[frames * channels..].iter_mut() {
@@ -826,15 +847,24 @@ impl StimulusEngine {
             *level = (sum * inv_frames).sqrt();
         }
 
-        self.publish_active_voices(engine_rate);
+        self.publish_output_state(sample_rate);
         self.reap_finished_voices();
     }
 
-    /// Push a snapshot of every active voice for the visualiser, each
-    /// tagged with its owning `instance_id`. The viewer reconstructs the
-    /// per-transducer field geometrically, so no delay array is sent. No-op
-    /// (and no allocation) when nothing is playing.
-    fn publish_active_voices(&mut self, sample_rate: f32) {
+    /// Push the freshest measured analytic output and every oscillator that
+    /// can serve as its reference. Publication continues through silence so a
+    /// viewer can retain the selected oscillator until the Wave,
+    /// reconstruction, and Hilbert tails have actually drained.
+    fn publish_output_state(&mut self, device_sample_rate: f32) {
+        let latest = self.output_analyzer.latest();
+        let valid = latest.is_some();
+        let sample_index = latest
+            .map(|frame| frame.sample_index)
+            .unwrap_or_else(|| self.device_frame_index.saturating_sub(1));
+        let analytic = latest
+            .map(|frame| frame.samples)
+            .unwrap_or([(0.0, 0.0); TRANSDUCER_COUNT]);
+        let analysis_decimation = self.output_analyzer.decimation();
         let mut voices = [VoiceInfo::default(); MAX_ACTIVE_VOICES];
         let mut count = 0usize;
         for (slot, owner) in self.wave_owners.iter().enumerate() {
@@ -857,6 +887,14 @@ impl StimulusEngine {
                 source_pos: stim.source_pos,
                 requested_pos: stim.requested_pos,
                 amplitude: stim.amplitude * stim.env_level * stim.mpe.value.pressure,
+                reference_phase: aligned_reference_phase(
+                    stim.phase,
+                    stim.frequency,
+                    device_sample_rate,
+                    self.last_render_device_frame,
+                    sample_index,
+                    analysis_decimation,
+                ),
             };
             count += 1;
         }
@@ -880,26 +918,25 @@ impl StimulusEngine {
                 source_pos: stim.source_pos,
                 requested_pos: stim.source_pos,
                 amplitude: stim.amplitude * stim.env_level * stim.mpe.value.pressure,
+                reference_phase: aligned_reference_phase(
+                    stim.phase,
+                    stim.frequency,
+                    device_sample_rate,
+                    self.last_render_device_frame,
+                    sample_index,
+                    analysis_decimation,
+                ),
             };
             count += 1;
         }
-        // Publish one explicit empty snapshot when the final voice ends so an
-        // observer clears immediately without relying on a stale-data timeout.
-        if count == 0 && self.last_voice_snapshot_count == 0 {
-            return;
-        }
-        let count = count as u8;
-        if self
-            .voice_producer
-            .push(VoiceSnapshot {
-                sample_rate,
-                count,
-                voices,
-            })
-            .is_ok()
-        {
-            self.last_voice_snapshot_count = count;
-        }
+        let _ = self.output_producer.push(OutputSnapshot {
+            device_sample_rate,
+            sample_index,
+            valid,
+            analytic,
+            count: count as u8,
+            voices,
+        });
     }
 
     /// Single-frame variant used by tests: renders one *internal-rate*
@@ -910,6 +947,33 @@ impl StimulusEngine {
         self.render_frame(sample_rate, output);
         self.reap_finished_voices();
     }
+}
+
+/// Phase of an ideal source sine oscillator at the exact time represented by
+/// the measured analytic output. `phase_after_latest_render` is the phase for
+/// the next internal render frame, so first step back to the phase used by the
+/// latest render, then compensate both linear-phase filters. The `-pi/2`
+/// offset is the analytic phase of `sin(theta)` under the Hilbert convention
+/// used by `OutputAnalyzer`.
+fn aligned_reference_phase(
+    phase_after_latest_render: f32,
+    frequency: f32,
+    device_sample_rate: f32,
+    latest_render_device_frame: u64,
+    analysis_sample_index: u64,
+    analysis_decimation: usize,
+) -> f32 {
+    let phase_used_at_latest_render = phase_after_latest_render as f64
+        - frequency as f64 * RENDER_DECIMATION as f64 / device_sample_rate as f64;
+    let reconstruction_delay = (FIR_LEN - 1) as f64 * 0.5;
+    let hilbert_delay = HILBERT_DELAY_SAMPLES as f64 * analysis_decimation as f64;
+    let represented_device_frame =
+        analysis_sample_index as f64 - hilbert_delay - reconstruction_delay;
+    let elapsed_frames = represented_device_frame - latest_render_device_frame as f64;
+    let cycles =
+        phase_used_at_latest_render + frequency as f64 * elapsed_frames / device_sample_rate as f64;
+    (std::f64::consts::TAU * cycles - std::f64::consts::FRAC_PI_2).rem_euclid(std::f64::consts::TAU)
+        as f32
 }
 
 /// Zeroth-order modified Bessel function of the first kind (power series),
@@ -1777,12 +1841,23 @@ mod tests {
         let c1 = note_to_haptic_frequency(36);
         assert!((c0 - 32.703).abs() < 0.01);
         assert!((c1 / c0 - 2.0).abs() < 1e-3);
-        assert!((note_to_haptic_frequency(DEFAULT_TEST_NOTE) - 65.406).abs() < 0.01);
+        assert!((note_to_haptic_frequency(DEFAULT_TEST_NOTE) - 55.0).abs() < 0.01);
         // MIDI 60 / Ableton C3 is above the haptic band and saturates.
         assert_eq!(note_to_haptic_frequency(60), MAX_HAPTIC_FREQ);
         // Extremes clamp to the transducer band
         assert_eq!(note_to_haptic_frequency(0), 20.0);
         assert_eq!(note_to_haptic_frequency(127), 200.0);
+    }
+
+    #[test]
+    fn preferred_rate_delay_capacity_covers_default_table_at_speed_floor() {
+        let diagonal = 1.0f32.hypot(2.0);
+        let required = diagonal / MIN_WAVE_SPEED * (SAMPLE_RATE / RENDER_DECIMATION as f32)
+            + SPLAT_TAPS as f32;
+        assert!(
+            required < MAX_DELAY_SAMPLES as f32,
+            "required {required} internal frames exceeds {MAX_DELAY_SAMPLES}"
+        );
     }
 
     #[test]
@@ -2194,7 +2269,7 @@ mod tests {
             &mut producer,
             EngineCommand::SetParameter {
                 instance_id: 7,
-                parameter: Parameter::WaveSpeed(250.0),
+                parameter: Parameter::WaveSpeed(25.0),
             },
         );
         send(
@@ -2212,7 +2287,7 @@ mod tests {
         // The instance's config drove note allocation into the TW pool.
         assert_eq!(active_wave_voices(&engine), 0);
         assert_eq!(engine.travelling_wave_owners.iter().flatten().count(), 1);
-        assert_eq!(engine.instance_config(7).wave_speed, 250.0);
+        assert_eq!(engine.instance_config(7).wave_speed, 25.0);
 
         send(
             &mut producer,
@@ -2234,7 +2309,7 @@ mod tests {
         run_samples(&mut engine, 64);
         assert_eq!(active_wave_voices(&engine), 1);
         assert_eq!(
-            engine.wave_pool.stimuli[0].wave_speed, 250.0,
+            engine.wave_pool.stimuli[0].wave_speed, 25.0,
             "instance wave speed should apply at note on"
         );
     }
@@ -2263,7 +2338,7 @@ mod tests {
                 instance_id: 200,
                 config: InstanceConfig {
                     stimulus_type: StimulusType::Wave,
-                    wave_speed: 300.0,
+                    wave_speed: 50.0,
                     ..InstanceConfig::default()
                 },
             },
@@ -2301,7 +2376,7 @@ mod tests {
             .map(|s| engine.wave_pool.stimuli[s].wave_speed)
             .collect();
         assert!(
-            speeds.contains(&5.0) && speeds.contains(&300.0),
+            speeds.contains(&5.0) && speeds.contains(&50.0),
             "got {speeds:?}"
         );
 
@@ -2918,7 +2993,7 @@ mod tests {
     }
 
     #[test]
-    fn active_voice_snapshots_include_travelling_wave_stimuli() {
+    fn output_snapshots_include_travelling_wave_references() {
         let (mut engine, mut producer, _, mut snapshots) =
             StimulusEngine::new(TransducerLayout::default());
         send(
@@ -2950,6 +3025,61 @@ mod tests {
         assert_eq!(snapshot.count, 1);
         assert_eq!(snapshot.voices[0].instance_id, 55);
         assert_eq!(snapshot.voices[0].note_type, StimulusType::TravellingWave);
+    }
+
+    #[test]
+    fn zero_distance_tw_output_is_aligned_with_its_reference_across_rates() {
+        for sample_rate in [44_100.0, 48_000.0, 96_000.0] {
+            let layout = TransducerLayout {
+                positions: [(0.5, 1.0); TRANSDUCER_COUNT],
+                gains: [0.5; TRANSDUCER_COUNT],
+                ..TransducerLayout::default()
+            };
+            let (mut engine, mut producer, _, mut snapshots) = StimulusEngine::new(layout);
+            send(
+                &mut producer,
+                EngineCommand::RegisterInstance {
+                    instance_id: 55,
+                    config: InstanceConfig {
+                        stimulus_type: StimulusType::TravellingWave,
+                        ..InstanceConfig::default()
+                    },
+                },
+            );
+            send(
+                &mut producer,
+                EngineCommand::NoteOn {
+                    instance_id: 55,
+                    note: DEFAULT_TEST_NOTE,
+                    velocity: 100,
+                    channel: 1,
+                    mpe: full_mpe(),
+                },
+            );
+
+            let mut data = vec![0.0f32; 512 * TRANSDUCER_COUNT];
+            let mut levels = [0.0f32; TRANSDUCER_COUNT];
+            let mut latest = None;
+            let blocks = (sample_rate as usize).div_ceil(512);
+            for _ in 0..blocks {
+                engine.process_block(&mut data, TRANSDUCER_COUNT, sample_rate, &mut levels);
+                while let Ok(snapshot) = snapshots.pop() {
+                    latest = Some(snapshot);
+                }
+            }
+
+            let snapshot = latest.expect("expected measured output snapshot");
+            assert!(snapshot.valid);
+            let reference = snapshot.voices[0].reference_phase;
+            let (real, imaginary) = snapshot.analytic[0];
+            let relative_imaginary = imaginary * reference.cos() - real * reference.sin();
+            let relative_real = real * reference.cos() + imaginary * reference.sin();
+            let phase_error = relative_imaginary.atan2(relative_real);
+            assert!(
+                phase_error.abs() < 0.03,
+                "{sample_rate} Hz zero-distance relative phase error {phase_error} rad"
+            );
+        }
     }
 
     #[test]
@@ -3159,7 +3289,7 @@ mod tests {
     ///
     /// Optional env: HAPTIC_CAPTURE_WAVE_SPEED (1.0), HAPTIC_CAPTURE_SECS
     /// (13), HAPTIC_CAPTURE_SR (48000), HAPTIC_CAPTURE_BLOCK (512),
-    /// HAPTIC_CAPTURE_ORBIT_PERIOD (6), HAPTIC_CAPTURE_NOTE (36 / Ableton C1),
+    /// HAPTIC_CAPTURE_ORBIT_PERIOD (6), HAPTIC_CAPTURE_NOTE (33 / Ableton A0),
     /// HAPTIC_CAPTURE_MPE_MS (8), HAPTIC_CAPTURE_RADIUS_M (35% of the shorter
     /// table side), HAPTIC_CAPTURE_VELOCITY (100), HAPTIC_CAPTURE_PRESSURE
     /// (1), HAPTIC_CAPTURE_ATTEN_D0 (0.5), HAPTIC_CAPTURE_ATTEN_EXPONENT (1).

@@ -59,8 +59,8 @@ Five principles guide development:
 - Disconnect, voice stealing, note-off, and panic all enter bounded lifecycle
   paths intended to prevent indefinitely sustained voices.
 - The server audio callback owns the engine. Commands, layout updates, levels,
-  and voice snapshots cross thread boundaries through fixed-capacity rings or
-  bounded queues.
+  and measured-output/reference snapshots cross thread boundaries through
+  fixed-capacity rings or bounded queues.
 
 ### Sound and control model
 
@@ -79,7 +79,10 @@ Five principles guide development:
   be expressed as speed or fixed wavelength and automated live.
 - MIDI frequencies use standard equal temperament with no transposition, then
   clamp to the 20–200 Hz haptic band. Note names use Ableton's octave
-  convention; the default test note is MIDI 36 / C1 / 65.4 Hz.
+  convention; the default test note is MIDI 33 / A0 / 55 Hz.
+- Wave-speed controls span 0.1–100 m/s. The viewer test console defaults to
+  5 m/s, while the reusable instance/plugin default remains 20 m/s. Shared
+  distance decay defaults to a 2 m knee with exponent 1.
 - Pitch bend maps to source x, CC74/timbre to source y, pressure to intensity,
   and strike velocity to amplitude. Stimulus type, scale, and distance decay
   are stable DAW parameters.
@@ -98,9 +101,15 @@ Five principles guide development:
   directly by the callback, plus generation-based delay-line clearing.
 - Layout and per-transducer gains come from `haptic.toml` and hot-reload off the
   audio thread. Invalid updates leave the accepted layout running.
-- The viewer displays all active Wave and TW voices, summed or filtered by
-  instance. Its spatial field is a phase-aligned geometric preview, not an exact
-  reconstruction of synchronized oscillator phase and delay-line history.
+- The viewer colours all 32 nodes from a server-side Hilbert transform of the
+  final bounded logical output, after reconstruction and before monitor
+  routing. It always shows the complete summed field; its only display choice
+  is the rule used to select an active reference oscillator.
+- Reference oscillators are aligned to the reconstruction and Hilbert group
+  delay. A selected oscillator continues through Wave/reconstruction/analysis
+  tails; silence ends the hold early, while a bounded filter-tail hold permits
+  another active reference to take over when other voices remain. Other pitches
+  rotate at their true difference frequencies without lock-in smoothing.
 - Headless mode runs the complete engine against a paced 48 kHz, 32-channel
   memory sink. It uses an isolated per-process socket by default and does not
   contend with the production server or open audio hardware.
@@ -143,9 +152,10 @@ allocation, shared locks, or cross-module abstractions that obscure callback
 cost. Move one coherent subsystem at a time while its existing tests remain
 green.
 
-**Next move:** extract the delay-line/scatter kernel and reconstruction code
-with no numerical changes, then establish narrow module-level tests around the
-extracted interfaces.
+**Next move:** extract the delay-line/scatter kernel plus reconstruction/output
+safety code with no numerical changes, placing the latter beside the existing
+fixed-capacity output-analysis module, then establish narrow module-level tests
+around the extracted interfaces.
 
 **Done when:** adding a fixed-capacity stimulus does not require modifying
 unrelated delay, routing, or reconstruction internals, and every lifecycle path

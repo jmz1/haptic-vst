@@ -49,7 +49,7 @@ The split establishes clear ownership:
 | `haptic-server` | IPC listener, connection lifecycle, fixed-capacity stimulus engine, CPAL output, layout loading, and headless sink. |
 | `haptic-plugin` | VST3 controller, MIDI/MPE merge state, automatable parameters, reconnect worker, and editor. |
 | `haptic-plugin-standalone` | Standalone host for the same controller plugin. |
-| `haptic-viewer` | Primary GUI application: server supervision, observation, field visualisation, instance filtering, routing, and test console. |
+| `haptic-viewer` | Primary GUI application: server supervision, measured-output visualisation, reference selection, routing, and test console. |
 | `xtask` | VST3 bundling commands. |
 | `tools/test_note.py` | DAW-free scripted protocol client. |
 
@@ -187,7 +187,7 @@ The server has three principal execution contexts:
 
 1. **Audio callback or dummy-audio loop.** Owns `StimulusEngine`, drains engine
    commands once per callback, renders audio, and publishes bounded levels and
-   voice snapshots.
+   measured-output/reference snapshots.
 2. **IPC thread.** Owns the listener and clients, validates/decode commands,
    pushes engine commands, and publishes observer status.
 3. **Configuration watcher.** Polls `haptic.toml` metadata at about 1 Hz,
@@ -204,7 +204,7 @@ The important flows are:
 socket command   -> IPC validation -> rtrb command ring -> audio callback
 layout candidate -> config watcher -> bounded layout ring -> audio callback
 logical levels   <- IPC broadcast  <- bounded levels ring <- audio callback
-voice snapshot   <- IPC broadcast  <- bounded snapshot ring <- audio callback
+output snapshot  <- IPC broadcast  <- bounded snapshot ring <- audio callback
 ```
 
 ## Real-time contract
@@ -276,7 +276,9 @@ Per device frame:
 4. Apply layout gains and bounded logical mixing.
 5. Reconstruct device-rate samples through the polyphase filter.
 6. Apply final output safety bounds.
-7. Copy the selected logical channels to physical device outputs according to
+7. Feed the bounded 32-channel logical vector to fixed-capacity Hilbert
+   analysis.
+8. Copy the selected logical channels to physical device outputs according to
    monitor routing.
 
 Logical levels and viewer state are measured before physical routing. A stereo
@@ -309,18 +311,26 @@ Observers receive:
 
 - RMS levels for all 32 logical channels at about 60 Hz;
 - layout and physical routing state;
-- a fixed-capacity snapshot of up to 16 active voices; and
-- an explicit empty active-voice snapshot when nothing is sounding.
+- a fixed-capacity `OutputState` containing the Hilbert analytic signal of all
+  32 final logical outputs; and
+- up to 16 synchronized active source-oscillator references plus geometry for
+  labels and source cursors.
 
-`VoiceInfo` contains identity, note type, frequency, effective scale, decay,
-requested/effective position, and amplitude. It does not contain synchronized
-oscillator phase or Wave delay-line contents. The viewer therefore reconstructs
-relative spatial phase geometrically and phase-aligns voices for display.
+`haptic-server/src/output_analysis.rs` consumes actual bounded device-rate
+logical samples after reconstruction and before monitor routing. It selects
+samples at approximately 1.5 kHz, safely above the 20--200 Hz system band, and
+applies a 255-tap odd-symmetric Blackman-windowed Hilbert FIR independently to
+all 32 channels. At 48 kHz the Hilbert group delay is about 84.7 ms; the
+published reference phases include both that delay and the reconstruction
+filter's group delay.
 
-For a single TW voice, the relative phase and distance gain use the same shared
-closed-form helper as the engine and can match closely. For Wave, or for the
-absolute interference of multiple voices, the display remains a deliberately
-labelled preview rather than exact output truth.
+The viewer multiplies the measured analytic vector by the conjugate of one
+selected oscillator. Selection rules never alter the measured sum. Zero
+relative phase retains the established blue hue, and other simultaneous
+pitches rotate at their unsmoothed difference frequencies. When a selected
+voice disappears, the viewer advances its oscillator on the reported device
+sample clock until the finite Wave, reconstruction, and Hilbert tails are
+silent.
 
 ## Operational profiles
 

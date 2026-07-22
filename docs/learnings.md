@@ -84,8 +84,9 @@ then collapsed Doppler behaviour at predictable orbit positions.
 
 **Carry forward:** derive delay capacity from maximum physical distance,
 minimum wave speed, kernel lookahead, render rate, and release needs. Report or
-test that time margin. The two-rate engine makes 16,384 cells cover about 10.9 s
-at the preferred 1.5 kHz internal rate.
+test that time margin. The two-rate engine currently makes 34,000 cells cover
+about 22.7 s at the preferred 1.5 kHz internal rate, enough for the default
+table diagonal at the 0.1 m/s control floor.
 
 ## Block-rate control steps become signal-rate artifacts
 
@@ -138,13 +139,16 @@ to a selected logical channel. Device discovery must not resize the model.
 
 ## Observer geometry is not delayed audio truth
 
-Current voice snapshots do not include synchronized oscillator phases or Wave
-delay-line contents. Present source position and wavelength are insufficient to
-reconstruct exact moving-source output or in-flight release energy.
+Present source position and wavelength are insufficient to reconstruct exact
+moving-source output or in-flight release energy. The earlier geometric viewer
+could closely predict one TW voice but diverged for Wave history and absolute
+multi-voice interference.
 
-**Carry forward:** label the viewer as a phase-aligned geometric preview. Claim
-exactness only for quantities actually shared with the engine, such as a single
-TW voice's relative phasor and decay.
+**Carry forward:** derive whole-system visualisation from the final bounded
+logical audio, not voice metadata. The current server-side Hilbert analyser
+runs after reconstruction and publishes synchronized oscillator references;
+geometry is retained only for cursors and labels. Reference selection may
+rotate the measured sum but must never filter or resynthesise it.
 
 ## Build identity must outlive bundle timestamps
 
@@ -187,5 +191,5 @@ test pitches disagree.
 
 **Carry forward:** use Ableton octave names in the UI, standard MIDI frequency
 without transposition in the engine, and an explicit 20–200 Hz clamp. Choose
-test-note defaults directly for their desired frequency; MIDI 36 / Ableton C1
-preserves the useful 65.4 Hz default without a hidden mapping.
+test-note defaults directly for their desired frequency; the current MIDI 33 /
+Ableton A0 default produces 55 Hz without a hidden mapping.

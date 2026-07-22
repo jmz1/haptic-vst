@@ -19,9 +19,9 @@ import os
 
 SOCKET_PATH = "/tmp/haptic-vst.sock"
 TEST_CHANNEL = 15
-DEFAULT_TEST_NOTE = 36  # Ableton C1, 65.4 Hz without transposition
+DEFAULT_TEST_NOTE = 33  # Ableton A0, 55 Hz without transposition
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 # HapticCommand variant tags (declaration order in haptic-protocol)
 HELLO, NOTE_ON, NOTE_OFF, MPE_UPDATE, SET_PARAMETER, PANIC = range(6)
@@ -146,7 +146,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--note", type=int, default=DEFAULT_TEST_NOTE,
-                    help="MIDI note (default 36 / Ableton C1 / 65.4 Hz)")
+                    help="MIDI note (default 33 / Ableton A0 / 55 Hz)")
     ap.add_argument("--velocity", type=int, default=100, help="1-127 (default 100)")
     ap.add_argument("--duration", type=float, default=2.0, help="seconds (default 2)")
     ap.add_argument("--pressure", type=float, default=1.0, help="MPE pressure 0-1")

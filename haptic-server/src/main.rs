@@ -9,6 +9,7 @@ mod audio;
 mod config;
 mod engine;
 mod ipc;
+mod output_analysis;
 
 use config::TransducerLayout;
 use engine::StimulusEngine;
@@ -77,8 +78,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create stimulus engine - the IPC thread gets the command producer and
-    // voice-snapshot consumer, the config watcher gets the layout producer
-    let (engine, command_producer, engine_layout_producer, voice_consumer) =
+    // measured-output consumer, the config watcher gets the layout producer
+    let (engine, command_producer, engine_layout_producer, output_consumer) =
         StimulusEngine::new(layout);
 
     // Levels path: audio callback → IPC thread → connected clients
@@ -103,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 running,
                 command_producer,
                 levels_consumer,
-                voice_consumer,
+                output_consumer,
                 layout,
                 ipc_layout_consumer,
                 device_channels_for_ipc,

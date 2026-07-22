@@ -3,11 +3,10 @@
 //!
 //! Attaches to an existing haptic server or starts a supervised child process,
 //! then connects over the same Unix-socket observer protocol and renders the
-//! configured
-//! transducer layout as coloured circles. In per-note mode each circle's
-//! OKLCH hue encodes the phase of the most recent delay-line voice at that
-//! transducer, relative to the source oscillator: zero phase difference
-//! maps to blue, and phase lag rotates the hue around the wheel.
+//! configured transducer layout as coloured circles. Each circle's OKLCH hue
+//! is derived from the server's Hilbert analytic signal for the final summed
+//! logical output, relative to a selected active source oscillator: zero phase
+//! difference maps to blue, and phase lag rotates the hue around the wheel.
 //! Lightness/chroma follow local amplitude, with chroma clamped into the
 //! sRGB gamut so the sweep never clips.
 //!
@@ -35,9 +34,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use haptic_protocol::{
-    encode_frame, travelling_wave_relative_phasor, ClientRole, DistanceDecay, FrameDecoder,
-    HapticCommand, InstanceConfig, MpeData, Parameter, ServerStatus, SpatialScaleMode,
-    StimulusType, PROTOCOL_VERSION, SOCKET_PATH,
+    encode_frame, ClientRole, FrameDecoder, HapticCommand, InstanceConfig, MpeData, Parameter,
+    ServerStatus, SpatialScaleMode, StimulusType, PROTOCOL_VERSION, SOCKET_PATH,
 };
 use parking_lot::Mutex;
 
@@ -45,17 +43,14 @@ const TRANSDUCERS: usize = 32;
 const TRANSDUCER_RADIUS_M: f32 = 0.09;
 const DISPLAY_EDGE_PADDING_PX: f32 = 8.0;
 
-/// Wave-speed floor mirroring the engine's `MIN_WAVE_SPEED`, used when the
-/// viewer reconstructs per-transducer delays geometrically from a voice's
-/// source position and wave speed.
-const WAVE_SPEED_FLOOR: f32 = 0.25;
-
 /// OKLCH hue of sRGB blue: the reference for zero phase difference.
 const ZERO_PHASE_HUE_DEG: f32 = 264.0;
 
-/// A voice older than this is considered ended (the server stops sending
-/// snapshots when nothing is active).
-const VOICE_STALE: Duration = Duration::from_millis(300);
+/// A measured field older than this is considered disconnected/stale.
+const OUTPUT_STALE: Duration = Duration::from_millis(300);
+const OUTPUT_SILENCE_THRESHOLD: f32 = 1.0e-4;
+const SILENT_SNAPSHOTS_TO_RELEASE_REFERENCE: u8 = 3;
+const REFERENCE_FILTER_TAIL_HOLD_S: f32 = 0.25;
 
 /// MIDI channel used for the viewer's test note (avoids the low channels
 /// a DAW/MPE zone will typically use first).
@@ -346,53 +341,51 @@ impl ServerSupervisor {
         ui.horizontal(|ui| {
             let (colour, label) = match self.mode {
                 ServerMode::Managed if connected => {
-                    (egui::Color32::from_rgb(64, 200, 120), "managed server")
+                    (egui::Color32::from_rgb(64, 200, 120), "managed")
                 }
-                ServerMode::Managed => (
-                    egui::Color32::from_rgb(220, 170, 60),
-                    "managed server starting",
-                ),
+                ServerMode::Managed => (egui::Color32::from_rgb(220, 170, 60), "starting"),
                 ServerMode::External if connected => {
-                    (egui::Color32::from_rgb(80, 160, 230), "external server")
+                    (egui::Color32::from_rgb(80, 160, 230), "external")
                 }
                 ServerMode::External => (
                     egui::Color32::from_rgb(220, 170, 60),
-                    "external server unavailable",
+                    "external unavailable",
                 ),
-                ServerMode::ConnectOnly if connected => (
-                    egui::Color32::from_rgb(80, 160, 230),
-                    "connect-only · attached",
-                ),
-                ServerMode::ConnectOnly => (
-                    egui::Color32::from_rgb(150, 150, 150),
-                    "connect-only · waiting",
-                ),
-                ServerMode::Stopped => (egui::Color32::from_rgb(150, 150, 150), "server stopped"),
-                ServerMode::Failed => (
-                    egui::Color32::from_rgb(220, 80, 80),
-                    "managed server failed",
-                ),
+                ServerMode::ConnectOnly if connected => {
+                    (egui::Color32::from_rgb(80, 160, 230), "attached")
+                }
+                ServerMode::ConnectOnly => (egui::Color32::from_rgb(150, 150, 150), "waiting"),
+                ServerMode::Stopped => (egui::Color32::from_rgb(150, 150, 150), "stopped"),
+                ServerMode::Failed => (egui::Color32::from_rgb(220, 80, 80), "server failed"),
             };
-            ui.colored_label(colour, format!("● {label}"));
-            ui.separator();
-            ui.weak(&self.options.socket_path);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match self.mode {
+                    ServerMode::Managed => {
+                        if ui.button("stop").clicked() {
+                            self.stop_managed();
+                        }
+                        if ui.button("restart").clicked() {
+                            self.restart_managed();
+                        }
+                    }
+                    ServerMode::Stopped | ServerMode::Failed => {
+                        if ui.button("start server").clicked() {
+                            self.start_managed();
+                        }
+                    }
+                    ServerMode::ConnectOnly | ServerMode::External => {}
+                }
 
-            match self.mode {
-                ServerMode::Managed => {
-                    if ui.button("restart").clicked() {
-                        self.restart_managed();
-                    }
-                    if ui.button("stop").clicked() {
-                        self.stop_managed();
-                    }
-                }
-                ServerMode::Stopped | ServerMode::Failed => {
-                    if ui.button("start server").clicked() {
-                        self.start_managed();
-                    }
-                }
-                ServerMode::ConnectOnly | ServerMode::External => {}
-            }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.colored_label(colour, format!("● {label}"));
+                    ui.separator();
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&self.options.socket_path).weak())
+                            .truncate(),
+                    )
+                    .on_hover_text(&self.options.socket_path);
+                });
+            });
         });
 
         egui::CollapsingHeader::new("server log")
@@ -400,7 +393,8 @@ impl ServerSupervisor {
             .show(ui, |ui| {
                 let logs = self.logs.lock();
                 for line in logs.iter().rev().take(12).rev() {
-                    ui.monospace(line);
+                    ui.add(egui::Label::new(egui::RichText::new(line).monospace()).truncate())
+                        .on_hover_text(line);
                 }
             });
     }
@@ -469,25 +463,31 @@ fn push_server_log(logs: &Mutex<VecDeque<String>>, line: String) {
 #[derive(Clone, Copy)]
 struct LayoutView {
     positions: [(f32, f32); TRANSDUCERS],
-    gains: [f32; TRANSDUCERS],
     table_m: (f32, f32),
 }
 
 #[derive(Clone, Copy)]
 struct VoiceView {
     instance_id: u64,
+    seq: u64,
     note: u8,
-    note_type: StimulusType,
     frequency: f32,
-    wave_speed: f32,
-    scale_mode: SpatialScaleMode,
-    wavelength_m: f32,
-    decay: DistanceDecay,
     /// Effective (velocity-limited) source the delay lines radiate from.
     source_pos: (f32, f32),
     /// Where MPE is asking the source to be.
     requested_pos: (f32, f32),
     amplitude: f32,
+    reference_phase: f32,
+}
+
+#[derive(Clone)]
+struct OutputView {
+    device_sample_rate: f32,
+    sample_index: u64,
+    valid: bool,
+    analytic: [(f32, f32); TRANSDUCERS],
+    voices: Vec<VoiceView>,
+    received_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -502,11 +502,10 @@ struct Shared {
     /// Writable clone of the socket for sending commands from the UI.
     writer: Option<UnixStream>,
     layout: Option<LayoutView>,
-    /// All active voices from the last `ActiveVoices` broadcast, with the
-    /// time it arrived (for staleness).
-    voices: Option<(Vec<VoiceView>, Instant)>,
+    /// Measured final output and its synchronized oscillator references.
+    output: Option<OutputView>,
     routing: Option<RoutingView>,
-    voice_rate: RateCounter,
+    output_rate: RateCounter,
 }
 
 #[derive(Default)]
@@ -621,7 +620,7 @@ fn reader_thread(shared: Arc<Mutex<Shared>>, instance_id: u64, socket_path: Stri
         let mut state = shared.lock();
         state.connected = false;
         state.writer = None;
-        state.voices = None;
+        state.output = None;
         drop(state);
         thread::sleep(Duration::from_millis(500));
     }
@@ -631,14 +630,10 @@ fn apply_message(shared: &Mutex<Shared>, msg: ServerStatus) {
     match msg {
         ServerStatus::Layout {
             positions,
-            gains,
+            gains: _,
             table_m,
         } => {
-            shared.lock().layout = Some(LayoutView {
-                positions,
-                gains,
-                table_m,
-            });
+            shared.lock().layout = Some(LayoutView { positions, table_m });
         }
         ServerStatus::MonitorRouting {
             device_channels,
@@ -649,30 +644,39 @@ fn apply_message(shared: &Mutex<Shared>, msg: ServerStatus) {
                 routes,
             });
         }
-        ServerStatus::ActiveVoices { count, voices, .. } => {
+        ServerStatus::OutputState {
+            device_sample_rate,
+            sample_index,
+            valid,
+            analytic,
+            count,
+            voices,
+            ..
+        } => {
             let list: Vec<VoiceView> = voices
                 .iter()
                 .take(count as usize)
                 .map(|v| VoiceView {
                     instance_id: v.instance_id,
+                    seq: v.seq,
                     note: v.note,
-                    note_type: v.note_type,
                     frequency: v.frequency,
-                    wave_speed: v.wave_speed,
-                    scale_mode: v.scale_mode,
-                    wavelength_m: v.wavelength_m,
-                    decay: DistanceDecay {
-                        d0_m: v.atten_d0_m,
-                        exponent: v.atten_exponent,
-                    },
                     source_pos: v.source_pos,
                     requested_pos: v.requested_pos,
                     amplitude: v.amplitude,
+                    reference_phase: v.reference_phase,
                 })
                 .collect();
             let mut state = shared.lock();
-            state.voices = Some((list, Instant::now()));
-            state.voice_rate.tick();
+            state.output = Some(OutputView {
+                device_sample_rate,
+                sample_index,
+                valid,
+                analytic,
+                voices: list,
+                received_at: Instant::now(),
+            });
+            state.output_rate.tick();
         }
         _ => {}
     }
@@ -767,7 +771,7 @@ impl Default for TestControls {
             note: haptic_protocol::DEFAULT_TEST_NOTE,
             velocity: 100,
             stimulus_type: StimulusType::Wave,
-            wave_speed: 1.0,
+            wave_speed: 5.0,
             scale_mode: SpatialScaleMode::Speed,
             wavelength_m: 0.2,
             atten_d0_m: haptic_protocol::DEFAULT_ATTEN_D0_M,
@@ -882,15 +886,57 @@ impl TestControls {
 // App
 // ---------------------------------------------------------------------------
 
-/// Which active voices the field visualisation includes. The viewer is the
-/// one observer of whole-server state, so by default it sums every voice;
-/// filtering narrows to a single controller instance.
-#[derive(Clone, Copy, PartialEq)]
-enum VoiceFilter {
-    /// Sum the field of every active voice (whole-system state).
-    All,
-    /// Only voices owned by this instance.
-    Instance(u64),
+/// Rule for choosing the oscillator against which the same measured summed
+/// output is compared. This never filters or otherwise changes the field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReferenceRule {
+    StickyNewest,
+    Oldest,
+    Strongest,
+    PreferViewerTest,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SelectedReference {
+    instance_id: u64,
+    seq: u64,
+    note: u8,
+    frequency: f32,
+    phase: f32,
+    sample_index: u64,
+    device_sample_rate: f32,
+    amplitude: f32,
+}
+
+impl SelectedReference {
+    fn from_voice(voice: &VoiceView, output: &OutputView) -> Self {
+        Self {
+            instance_id: voice.instance_id,
+            seq: voice.seq,
+            note: voice.note,
+            frequency: voice.frequency,
+            phase: voice.reference_phase,
+            sample_index: output.sample_index,
+            device_sample_rate: output.device_sample_rate,
+            amplitude: voice.amplitude,
+        }
+    }
+
+    fn advance_to(&mut self, output: &OutputView) {
+        if self.device_sample_rate != output.device_sample_rate
+            || output.sample_index < self.sample_index
+        {
+            self.sample_index = output.sample_index;
+            self.device_sample_rate = output.device_sample_rate;
+            return;
+        }
+        let frames = output.sample_index - self.sample_index;
+        self.phase = (self.phase
+            + std::f32::consts::TAU * self.frequency * frames as f32 / output.device_sample_rate)
+            .rem_euclid(std::f32::consts::TAU);
+        self.sample_index = output.sample_index;
+        self.device_sample_rate = output.device_sample_rate;
+    }
 }
 
 struct ViewerApp {
@@ -898,12 +944,143 @@ struct ViewerApp {
     server: ServerSupervisor,
     fps: RateCounter,
     test: TestControls,
-    /// Which voices the field visualisation includes.
-    filter: VoiceFilter,
+    instance_id: u64,
+    reference_rule: ReferenceRule,
+    reference: Option<SelectedReference>,
+    reference_missing_since: Option<u64>,
+    silent_reference_snapshots: u8,
     /// Parameter values in effect for the sounding note, to retrigger when
     /// the user lands on new slider values.
     sounding_params: (u8, u8, StimulusType, f32),
     last_live_config: (f32, SpatialScaleMode, f32, f32, f32),
+}
+
+impl ViewerApp {
+    fn update_reference(&mut self, output: &OutputView) {
+        if let Some(reference) = self.reference.as_mut() {
+            if let Some(voice) = output.voices.iter().find(|voice| {
+                voice.instance_id == reference.instance_id && voice.seq == reference.seq
+            }) {
+                *reference = SelectedReference::from_voice(voice, output);
+            } else {
+                reference.advance_to(output);
+            }
+        }
+
+        let reference_is_live = self.reference.is_some_and(|reference| {
+            output.voices.iter().any(|voice| {
+                voice.instance_id == reference.instance_id && voice.seq == reference.seq
+            })
+        });
+        let output_is_silent = output
+            .analytic
+            .iter()
+            .all(|&(real, imaginary)| real.hypot(imaginary) < OUTPUT_SILENCE_THRESHOLD);
+        if self.reference.is_some() && !reference_is_live {
+            let missing_since = *self
+                .reference_missing_since
+                .get_or_insert(output.sample_index);
+            if output.valid && output_is_silent {
+                self.silent_reference_snapshots = self.silent_reference_snapshots.saturating_add(1);
+            } else {
+                self.silent_reference_snapshots = 0;
+            }
+            let hold_elapsed = output.sample_index.saturating_sub(missing_since) as f32
+                / output.device_sample_rate
+                >= REFERENCE_FILTER_TAIL_HOLD_S;
+            if hold_elapsed
+                || self.silent_reference_snapshots >= SILENT_SNAPSHOTS_TO_RELEASE_REFERENCE
+            {
+                self.reference = None;
+                self.reference_missing_since = None;
+                self.silent_reference_snapshots = 0;
+            }
+        } else {
+            self.reference_missing_since = None;
+            self.silent_reference_snapshots = 0;
+        }
+
+        let candidate = match self.reference_rule {
+            ReferenceRule::StickyNewest => {
+                sticky_newest_candidate(&output.voices, self.reference.as_ref(), |_| true)
+            }
+            ReferenceRule::Oldest => {
+                if self.reference.is_none() {
+                    output.voices.iter().min_by_key(|voice| voice.seq)
+                } else {
+                    None
+                }
+            }
+            ReferenceRule::Strongest => {
+                let strongest = output.voices.iter().max_by(|a, b| {
+                    a.amplitude
+                        .partial_cmp(&b.amplitude)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                match (strongest, self.reference.as_ref()) {
+                    (Some(voice), Some(current))
+                        if voice.seq != current.seq
+                            && voice.amplitude <= current.amplitude * 1.1 =>
+                    {
+                        None
+                    }
+                    (voice, _) => voice,
+                }
+            }
+            ReferenceRule::PreferViewerTest => {
+                let preferred =
+                    sticky_newest_candidate(&output.voices, self.reference.as_ref(), |voice| {
+                        voice.instance_id == self.instance_id
+                    });
+                preferred.or_else(|| {
+                    if self
+                        .reference
+                        .is_some_and(|reference| reference.instance_id == self.instance_id)
+                    {
+                        None
+                    } else {
+                        sticky_newest_candidate(&output.voices, self.reference.as_ref(), |_| true)
+                    }
+                })
+            }
+        };
+
+        if let Some(voice) = candidate {
+            if self
+                .reference
+                .is_none_or(|reference| reference.seq != voice.seq)
+            {
+                self.reference = Some(SelectedReference::from_voice(voice, output));
+                self.reference_missing_since = None;
+                self.silent_reference_snapshots = 0;
+            }
+        }
+    }
+}
+
+fn sticky_newest_candidate<'a>(
+    voices: &'a [VoiceView],
+    current: Option<&SelectedReference>,
+    include: impl Fn(&VoiceView) -> bool,
+) -> Option<&'a VoiceView> {
+    let newest = voices
+        .iter()
+        .filter(|voice| include(voice))
+        .max_by_key(|voice| voice.seq)?;
+    match current {
+        Some(current) if newest.seq <= current.seq => None,
+        _ => Some(newest),
+    }
+}
+
+fn relative_to_reference(analytic: (f32, f32), reference_phase: f32) -> (f32, f32) {
+    let (real, imaginary) = analytic;
+    let (cosine, sine) = (reference_phase.cos(), reference_phase.sin());
+    // z * conjugate(reference)
+    (
+        real * cosine + imaginary * sine,
+        imaginary * cosine - real * sine,
+    )
 }
 
 const NOTE_NAMES: [&str; 12] = [
@@ -918,15 +1095,52 @@ fn note_name(note: u8) -> String {
 
 #[cfg(test)]
 mod note_name_tests {
-    use super::note_name;
+    use super::{note_name, relative_to_reference, OutputView, SelectedReference, TRANSDUCERS};
 
     #[test]
     fn uses_ableton_octave_numbers() {
         assert_eq!(note_name(0), "C-2");
-        assert_eq!(note_name(haptic_protocol::DEFAULT_TEST_NOTE), "C1");
+        assert_eq!(note_name(haptic_protocol::DEFAULT_TEST_NOTE), "A0");
         assert_eq!(note_name(48), "C2");
         assert_eq!(note_name(60), "C3");
         assert_eq!(note_name(69), "A3");
+    }
+
+    #[test]
+    fn reference_rotation_preserves_the_existing_phase_direction() {
+        let reference_phase = 0.7f32;
+        let lag = -0.4f32;
+        let analytic_phase = reference_phase + lag;
+        let relative = relative_to_reference(
+            (analytic_phase.cos(), analytic_phase.sin()),
+            reference_phase,
+        );
+        assert!((relative.1.atan2(relative.0) - lag).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn missing_reference_oscillator_continues_on_the_output_clock() {
+        let mut reference = SelectedReference {
+            instance_id: 1,
+            seq: 2,
+            note: 36,
+            frequency: 100.0,
+            phase: 0.25,
+            sample_index: 1_000,
+            device_sample_rate: 48_000.0,
+            amplitude: 0.5,
+        };
+        let output = OutputView {
+            device_sample_rate: 48_000.0,
+            sample_index: 1_480,
+            valid: true,
+            analytic: [(0.0, 0.0); TRANSDUCERS],
+            voices: Vec::new(),
+            received_at: std::time::Instant::now(),
+        };
+        reference.advance_to(&output);
+        let expected = (0.25 + std::f32::consts::TAU).rem_euclid(std::f32::consts::TAU);
+        assert!((reference.phase - expected).abs() < 1.0e-5);
     }
 }
 
@@ -945,37 +1159,38 @@ impl eframe::App for ViewerApp {
         self.fps.tick();
         let fps = self.fps.rate();
 
-        let (connected, layout, voices, routing, voice_rate) = {
+        let (connected, layout, output, routing, output_rate) = {
             let mut state = self.shared.lock();
-            let rate = state.voice_rate.rate();
-            let voices = state
-                .voices
+            let rate = state.output_rate.rate();
+            let output = state
+                .output
                 .as_ref()
-                .filter(|(_, at)| at.elapsed() < VOICE_STALE)
-                .map(|(v, _)| v.clone())
-                .unwrap_or_default();
-            (state.connected, state.layout, voices, state.routing, rate)
+                .filter(|output| output.received_at.elapsed() < OUTPUT_STALE)
+                .cloned();
+            (state.connected, state.layout, output, state.routing, rate)
         };
         let table = layout.map(|l| l.table_m).unwrap_or((1.0, 2.0));
+        if let Some(output) = output.as_ref() {
+            self.update_reference(output);
+        }
+        let voices = output
+            .as_ref()
+            .map(|output| output.voices.as_slice())
+            .unwrap_or_default();
 
-        // Distinct instances currently sounding, for the filter picker.
+        // Distinct instances currently sounding, for status only. The field
+        // itself is never filtered by voice or instance.
         let mut instances: Vec<u64> = voices.iter().map(|v| v.instance_id).collect();
         instances.sort_unstable();
         instances.dedup();
-        // Drop a stale instance filter back to All if that instance went quiet.
-        if let VoiceFilter::Instance(id) = self.filter {
-            if !instances.contains(&id) {
-                self.filter = VoiceFilter::All;
-            }
-        }
-        let shown: Vec<VoiceView> = voices
-            .iter()
-            .copied()
-            .filter(|v| match self.filter {
-                VoiceFilter::All => true,
-                VoiceFilter::Instance(id) => v.instance_id == id,
+        let relative_analytic = output.as_ref().and_then(|output| {
+            let reference = self.reference?;
+            output.valid.then(|| {
+                std::array::from_fn(|channel| {
+                    relative_to_reference(output.analytic[channel], reference.phase)
+                })
             })
-            .collect();
+        });
 
         egui::TopBottomPanel::top("server").show(ctx, |ui| {
             self.server.ui(ui, connected);
@@ -983,55 +1198,36 @@ impl eframe::App for ViewerApp {
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if connected {
-                    ui.colored_label(egui::Color32::from_rgb(64, 200, 120), "● connected");
-                } else {
-                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), "● waiting for server");
-                }
-                if let Some(r) = routing {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Keep FPS at the fixed right edge. Changes in message rate or
+                    // activity text can only consume space to its left.
+                    ui.label(format!("{output_rate} msg/s · {fps} fps"));
                     ui.separator();
-                    ui.label(format!("device: {} ch", r.device_channels));
-                }
-                ui.separator();
-                ui.label(match voices.len() {
-                    0 => "no active voices".to_string(),
-                    n => format!("{n} voice(s), {} instance(s)", instances.len()),
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        if connected {
+                            ui.colored_label(egui::Color32::from_rgb(64, 200, 120), "● connected");
+                        } else {
+                            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), "● waiting");
+                        }
+                        ui.separator();
+                        let activity = match voices.len() {
+                            0 => "idle".to_string(),
+                            1 => "1 voice".to_string(),
+                            n => format!("{n} voices · {} instances", instances.len()),
+                        };
+                        let summary = routing.map_or(activity.clone(), |routing| {
+                            format!("{} ch · {activity}", routing.device_channels)
+                        });
+                        ui.add(egui::Label::new(&summary).truncate())
+                            .on_hover_text(&summary);
+                    });
                 });
-                if shown.len() == 1 {
-                    let v = &shown[0];
-                    ui.separator();
-                    match v.note_type {
-                        StimulusType::Wave => ui.label(format!(
-                            "Wave · note {} ({:.1} Hz)  c = {:.0} m/s  λ = {:.2} m",
-                            note_name(v.note),
-                            v.frequency,
-                            v.wave_speed,
-                            v.wave_speed / v.frequency,
-                        )),
-                        StimulusType::TravellingWave => ui.label(format!(
-                            "TW ({}) · note {} ({:.1} Hz)  c = {:.2} m/s  λ = {:.4} m",
-                            match v.scale_mode {
-                                SpatialScaleMode::Speed => "fixed speed",
-                                SpatialScaleMode::Wavelength => "fixed wavelength",
-                            },
-                            note_name(v.note),
-                            v.frequency,
-                            v.wave_speed,
-                            v.wavelength_m,
-                        )),
-                    };
-                }
-                ui.separator();
-                ui.label(format!("{fps} fps / {voice_rate} msg/s"));
-                ui.separator();
-                ui.weak("geometric preview · voices shown phase-aligned");
             });
         });
 
         egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
-            self.filter_ui(ui, &instances);
+            self.reference_ui(ui);
             ui.add_enabled_ui(connected, |ui| self.test_controls_ui(ui, table));
-            ui.label("drag on table: move source (○ requested, ✚ effective)   ·   left-click a cell: monitor on output 1 (L)   ·   right-click: output 2 (R)");
         });
 
         let mut interaction = TableInteraction::default();
@@ -1044,7 +1240,13 @@ impl eframe::App for ViewerApp {
                     });
                     return;
                 };
-                interaction = draw_table(ui, &layout, &shown, routing.as_ref());
+                interaction = draw_table(
+                    ui,
+                    &layout,
+                    voices,
+                    routing.as_ref(),
+                    relative_analytic.as_ref(),
+                );
             });
 
         // Apply table interactions
@@ -1113,45 +1315,89 @@ impl eframe::App for ViewerApp {
 }
 
 impl ViewerApp {
-    /// Filter picker: sum the whole system, or narrow to one controller
-    /// instance. Instances are labelled by a short hash of their id.
-    fn filter_ui(&mut self, ui: &mut egui::Ui, instances: &[u64]) {
+    fn reference_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("visualise:");
-            let label = match self.filter {
-                VoiceFilter::All => "all instances (summed)".to_string(),
-                VoiceFilter::Instance(id) => format!("instance {:04x}", id & 0xffff),
+            ui.label("reference");
+            let label = match self.reference_rule {
+                ReferenceRule::StickyNewest => "newest",
+                ReferenceRule::Oldest => "oldest",
+                ReferenceRule::Strongest => "strongest",
+                ReferenceRule::PreferViewerTest => "prefer test",
             };
-            egui::ComboBox::from_id_salt("voice_filter")
+            let mut changed = false;
+            egui::ComboBox::from_id_salt("reference_rule")
                 .selected_text(label)
+                .width(110.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.filter,
-                        VoiceFilter::All,
-                        "all instances (summed)",
-                    );
-                    for &id in instances {
-                        ui.selectable_value(
-                            &mut self.filter,
-                            VoiceFilter::Instance(id),
-                            format!("instance {:04x}", id & 0xffff),
-                        );
-                    }
-                });
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.reference_rule,
+                            ReferenceRule::StickyNewest,
+                            "sticky newest",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.reference_rule,
+                            ReferenceRule::Oldest,
+                            "oldest active",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.reference_rule,
+                            ReferenceRule::Strongest,
+                            "strongest active",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.reference_rule,
+                            ReferenceRule::PreferViewerTest,
+                            "prefer viewer test note",
+                        )
+                        .changed();
+                })
+                .response
+                .on_hover_text("Select the oscillator used as the phase reference");
+            if changed {
+                self.reference = None;
+                self.reference_missing_since = None;
+                self.silent_reference_snapshots = 0;
+            }
+            if let Some(reference) = self.reference {
+                ui.separator();
+                ui.add(
+                    egui::Label::new(format!(
+                        "{} · {:.1} Hz · #{:04x}",
+                        note_name(reference.note),
+                        reference.frequency,
+                        reference.instance_id & 0xffff,
+                    ))
+                    .truncate(),
+                );
+            }
         });
     }
 
     fn test_controls_ui(&mut self, ui: &mut egui::Ui, table: (f32, f32)) {
-        // Keep the console usable at the default 620 px window width. These
-        // controls used to occupy one long row, which clipped at wave speed.
-        ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+
+        ui.columns(2, |columns| {
             let playing = self.test.playing.is_some();
             let button = if playing {
                 "■ stop test note"
             } else {
                 "▶ start test note"
             };
-            if ui.button(button).clicked() {
+            let button_size = [
+                columns[0].available_width(),
+                columns[0].spacing().interact_size.y,
+            ];
+            if columns[0]
+                .add_sized(button_size, egui::Button::new(button))
+                .clicked()
+            {
                 if playing {
                     self.test.stop(&self.shared);
                 } else {
@@ -1168,116 +1414,185 @@ impl ViewerApp {
                     );
                 }
             }
-            ui.separator();
-            ui.label("note");
-            ui.add(
+            let slider_size = [
+                columns[1].available_width(),
+                columns[1].spacing().interact_size.y,
+            ];
+            columns[1].add_sized(
+                slider_size,
                 egui::Slider::new(&mut self.test.note, 24..=96)
+                    .text("note")
                     .custom_formatter(|v, _| note_name(v as u8)),
             );
         });
-        ui.horizontal(|ui| {
-            ui.label("type");
-            egui::ComboBox::from_id_salt("test_stimulus_type")
-                .selected_text(match self.test.stimulus_type {
-                    StimulusType::Wave => "Wave",
-                    StimulusType::TravellingWave => "TW",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.test.stimulus_type, StimulusType::Wave, "Wave");
-                    ui.selectable_value(
-                        &mut self.test.stimulus_type,
-                        StimulusType::TravellingWave,
-                        "Travelling Wave (TW)",
-                    );
-                });
-            ui.separator();
-            ui.label("velocity");
-            ui.add(egui::Slider::new(&mut self.test.velocity, 1..=127));
-        });
-        ui.horizontal(|ui| {
-            ui.separator();
-            ui.label("wave speed");
-            ui.add_enabled(
-                self.test.stimulus_type == StimulusType::Wave
-                    || self.test.scale_mode == SpatialScaleMode::Speed,
-                egui::Slider::new(
-                    &mut self.test.wave_speed,
-                    haptic_protocol::MIN_WAVE_SPEED..=haptic_protocol::MAX_WAVE_SPEED,
-                )
-                .logarithmic(true)
-                .suffix(" m/s"),
+
+        ui.columns(2, |columns| {
+            columns[0].horizontal(|ui| {
+                ui.label("type");
+                egui::ComboBox::from_id_salt("test_stimulus_type")
+                    .selected_text(match self.test.stimulus_type {
+                        StimulusType::Wave => "Wave",
+                        StimulusType::TravellingWave => "TW",
+                    })
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.test.stimulus_type,
+                            StimulusType::Wave,
+                            "Wave",
+                        );
+                        ui.selectable_value(
+                            &mut self.test.stimulus_type,
+                            StimulusType::TravellingWave,
+                            "Travelling Wave (TW)",
+                        );
+                    });
+            });
+            let slider_size = [
+                columns[1].available_width(),
+                columns[1].spacing().interact_size.y,
+            ];
+            columns[1].add_sized(
+                slider_size,
+                egui::Slider::new(&mut self.test.velocity, 1..=127).text("velocity"),
             );
         });
+
         if self.test.stimulus_type == StimulusType::TravellingWave {
-            ui.horizontal(|ui| {
-                ui.label("TW scale");
-                ui.selectable_value(&mut self.test.scale_mode, SpatialScaleMode::Speed, "speed");
-                ui.selectable_value(
-                    &mut self.test.scale_mode,
-                    SpatialScaleMode::Wavelength,
-                    "fixed wavelength",
-                );
-                ui.add_enabled(
-                    self.test.scale_mode == SpatialScaleMode::Wavelength,
+            ui.columns(2, |columns| {
+                columns[0].horizontal(|ui| {
+                    ui.label("scale");
+                    egui::ComboBox::from_id_salt("test_scale_mode")
+                        .selected_text(match self.test.scale_mode {
+                            SpatialScaleMode::Speed => "speed",
+                            SpatialScaleMode::Wavelength => "wavelength",
+                        })
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.test.scale_mode,
+                                SpatialScaleMode::Speed,
+                                "speed",
+                            );
+                            ui.selectable_value(
+                                &mut self.test.scale_mode,
+                                SpatialScaleMode::Wavelength,
+                                "fixed wavelength",
+                            );
+                        });
+                });
+                let slider_size = [
+                    columns[1].available_width(),
+                    columns[1].spacing().interact_size.y,
+                ];
+                match self.test.scale_mode {
+                    SpatialScaleMode::Speed => {
+                        columns[1].add_sized(
+                            slider_size,
+                            egui::Slider::new(
+                                &mut self.test.wave_speed,
+                                haptic_protocol::MIN_WAVE_SPEED..=haptic_protocol::MAX_WAVE_SPEED,
+                            )
+                            .logarithmic(true)
+                            .suffix(" m/s")
+                            .text("speed"),
+                        );
+                    }
+                    SpatialScaleMode::Wavelength => {
+                        columns[1].add_sized(
+                            slider_size,
+                            egui::Slider::new(
+                                &mut self.test.wavelength_m,
+                                haptic_protocol::MIN_WAVELENGTH_M
+                                    ..=haptic_protocol::MAX_WAVELENGTH_M,
+                            )
+                            .logarithmic(true)
+                            .suffix(" m")
+                            .text("wavelength"),
+                        );
+                    }
+                }
+            });
+        } else {
+            ui.columns(2, |columns| {
+                let speed_size = [
+                    columns[0].available_width(),
+                    columns[0].spacing().interact_size.y,
+                ];
+                columns[0].add_sized(
+                    speed_size,
                     egui::Slider::new(
-                        &mut self.test.wavelength_m,
-                        haptic_protocol::MIN_WAVELENGTH_M..=haptic_protocol::MAX_WAVELENGTH_M,
+                        &mut self.test.wave_speed,
+                        haptic_protocol::MIN_WAVE_SPEED..=haptic_protocol::MAX_WAVE_SPEED,
                     )
                     .logarithmic(true)
-                    .suffix(" m"),
+                    .suffix(" m/s")
+                    .text("wave speed"),
                 );
+                columns[1].horizontal(|ui| {
+                    ui.checkbox(&mut self.test.orbit, "orbit");
+                    let slider_size = [ui.available_width(), ui.spacing().interact_size.y];
+                    ui.add_enabled_ui(self.test.orbit, |ui| {
+                        ui.add_sized(
+                            slider_size,
+                            egui::Slider::new(&mut self.test.orbit_period_s, 1.0..=30.0)
+                                .logarithmic(true)
+                                .suffix(" s")
+                                .text("period"),
+                        );
+                    });
+                });
             });
         }
-        ui.horizontal(|ui| {
-            ui.label("decay knee");
-            ui.add(
+
+        ui.columns(2, |columns| {
+            let knee_size = [
+                columns[0].available_width(),
+                columns[0].spacing().interact_size.y,
+            ];
+            columns[0].add_sized(
+                knee_size,
                 egui::Slider::new(
                     &mut self.test.atten_d0_m,
                     haptic_protocol::MIN_ATTEN_D0_M..=haptic_protocol::MAX_ATTEN_D0_M,
                 )
                 .logarithmic(true)
-                .suffix(" m"),
+                .suffix(" m")
+                .text("decay knee"),
             );
-            ui.separator();
-            ui.label("exponent");
-            ui.add(egui::Slider::new(
-                &mut self.test.atten_exponent,
-                haptic_protocol::MIN_ATTEN_EXPONENT..=haptic_protocol::MAX_ATTEN_EXPONENT,
-            ));
-        });
-        ui.horizontal(|ui| {
-            ui.label("motion");
-            ui.separator();
-            ui.checkbox(&mut self.test.orbit, "orbit");
-            ui.add(
-                egui::Slider::new(&mut self.test.orbit_period_s, 1.0..=30.0)
-                    .logarithmic(true)
-                    .suffix(" s"),
+            let exponent_size = [
+                columns[1].available_width(),
+                columns[1].spacing().interact_size.y,
+            ];
+            columns[1].add_sized(
+                exponent_size,
+                egui::Slider::new(
+                    &mut self.test.atten_exponent,
+                    haptic_protocol::MIN_ATTEN_EXPONENT..=haptic_protocol::MAX_ATTEN_EXPONENT,
+                )
+                .text("exponent"),
             );
         });
-    }
-}
 
-/// Approximate complex field at a transducer. Wave propagation phase and
-/// attenuation are reconstructed geometrically for both stimulus types.
-/// Voice snapshots do not carry synchronized oscillator phase or delay-line
-/// history, so multiple voices are intentionally shown phase-aligned rather
-/// than presented as exact server-output interference.
-fn field_at(pos: (f32, f32), voices: &[VoiceView]) -> (f32, f32) {
-    let (mut re, mut im) = (0.0f32, 0.0f32);
-    for v in voices {
-        let dx = pos.0 - v.source_pos.0;
-        let dy = pos.1 - v.source_pos.1;
-        let dist = (dx * dx + dy * dy).sqrt();
-        let wavelength = match v.note_type {
-            StimulusType::Wave => v.wave_speed.max(WAVE_SPEED_FLOOR) / v.frequency,
-            StimulusType::TravellingWave => v.wavelength_m,
-        };
-        let (voice_re, voice_im) = travelling_wave_relative_phasor(dist, wavelength, v.decay);
-        re += v.amplitude * voice_re;
-        im += v.amplitude * voice_im;
+        if self.test.stimulus_type == StimulusType::TravellingWave {
+            ui.columns(2, |columns| {
+                columns[0].checkbox(&mut self.test.orbit, "orbit");
+                let period_size = [
+                    columns[1].available_width(),
+                    columns[1].spacing().interact_size.y,
+                ];
+                columns[1].add_enabled_ui(self.test.orbit, |ui| {
+                    ui.add_sized(
+                        period_size,
+                        egui::Slider::new(&mut self.test.orbit_period_s, 1.0..=30.0)
+                            .logarithmic(true)
+                            .suffix(" s")
+                            .text("orbit period"),
+                    )
+                });
+            });
+        }
     }
-    (re, im)
 }
 
 fn draw_table(
@@ -1285,6 +1600,7 @@ fn draw_table(
     layout: &LayoutView,
     voices: &[VoiceView],
     routing: Option<&RoutingView>,
+    relative_analytic: Option<&[(f32, f32); TRANSDUCERS]>,
 ) -> TableInteraction {
     let mut interaction = TableInteraction::default();
     let size = ui.available_size();
@@ -1343,19 +1659,18 @@ fn draw_table(
 
     for (i, &(x, y)) in layout.positions.iter().enumerate() {
         let center = to_screen(x, y);
-        let color = if voices.is_empty() {
-            egui::Color32::from_gray(60)
-        } else {
-            // Summed field: hue = resultant phase, lightness/chroma = resultant
-            // magnitude (× this transducer's configured gain). For a single
-            // voice this reduces to its relative phase and local amplitude.
-            let (re, im) = field_at((x, y), voices);
+        let color = if let Some(relative_analytic) = relative_analytic {
+            // Hue retains the original zero-phase-blue convention. Magnitude
+            // is the measured final output and already includes layout gain.
+            let (re, im) = relative_analytic[i];
             let hue = ZERO_PHASE_HUE_DEG + im.atan2(re).to_degrees();
-            let amp = (re * re + im * im).sqrt() * layout.gains[i];
+            let amp = re.hypot(im);
             let vis = (amp * 2.0).clamp(0.0, 1.0).sqrt();
             let lightness = 0.25 + 0.50 * vis;
             let chroma = 0.03 + 0.14 * vis;
             oklch_to_color(lightness, chroma, hue)
+        } else {
+            egui::Color32::from_gray(60)
         };
         painter.circle_filled(center, radius, color);
         painter.circle_stroke(
@@ -1445,6 +1760,11 @@ fn draw_table(
         }
     }
 
+    response.on_hover_text(
+        "Drag to move the test source (○ requested, ✚ effective).\n\
+         Left-click a transducer to route output 1 (L); right-click for output 2 (R).",
+    );
+
     interaction
 }
 
@@ -1468,7 +1788,6 @@ mod table_layout_tests {
     fn table_bounds_add_no_padding_for_inset_transducers() {
         let layout = LayoutView {
             positions: [(0.5, 1.0); TRANSDUCERS],
-            gains: [1.0; TRANSDUCERS],
             table_m: (1.0, 2.0),
         };
         assert_eq!(table_world_bounds(&layout), (0.0, 0.0, 1.0, 2.0));
@@ -1480,7 +1799,6 @@ mod table_layout_tests {
         positions[0] = (-0.2, 2.3);
         let layout = LayoutView {
             positions,
-            gains: [1.0; TRANSDUCERS],
             table_m: (1.0, 2.0),
         };
         let (min_x, min_y, max_x, max_y) = table_world_bounds(&layout);
@@ -1531,6 +1849,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([620.0, 1020.0])
+            .with_min_inner_size([520.0, 720.0])
             .with_title("Haptic"),
         vsync: true,
         multisampling: 4,
@@ -1545,15 +1864,19 @@ fn main() -> eframe::Result<()> {
                 server,
                 fps: RateCounter::default(),
                 test: TestControls::default(),
-                filter: VoiceFilter::All,
+                instance_id,
+                reference_rule: ReferenceRule::StickyNewest,
+                reference: None,
+                reference_missing_since: None,
+                silent_reference_snapshots: 0,
                 sounding_params: (
                     haptic_protocol::DEFAULT_TEST_NOTE,
                     100,
                     StimulusType::Wave,
-                    20.0,
+                    5.0,
                 ),
                 last_live_config: (
-                    1.0,
+                    5.0,
                     SpatialScaleMode::Speed,
                     0.2,
                     haptic_protocol::DEFAULT_ATTEN_D0_M,

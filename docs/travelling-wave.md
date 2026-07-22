@@ -73,9 +73,9 @@ Shared ranges are defined in `haptic-protocol`:
 
 | Control | Range | Default |
 |---|---:|---:|
-| speed | 0.25–1000 m/s | 20 m/s |
+| speed | 0.1–100 m/s | 20 m/s |
 | wavelength | 0.00125–50 m | 0.2 m |
-| decay knee `d0` | 0.01–10 m | 0.5 m |
+| decay knee `d0` | 0.01–10 m | 2 m |
 | decay exponent `p` | 0–4 | 1 |
 
 The broad wavelength range is experimental, not a promise that every layout
@@ -111,8 +111,8 @@ The shared gain law is:
 g(d) = (1 + d/d0)^(-p)
 ```
 
-At the defaults `d0 = 0.5 m` and `p = 1`, this is exactly
-`1 / (1 + 2d)`. Setting `p = 0` produces no distance falloff.
+At the defaults `d0 = 2 m` and `p = 1`, this is exactly
+`1 / (1 + d/2)`. Setting `p = 0` produces no distance falloff.
 
 Because TW has no stored history, live decay affects current output directly as
 the ramp advances. In Wave, the same parameter applies at emission time and
@@ -157,22 +157,22 @@ not a retained standing-wave compatibility engine.
 
 ## Viewer contract
 
-For a TW voice the viewer uses the same shared relative phasor helper as the
-engine:
+The closed-form TW relationship remains useful for engine tests:
 
 ```text
 phasor_i = amplitude * g(d_i) * exp(-j*2*pi*d_i/lambda)
 ```
 
-It receives the effective interpolated wavelength and decay in `VoiceInfo`, so
-it need not reconstruct them from stale configuration. Relative phase and gain
-for a single voice can therefore match the model closely.
+The viewer no longer evaluates that equation itself. It receives the Hilbert
+analytic signal measured from the complete final bounded output and compares it
+with a synchronized active oscillator reference. A zero-distance TW therefore
+remains a useful phase-alignment test, while multi-voice cancellation,
+reconstruction response, and contributions from Wave are displayed from the
+actual sum rather than approximated geometrically.
 
-Snapshots still omit oscillator phase. When several voices are displayed, the
-viewer phase-aligns their source oscillators before summing; this shows spatial
-relationships and possible interference but not the engine's exact
-instantaneous output. The overall display remains labelled as a geometric
-preview.
+Changing the reference-selection rule rotates the phase coordinate system but
+never filters the field. Different-pitch contributions rotate at their true
+difference frequencies.
 
 Requested and effective cursors normally coincide after ordinary smoothing,
 because TW has no wave-speed-dependent source chase.
