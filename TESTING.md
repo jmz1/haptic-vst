@@ -1,6 +1,6 @@
 # Testing the haptic system
 
-This document covers automated, headless, viewer, DAW, and physical-device
+This document covers automated, headless, interactive, DAW, and physical-device
 workflows. Build commands and bundle details live in [`BUILD.md`](BUILD.md).
 
 Prefer the smallest workflow that exercises the behaviour under test. Most
@@ -11,8 +11,8 @@ a DAW or opening an audio device.
 
 | Process | Typical command | Role |
 |---|---|---|
-| server | `cargo run -p haptic-server --release` | Owns the engine, socket, layout, and physical audio device. |
-| viewer | `cargo run -p haptic-viewer --release` | Observes server state and provides routing/test controls. |
+| Haptic application | `cargo run -p haptic-viewer --release` | Primary GUI; observes state and attaches to or supervises a server. |
+| server | `cargo run -p haptic-server --release` | Independent/headless engine, socket, layout, and physical audio device. |
 | scripted client | `python3 tools/test_note.py` | Drives notes, MPE, parameters, and routing without a DAW. |
 | VST3 plugin | loaded by a DAW | Converts host MIDI/MPE and automation to controller commands. |
 
@@ -32,6 +32,7 @@ Important server options:
 --headless                paced 48 kHz, 32-channel memory sink
 --dummy-audio             alias for --headless
 --socket PATH             override socket and singleton namespace
+--managed-lifetime-stdin  internal supervisor mode; exit on stdin EOF
 HAPTIC_SOCKET_PATH        environment alternative to --socket
 ```
 
@@ -54,6 +55,24 @@ cargo run -p haptic-server --release -- \
 
 An occupied explicit endpoint fails immediately; the server never waits for a
 test lock or unlinks another live server.
+
+The Haptic application accepts:
+
+```text
+--connect-only            attach without starting or stopping a server
+--server-bin PATH         override the managed server executable
+--config PATH             layout passed to a managed server
+--headless                start the managed server with dummy audio
+--test-tone               start the managed server in hardware test-tone mode
+--socket PATH             endpoint used for both attachment and launch
+HAPTIC_SERVER_BIN         environment alternative to --server-bin
+HAPTIC_SOCKET_PATH        environment alternative to --socket
+```
+
+By default it probes the selected endpoint. A reachable server is treated as
+external and left running when the window closes. If no server is reachable,
+the application starts a sibling `haptic-server`, captures its logs, and shuts
+it down when the application exits.
 
 ## Fastest end-to-end test: headless plus script
 
@@ -99,28 +118,38 @@ Use this workflow for:
 - headless callback health; and
 - build-hash-independent debugging before DAW integration.
 
-## Viewer workflow without a plugin
+## Interactive workflow without a plugin
 
-Terminal 1:
+Build the GUI and server helper together once:
 
 ```bash
-cargo run -p haptic-server --release
+cargo build -p haptic-server -p haptic-viewer --release
 ```
 
-Terminal 2:
+Then launch the application:
 
 ```bash
 cargo run -p haptic-viewer --release
 ```
 
-To avoid physical hardware, give both processes the same explicit headless
-socket instead:
+The **Haptic** window starts a managed physical-audio server when the production
+endpoint is free. Its top panel identifies the server as managed or external,
+shows the socket, provides owned-child start/stop/restart controls, and contains
+a bounded server log.
+
+To run the complete application without physical hardware:
 
 ```bash
-cargo run -p haptic-server --release -- \
-  --headless --socket /tmp/haptic-vst-test.sock
 cargo run -p haptic-viewer --release -- \
-  --socket /tmp/haptic-vst-test.sock
+  --headless --socket /tmp/haptic-vst-test.sock
+```
+
+To attach to a server whose lifecycle is managed in another terminal or by a
+service:
+
+```bash
+cargo run -p haptic-viewer --release -- \
+  --connect-only --socket /tmp/haptic-vst-test.sock
 ```
 
 The viewer's controls are stacked to fit the default 620 px window width.
@@ -231,9 +260,12 @@ callback p50/p99/max, frame count, and stream errors. It prefers a supported
 48 kHz `f32` mode for the selected channel layout and reports when another rate
 is necessary.
 
-After channel bring-up, use the viewer to route selected logical channels and
-exercise Wave/TW at conservative levels. Remember that the default layout gain
-is 0.5 but explicit `haptic.toml` gains override it.
+Alternatively, launch the Haptic application with `--test-tone`; it will pass
+that mode to a managed server and expose its output in the server log.
+
+After channel bring-up, use the application to route selected logical channels
+and exercise Wave/TW at conservative levels. Remember that the default layout
+gain is 0.5 but explicit `haptic.toml` gains override it.
 
 ## VST3/DAW integration
 
@@ -255,12 +287,14 @@ ditto target/bundled/haptic-plugin.vst3 \
 
 Then:
 
-1. Start `haptic-server`; optionally start the viewer.
+1. Start the Haptic application. It attaches to an existing server or starts
+   one; alternatively run a server independently and use `--connect-only`.
 2. Load **Haptic Controller** in the target host.
 3. Compare the editor's build hash and protocol version with the bundle under
    test.
 4. Play MIDI/MPE and automate the patch parameters.
-5. Use the viewer, not the plugin, for whole-server field and routing state.
+5. Use the Haptic application, not the plugin, for whole-server field and
+   routing state.
 
 The plugin reconnects automatically and replays a coherent configuration after
 `HelloAccepted`. Starting the server before the host is convenient but not
@@ -297,10 +331,11 @@ Override it with `NIH_LOG` where supported by the logging layer.
 | Symptom | Likely cause or check |
 |---|---|
 | `cargo` not found | Activate the rustup environment shown at the top of this document. |
-| Viewer waits for server | Confirm both processes use the same socket path and inspect the server terminal. |
+| Application waits for server | Open **server log**. Build `haptic-server` beside the GUI, pass `--server-bin`, or confirm an external process uses the same socket. |
 | Plugin remains disconnected | Confirm protocol/build identity and that the server accepted the instance rather than merely accepting the socket. |
 | No sound on a stereo fallback | Route the desired logical channels to physical outputs 1 and 2 in the viewer. |
 | Server will not bind | Another live process owns the endpoint; stop it or choose an isolated test socket. |
-| Observer is removed during a long test | It is not consuming status fast enough or its bounded backlog remained full; inspect client/server output. |
+| Observer is removed during a long test | It is not consuming status fast enough or its bounded backlog remained full; inspect the integrated or external server output. |
+| Managed server remains after an ordinary GUI exit | It should receive stdin EOF and stop within three seconds; inspect the server log and verify it was started with `--managed-lifetime-stdin`. |
 | Output comes from an unexpected device | No 32-channel device matched and the server deliberately selected the system default. |
 | VST editor shows an old hash | The DAW still has an older library loaded; replace the bundle and fully restart the host. |

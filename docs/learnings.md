@@ -160,6 +160,19 @@ runs default to a per-process endpoint and accept an explicit stable socket for
 multi-process tests. An occupied endpoint is an error, never something to wait
 on or unlink blindly.
 
+## One application does not require one process
+
+Launching the viewer and server separately imposed operational friction, but
+putting egui and the real-time engine in one address space would remove useful
+fault isolation without eliminating a measured bottleneck.
+
+**Carry forward:** unify user-facing startup and lifecycle while retaining the
+server process boundary. The GUI may attach to an external server or supervise
+one child, but both cases use the same observer protocol. A managed child must
+receive a parent-death signal that survives GUI crashes; the current inherited
+stdin pipe turns EOF into normal server shutdown. Never terminate a server the
+GUI did not start.
+
 ## MIDI naming and frequency are separate conventions
 
 Ableton labels MIDI 60 as C3, while the equal-tempered frequency is still

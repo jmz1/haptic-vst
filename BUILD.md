@@ -85,11 +85,15 @@ Server:
 cargo build -p haptic-server --release
 ```
 
-Viewer:
+Interactive Haptic application and its server helper:
 
 ```bash
-cargo build -p haptic-viewer --release
+cargo build -p haptic-server -p haptic-viewer --release
 ```
+
+Both executables land beside one another in `target/release/`. Launching
+`haptic-viewer` then attaches to an existing server or starts the sibling
+`haptic-server` automatically.
 
 Standalone controller host:
 
@@ -99,17 +103,24 @@ cargo build -p haptic-plugin-standalone --release
 
 Corresponding binaries are placed under `target/release/`.
 
-For an ordinary development run, Cargo can build and start in one command:
+For an ordinary interactive run after building both executables:
+
+```bash
+cargo run -p haptic-viewer --release
+```
+
+The application window is titled **Haptic** and owns any server it starts. To
+run the engine independently or headlessly:
 
 ```bash
 cargo run -p haptic-server --release
-cargo run -p haptic-viewer --release
 cargo run -p haptic-plugin-standalone --release
 ```
 
-Use separate terminals for processes that need to run together. The DAW-free
-and headless workflows in `TESTING.md` are usually faster than rebuilding and
-reloading a plugin host.
+Use `haptic-viewer --connect-only` when a manually managed server must remain
+independent. `--server-bin PATH` or `HAPTIC_SERVER_BIN` selects a helper that is
+not beside the application. The DAW-free and headless workflows in `TESTING.md`
+are usually faster than rebuilding and reloading a plugin host.
 
 ## Optional local installation on macOS
 

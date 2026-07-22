@@ -20,8 +20,8 @@ one or more observers can inspect the server's combined state.
  └───────────────────┘                              ▼
                                              ┌───────────────┐
  ┌───────────────────┐   status + test       │ haptic-server │
- │   haptic-viewer   │ ◀───────────────────▶ │ 32-ch engine  │
- │ observer + console│                       └───────┬───────┘
+ │  Haptic GUI app   │ ◀───────────────────▶ │ 32-ch engine  │
+ │ observer + console│   owns child lifetime └───────┬───────┘
  └───────────────────┘                               │
                                              monitor routing
                                                      │
@@ -35,8 +35,9 @@ The split establishes clear ownership:
   commands. It does not claim to display whole-system state.
 - The **server** owns instance registration, voices, synthesis, layout, routing,
   status publication, and the physical audio device.
-- The **viewer** is an observer of server state. Its test console is also a
-  controller instance with its own identity and configuration.
+- The **GUI application** is an observer of server state. Its test console is
+  also a controller instance with its own identity and configuration. It
+  attaches to an external server or supervises a server child process.
 - The **protocol crate** is the shared boundary. A protocol change is not
   complete until every producer and consumer agrees.
 
@@ -48,13 +49,44 @@ The split establishes clear ownership:
 | `haptic-server` | IPC listener, connection lifecycle, fixed-capacity stimulus engine, CPAL output, layout loading, and headless sink. |
 | `haptic-plugin` | VST3 controller, MIDI/MPE merge state, automatable parameters, reconnect worker, and editor. |
 | `haptic-plugin-standalone` | Standalone host for the same controller plugin. |
-| `haptic-viewer` | Server observer, field visualisation, instance filtering, monitor routing, and test console. |
+| `haptic-viewer` | Primary GUI application: server supervision, observation, field visualisation, instance filtering, routing, and test console. |
 | `xtask` | VST3 bundling commands. |
 | `tools/test_note.py` | DAW-free scripted protocol client. |
 
 The server is still concentrated in `haptic-server/src/engine.rs`; splitting
 its lifecycle, DSP, reconstruction, routing, and snapshot responsibilities is
 an active roadmap priority.
+
+## Unified application and process ownership
+
+The preferred interactive entry point is `haptic-viewer`, whose window is
+labelled **Haptic**. “Unified application” does not mean the GUI and real-time
+engine share an OS process:
+
+1. The GUI probes its selected Unix-socket endpoint.
+2. If a compatible server is already reachable, it attaches as an observer and
+   labels the server external.
+3. Otherwise, it locates a sibling `haptic-server`, starts it with the same
+   socket/configuration options, and retains ownership of the child.
+4. The existing observer connection and handshake remain the only viewer state
+   path; there is no parallel in-process model that can drift from the protocol.
+
+A managed server receives piped stdin plus `--managed-lifetime-stdin`. The GUI
+keeps the pipe's write end open without using it as a command channel. Normal
+GUI shutdown or abrupt parent death closes the pipe; EOF makes the server set
+its ordinary atomic shutdown flag. The GUI waits briefly for graceful exit and
+terminates only if the child does not stop.
+
+Server stdout/stderr are consumed on background threads into a bounded 200-line
+GUI log. The supervisor exposes start, stop, and restart only for a child it
+owns. It never stops an external server. `--connect-only` disables launch and
+ownership entirely.
+
+This boundary is retained for fault isolation rather than IPC performance. The
+CPAL callback remains a real-time thread owned by the server; GUI rendering,
+allocation, GPU work, or panic cannot directly unwind or corrupt its process.
+Standalone and headless server workflows continue to exercise the same engine
+and protocol.
 
 ## Protocol and connection lifecycle
 
@@ -295,6 +327,16 @@ labelled preview rather than exact output truth.
 - Removes a proven-stale socket selectively.
 - Opens the selected CPAL device.
 
+### Managed interactive mode
+
+- The GUI attaches to an existing production endpoint or starts a sibling
+  server executable.
+- `--server-bin`/`HAPTIC_SERVER_BIN` override helper discovery.
+- `--config`, `--socket`, `--headless`, and `--test-tone` are passed to a
+  managed server.
+- Managed lifetime is tied to stdin EOF; external server lifetime is untouched.
+- The GUI continues to communicate over framed IPC even when it owns the child.
+
 ### Headless/dummy mode
 
 - Uses a paced 48 kHz, 32-channel memory sink.
@@ -302,6 +344,6 @@ labelled preview rather than exact output truth.
 - Defaults to `/tmp/haptic-vst-test-<pid>.sock`.
 - Accepts `--socket` or `HAPTIC_SOCKET_PATH` for a stable test endpoint.
 
-Both profiles run the same engine, IPC, snapshots, layout watcher, and health
-reporting. Headless mode is therefore the preferred DAW-free integration path,
-not a reduced mock implementation.
+All server profiles run the same engine, IPC, snapshots, layout watcher, and
+health reporting. Headless mode is therefore the preferred DAW-free integration
+path, not a reduced mock implementation.

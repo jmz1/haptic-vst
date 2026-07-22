@@ -1,6 +1,9 @@
-//! Standalone phase visualiser and test console for the haptic server.
+//! Primary Haptic GUI: managed-server supervisor, phase visualiser, and test
+//! console.
 //!
-//! Connects to the server's Unix socket and renders the configured
+//! Attaches to an existing haptic server or starts a supervised child process,
+//! then connects over the same Unix-socket observer protocol and renders the
+//! configured
 //! transducer layout as coloured circles. In per-note mode each circle's
 //! OKLCH hue encodes the phase of the most recent delay-line voice at that
 //! transducer, relative to the source oscillator: zero phase difference
@@ -290,6 +293,11 @@ impl ServerSupervisor {
                     &self.logs,
                     format!("Could not poll managed server: {error}"),
                 );
+                self.lifetime = None;
+                if let Some(mut child) = self.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
                 self.mode = ServerMode::Failed;
             }
         }

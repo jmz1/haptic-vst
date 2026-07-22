@@ -16,10 +16,12 @@ the software.
 
 - **Haptic Controller** is a VST3 plugin. It receives MIDI/MPE and owns the
   automatable stimulus configuration for one DAW track.
-- **haptic-server** owns the real-time engine and audio device. It always
-  renders 32 logical channels, even when monitoring through a smaller device.
-- **haptic-viewer** observes the whole server, visualises the spatial field,
-  provides monitor routing, and can drive test notes without a DAW.
+- **Haptic** (`haptic-viewer`) is the primary interactive application. It
+  observes and visualises the whole server, provides routing and test controls,
+  and attaches to an existing server or starts and supervises one automatically.
+- **haptic-server** remains a separate real-time process owning the engine and
+  audio device. It always renders 32 logical channels, even when monitoring
+  through a smaller device, and can still run independently or headlessly.
 - **haptic-protocol** defines their versioned, framed Unix-socket protocol.
 
 There are currently two stimulus types:
@@ -36,8 +38,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the current system in detail.
 - [ROADMAP.md](ROADMAP.md) — current baseline, active priorities, and future
   research paths.
 - [BUILD.md](BUILD.md) — build and bundle the workspace and VST3 plugin.
-- [TESTING.md](TESTING.md) — run the server, viewer, scripted client, headless
-  tests, and DAW workflow.
+- [TESTING.md](TESTING.md) — run the unified application, standalone server,
+  scripted client, headless tests, and DAW workflow.
 - [docs/wave.md](docs/wave.md) and
   [docs/travelling-wave.md](docs/travelling-wave.md) — stimulus models and the
   engineering decisions behind them.

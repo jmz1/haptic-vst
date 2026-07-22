@@ -45,8 +45,11 @@ Five principles guide development:
 
 ### Runtime architecture
 
-- A VST3 controller plugin, standalone haptic server, and observer/test viewer
+- A VST3 controller plugin, real-time server process, and observer/test GUI
   communicate over versioned, length-prefixed bincode frames on a Unix socket.
+- The GUI is the primary interactive application: it attaches to an existing
+  server or starts a managed server automatically. The process boundary remains
+  for fault isolation, but ordinary use requires only one launch.
 - Each connection begins with `Hello` and is accepted only after exact protocol
   version, role, identity, and configuration validation. A controller reports a
   connection only after `HelloAccepted`.
@@ -96,6 +99,9 @@ Five principles guide development:
 - Headless mode runs the complete engine against a paced 48 kHz, 32-channel
   memory sink. It uses an isolated per-process socket by default and does not
   contend with the production server or open audio hardware.
+- A managed server receives an inherited stdin lifetime pipe. Closing or
+  crashing the GUI closes that pipe and makes the owned server shut down through
+  its normal lifecycle; an externally launched server remains independent.
 - Automated tests cover protocol framing and handshakes, connection lifecycle,
   voice ownership, Wave/TW signal models, routing, layout, reconstruction, and
   real Unix-socket integration. An opt-in orbit capture provides deeper DSP
@@ -289,6 +295,10 @@ with the existing sinc reconstruction rather than added as an isolated fix.
 
 - **Plugin formats:** VST3 is the supported export. CLAP remains disabled; only
   revisit it when there is a concrete host or distribution need.
+- **Application packaging:** the unified behavior currently lives in the
+  `haptic-viewer` binary for compatibility. A future macOS application bundle
+  can rename the user-facing executable and carry `haptic-server` as a private
+  helper without changing runtime ownership.
 - **Human-readable instance identity:** the viewer currently exposes shortened
   generated IDs. Track or scene labels would improve multi-instance sessions,
   but ownership and persistence semantics need definition.

@@ -22,7 +22,8 @@ controller plugin (`nih-plug` + `egui`) and a standalone real-time server
   Unix-socket server.
 - `haptic-plugin`: VST3 controller and plugin UI.
 - `haptic-plugin-standalone`: standalone host for the plugin UI/controller.
-- `haptic-viewer`: phase visualizer and interactive test console.
+- `haptic-viewer`: primary interactive application; phase visualizer, test
+  console, and managed-server supervisor.
 - `xtask`: plugin bundling commands.
 - `haptic.toml`: default table layout and transducer configuration.
 
