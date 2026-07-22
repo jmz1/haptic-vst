@@ -93,7 +93,8 @@ cargo run --bin haptic-server
 - **Real-time Processing**: Lock-free audio path in the server
 - **MIDI/MPE Input**: Velocity → amplitude, bend/pressure/slide → source
   position and intensity
-- **DAW-automatable parameters**: Wave Speed (0.25–1000 m/s, low-speed skew) and Stimulus Type
+- **DAW-automatable parameters**: Stimulus Type (`Wave`/`Travelling Wave`),
+  Wave Speed, TW Scale Mode/Wavelength, and shared distance-decay knee/exponent
 - **32-channel Output**: Direct control of haptic transducer arrays
 - **Logging**: Plugin log at `/Users/jmz/tmp/log/haptic-vst.log`
   (override with `NIH_LOG`)

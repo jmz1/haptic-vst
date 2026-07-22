@@ -30,8 +30,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use haptic_protocol::{
-    encode_frame, ClientRole, FrameDecoder, HapticCommand, InstanceConfig, MpeData, Parameter,
-    ServerStatus, StimulusType, PROTOCOL_VERSION, SOCKET_PATH,
+    encode_frame, travelling_wave_relative_phasor, ClientRole, DistanceDecay, FrameDecoder,
+    HapticCommand, InstanceConfig, MpeData, Parameter, ServerStatus, SpatialScaleMode,
+    StimulusType, PROTOCOL_VERSION, SOCKET_PATH,
 };
 use parking_lot::Mutex;
 
@@ -74,6 +75,9 @@ struct VoiceView {
     note_type: StimulusType,
     frequency: f32,
     wave_speed: f32,
+    scale_mode: SpatialScaleMode,
+    wavelength_m: f32,
+    decay: DistanceDecay,
     /// Effective (velocity-limited) source the delay lines radiate from.
     source_pos: (f32, f32),
     /// Where MPE is asking the source to be.
@@ -250,6 +254,12 @@ fn apply_message(shared: &Mutex<Shared>, msg: ServerStatus) {
                     note_type: v.note_type,
                     frequency: v.frequency,
                     wave_speed: v.wave_speed,
+                    scale_mode: v.scale_mode,
+                    wavelength_m: v.wavelength_m,
+                    decay: DistanceDecay {
+                        d0_m: v.atten_d0_m,
+                        exponent: v.atten_exponent,
+                    },
                     source_pos: v.source_pos,
                     requested_pos: v.requested_pos,
                     amplitude: v.amplitude,
@@ -331,7 +341,12 @@ struct TestControls {
     playing: Option<u8>, // note currently sounding
     note: u8,
     velocity: u8,
+    stimulus_type: StimulusType,
     wave_speed: f32,
+    scale_mode: SpatialScaleMode,
+    wavelength_m: f32,
+    atten_d0_m: f32,
+    atten_exponent: f32,
     orbit: bool,
     orbit_period_s: f32,
     orbit_phase: f32,
@@ -346,7 +361,12 @@ impl Default for TestControls {
             playing: None,
             note: 60,
             velocity: 100,
+            stimulus_type: StimulusType::Wave,
             wave_speed: 1.0,
+            scale_mode: SpatialScaleMode::Speed,
+            wavelength_m: 0.2,
+            atten_d0_m: haptic_protocol::DEFAULT_ATTEN_D0_M,
+            atten_exponent: haptic_protocol::DEFAULT_ATTEN_EXPONENT,
             orbit: false,
             orbit_period_s: 6.0,
             orbit_phase: 0.0,
@@ -366,11 +386,12 @@ impl TestControls {
     }
 
     fn start(&mut self, shared: &Mutex<Shared>, table: (f32, f32)) {
+        self.send_config(shared);
         send_command(
             shared,
             &HapticCommand::SetParameter {
                 timestamp_us: 0,
-                parameter: Parameter::WaveSpeed(self.wave_speed),
+                parameter: Parameter::StimulusType(self.stimulus_type),
             },
         );
         send_command(
@@ -384,6 +405,44 @@ impl TestControls {
             },
         );
         self.playing = Some(self.note);
+    }
+
+    fn send_config(&self, shared: &Mutex<Shared>) {
+        send_command(
+            shared,
+            &HapticCommand::SetParameter {
+                timestamp_us: 0,
+                parameter: Parameter::WaveSpeed(self.wave_speed),
+            },
+        );
+        send_command(
+            shared,
+            &HapticCommand::SetParameter {
+                timestamp_us: 0,
+                parameter: Parameter::TravellingWaveScaleMode(self.scale_mode),
+            },
+        );
+        send_command(
+            shared,
+            &HapticCommand::SetParameter {
+                timestamp_us: 0,
+                parameter: Parameter::TravellingWaveWavelength(self.wavelength_m),
+            },
+        );
+        send_command(
+            shared,
+            &HapticCommand::SetParameter {
+                timestamp_us: 0,
+                parameter: Parameter::AttenuationD0(self.atten_d0_m),
+            },
+        );
+        send_command(
+            shared,
+            &HapticCommand::SetParameter {
+                timestamp_us: 0,
+                parameter: Parameter::AttenuationExponent(self.atten_exponent),
+            },
+        );
     }
 
     fn stop(&mut self, shared: &Mutex<Shared>) {
@@ -437,7 +496,8 @@ struct ViewerApp {
     filter: VoiceFilter,
     /// Parameter values in effect for the sounding note, to retrigger when
     /// the user lands on new slider values.
-    sounding_params: (u8, u8, f32),
+    sounding_params: (u8, u8, StimulusType, f32),
+    last_live_config: (f32, SpatialScaleMode, f32, f32, f32),
 }
 
 const NOTE_NAMES: [&str; 12] = [
@@ -522,10 +582,16 @@ impl eframe::App for ViewerApp {
                             v.wave_speed,
                             v.wave_speed / v.frequency,
                         )),
-                        StimulusType::Standing => ui.label(format!(
-                            "Standing · note {} ({:.1} Hz)",
+                        StimulusType::TravellingWave => ui.label(format!(
+                            "TW ({}) · note {} ({:.1} Hz)  c = {:.2} m/s  λ = {:.4} m",
+                            match v.scale_mode {
+                                SpatialScaleMode::Speed => "fixed speed",
+                                SpatialScaleMode::Wavelength => "fixed wavelength",
+                            },
                             note_name(v.note),
                             v.frequency,
+                            v.wave_speed,
+                            v.wavelength_m,
                         )),
                     };
                 }
@@ -585,12 +651,32 @@ impl eframe::App for ViewerApp {
         }
 
         // Retrigger when slider values settle on something new mid-note
-        let desired = (self.test.note, self.test.velocity, self.test.wave_speed);
+        let desired = (
+            self.test.note,
+            self.test.velocity,
+            self.test.stimulus_type,
+            if self.test.stimulus_type == StimulusType::Wave {
+                self.test.wave_speed
+            } else {
+                0.0
+            },
+        );
         let pointer_down = ctx.input(|i| i.pointer.any_down());
         if self.test.playing.is_some() && desired != self.sounding_params && !pointer_down {
             self.test.stop(&self.shared);
             self.test.start(&self.shared, table);
             self.sounding_params = desired;
+        }
+        let live_config = (
+            self.test.wave_speed,
+            self.test.scale_mode,
+            self.test.wavelength_m,
+            self.test.atten_d0_m,
+            self.test.atten_exponent,
+        );
+        if live_config != self.last_live_config {
+            self.test.send_config(&self.shared);
+            self.last_live_config = live_config;
         }
         if !connected {
             self.test.playing = None;
@@ -642,8 +728,16 @@ impl ViewerApp {
                     self.test.stop(&self.shared);
                 } else {
                     self.test.start(&self.shared, table);
-                    self.sounding_params =
-                        (self.test.note, self.test.velocity, self.test.wave_speed);
+                    self.sounding_params = (
+                        self.test.note,
+                        self.test.velocity,
+                        self.test.stimulus_type,
+                        if self.test.stimulus_type == StimulusType::Wave {
+                            self.test.wave_speed
+                        } else {
+                            0.0
+                        },
+                    );
                 }
             }
             ui.separator();
@@ -654,15 +748,74 @@ impl ViewerApp {
             );
         });
         ui.horizontal(|ui| {
+            ui.label("type");
+            egui::ComboBox::from_id_salt("test_stimulus_type")
+                .selected_text(match self.test.stimulus_type {
+                    StimulusType::Wave => "Wave",
+                    StimulusType::TravellingWave => "TW",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.test.stimulus_type, StimulusType::Wave, "Wave");
+                    ui.selectable_value(
+                        &mut self.test.stimulus_type,
+                        StimulusType::TravellingWave,
+                        "Travelling Wave (TW)",
+                    );
+                });
+            ui.separator();
             ui.label("velocity");
             ui.add(egui::Slider::new(&mut self.test.velocity, 1..=127));
+        });
+        ui.horizontal(|ui| {
             ui.separator();
             ui.label("wave speed");
-            ui.add(
-                egui::Slider::new(&mut self.test.wave_speed, 0.25..=10.0)
-                    .logarithmic(true)
-                    .suffix(" m/s"),
+            ui.add_enabled(
+                self.test.stimulus_type == StimulusType::Wave
+                    || self.test.scale_mode == SpatialScaleMode::Speed,
+                egui::Slider::new(
+                    &mut self.test.wave_speed,
+                    haptic_protocol::MIN_WAVE_SPEED..=haptic_protocol::MAX_WAVE_SPEED,
+                )
+                .logarithmic(true)
+                .suffix(" m/s"),
             );
+        });
+        if self.test.stimulus_type == StimulusType::TravellingWave {
+            ui.horizontal(|ui| {
+                ui.label("TW scale");
+                ui.selectable_value(&mut self.test.scale_mode, SpatialScaleMode::Speed, "speed");
+                ui.selectable_value(
+                    &mut self.test.scale_mode,
+                    SpatialScaleMode::Wavelength,
+                    "fixed wavelength",
+                );
+                ui.add_enabled(
+                    self.test.scale_mode == SpatialScaleMode::Wavelength,
+                    egui::Slider::new(
+                        &mut self.test.wavelength_m,
+                        haptic_protocol::MIN_WAVELENGTH_M..=haptic_protocol::MAX_WAVELENGTH_M,
+                    )
+                    .logarithmic(true)
+                    .suffix(" m"),
+                );
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.label("decay knee");
+            ui.add(
+                egui::Slider::new(
+                    &mut self.test.atten_d0_m,
+                    haptic_protocol::MIN_ATTEN_D0_M..=haptic_protocol::MAX_ATTEN_D0_M,
+                )
+                .logarithmic(true)
+                .suffix(" m"),
+            );
+            ui.separator();
+            ui.label("exponent");
+            ui.add(egui::Slider::new(
+                &mut self.test.atten_exponent,
+                haptic_protocol::MIN_ATTEN_EXPONENT..=haptic_protocol::MAX_ATTEN_EXPONENT,
+            ));
         });
         ui.horizontal(|ui| {
             ui.label("motion");
@@ -678,26 +831,23 @@ impl ViewerApp {
 }
 
 /// Approximate complex field at a transducer. Wave propagation phase and
-/// attenuation are reconstructed geometrically; standing voices are uniform.
+/// attenuation are reconstructed geometrically for both stimulus types.
 /// Voice snapshots do not carry synchronized oscillator phase or delay-line
 /// history, so multiple voices are intentionally shown phase-aligned rather
 /// than presented as exact server-output interference.
 fn field_at(pos: (f32, f32), voices: &[VoiceView]) -> (f32, f32) {
     let (mut re, mut im) = (0.0f32, 0.0f32);
     for v in voices {
-        match v.note_type {
-            StimulusType::Wave => {
-                let dx = pos.0 - v.source_pos.0;
-                let dy = pos.1 - v.source_pos.1;
-                let dist = (dx * dx + dy * dy).sqrt();
-                let phi =
-                    std::f32::consts::TAU * v.frequency * dist / v.wave_speed.max(WAVE_SPEED_FLOOR);
-                let amp = v.amplitude / (1.0 + 2.0 * dist);
-                re += amp * phi.cos();
-                im += amp * phi.sin();
-            }
-            StimulusType::Standing => re += v.amplitude,
-        }
+        let dx = pos.0 - v.source_pos.0;
+        let dy = pos.1 - v.source_pos.1;
+        let dist = (dx * dx + dy * dy).sqrt();
+        let wavelength = match v.note_type {
+            StimulusType::Wave => v.wave_speed.max(WAVE_SPEED_FLOOR) / v.frequency,
+            StimulusType::TravellingWave => v.wavelength_m,
+        };
+        let (voice_re, voice_im) = travelling_wave_relative_phasor(dist, wavelength, v.decay);
+        re += v.amplitude * voice_re;
+        im += v.amplitude * voice_im;
     }
     (re, im)
 }
@@ -830,9 +980,6 @@ fn draw_table(
     // position, the cross is the effective (velocity-limited) source the delay
     // lines radiate from; a tether joins them while the source is catching up.
     for v in voices {
-        if v.note_type != StimulusType::Wave {
-            continue;
-        }
         let src = to_screen(v.source_pos.0, v.source_pos.1);
         let req = to_screen(v.requested_pos.0, v.requested_pos.1);
         if req.distance(src) > 1.0 {
@@ -920,7 +1067,14 @@ fn main() -> eframe::Result<()> {
                 fps: RateCounter::default(),
                 test: TestControls::default(),
                 filter: VoiceFilter::All,
-                sounding_params: (60, 100, 20.0),
+                sounding_params: (60, 100, StimulusType::Wave, 20.0),
+                last_live_config: (
+                    1.0,
+                    SpatialScaleMode::Speed,
+                    0.2,
+                    haptic_protocol::DEFAULT_ATTEN_D0_M,
+                    haptic_protocol::DEFAULT_ATTEN_EXPONENT,
+                ),
             }))
         }),
     )

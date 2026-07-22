@@ -61,9 +61,11 @@ In the viewer's bottom panel:
 The console is arranged in compact stacked rows and fits the default 620 px
 window width; enlarging the viewer should not be necessary to reach controls.
 
-1. **▶ start test note** — plays a wave-stimulus note on MIDI channel 15.
-2. **note / velocity / wave speed** sliders — changing one while a note
-   sounds retriggers it on release (pitch and wave speed bind at note-on).
+1. Choose **Wave** or **Travelling Wave (TW)**, then **▶ start test note** on
+   MIDI channel 15.
+2. **note / velocity** changes retrigger a held note. Wave speed retriggers a
+   held delay-line Wave, but updates TW live. TW speed/fixed-wavelength mode,
+   wavelength, decay knee, and exponent all update without retriggering.
 3. **Drag on the table** to move the source; the phase pattern re-forms
    around it. **orbit** circles the source automatically (period slider).
 4. **Left-click a circle** → that logical channel plays on device output
@@ -90,6 +92,8 @@ python3 tools/test_note.py                          # 2 s middle-C note
 python3 tools/test_note.py --note 48 --velocity 80 --duration 5
 python3 tools/test_note.py --orbit                  # circle the source
 python3 tools/test_note.py --wave-speed 100
+python3 tools/test_note.py --type tw --scale-mode wavelength \
+  --wavelength 0.125 --atten-d0 0.75 --atten-p 1.5 --orbit
 python3 tools/test_note.py --route 0:31 --route 1:13  # monitor L←31, R←13
 python3 tools/test_note.py --panic                  # just silence everything
 python3 tools/test_note.py --socket /tmp/haptic-vst-test.sock
@@ -102,6 +106,8 @@ Protocol notes for writing your own clients:
 - Every connection must first send the exact-version `Hello` handshake. The
   checked-in script does this; copy its current schema rather than hardcoding an
   older enum layout.
+- Protocol v3 has only `Wave` and `TravellingWave`; the second enum/VST slot
+  deliberately migrated from the removed placeholder to TW.
 - Controllers receive one `HelloAccepted` frame and must wait for it before
   reporting themselves connected; they receive no continuous status stream.
   Observers receive the acknowledgement plus levels (~60 Hz), active voices,
@@ -124,9 +130,9 @@ cp -r target/bundled/haptic-plugin.vst3 ~/Library/Audio/Plug-Ins/VST3/
    matter.
 3. Play MIDI/MPE. Velocity → amplitude; pitch bend → source x (full
    table width); pressure → intensity; CC74/slide → source y (full table
-   length). The **Wave Speed** and **Stimulus Type** plugin parameters are
-   DAW-automatable and pushed to the server on change.
-4. The viewer shows every active wave and standing voice, with per-instance
+   length). Stimulus type, wave speed, TW scale mode/wavelength, and shared
+   decay controls are DAW-automatable and pushed to the server on change.
+4. The viewer shows every active Wave and Travelling Wave voice, with per-instance
    filtering. Its phase display is a phase-aligned geometric preview; it does
    not reconstruct synchronized oscillator phase or delay-line history.
 

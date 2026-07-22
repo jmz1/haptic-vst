@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -70,35 +70,108 @@ pub struct DiagnosticSnapshot {
     pub sends_dropped: u64,
 }
 
-struct ConfigSnapshot(AtomicU64);
+struct ConfigSnapshot {
+    sequence: AtomicU64,
+    stimulus_type: AtomicU32,
+    wave_speed: AtomicU32,
+    tw_wave_speed: AtomicU32,
+    scale_mode: AtomicU32,
+    wavelength_m: AtomicU32,
+    atten_d0_m: AtomicU32,
+    atten_exponent: AtomicU32,
+}
 
 impl ConfigSnapshot {
     fn new(config: InstanceConfig) -> Self {
-        Self(AtomicU64::new(Self::encode(config)))
-    }
-
-    fn store(&self, config: InstanceConfig) {
-        self.0.store(Self::encode(config), Ordering::Relaxed);
-    }
-
-    fn load(&self) -> InstanceConfig {
-        let packed = self.0.load(Ordering::Relaxed);
-        InstanceConfig {
-            stimulus_type: if packed >> 32 == 0 {
-                haptic_protocol::StimulusType::Wave
-            } else {
-                haptic_protocol::StimulusType::Standing
-            },
-            wave_speed: f32::from_bits(packed as u32),
+        Self {
+            sequence: AtomicU64::new(0),
+            stimulus_type: AtomicU32::new(Self::encode_stimulus(config.stimulus_type)),
+            wave_speed: AtomicU32::new(config.wave_speed.to_bits()),
+            tw_wave_speed: AtomicU32::new(config.travelling_wave.wave_speed.to_bits()),
+            scale_mode: AtomicU32::new(Self::encode_scale_mode(config.travelling_wave.scale_mode)),
+            wavelength_m: AtomicU32::new(config.travelling_wave.wavelength_m.to_bits()),
+            atten_d0_m: AtomicU32::new(config.distance_decay.d0_m.to_bits()),
+            atten_exponent: AtomicU32::new(config.distance_decay.exponent.to_bits()),
         }
     }
 
-    fn encode(config: InstanceConfig) -> u64 {
-        let stimulus = match config.stimulus_type {
-            haptic_protocol::StimulusType::Wave => 0u64,
-            haptic_protocol::StimulusType::Standing => 1u64,
-        };
-        config.wave_speed.to_bits() as u64 | stimulus << 32
+    fn store(&self, config: InstanceConfig) {
+        self.sequence.fetch_add(1, Ordering::AcqRel);
+        self.stimulus_type.store(
+            Self::encode_stimulus(config.stimulus_type),
+            Ordering::Relaxed,
+        );
+        self.wave_speed
+            .store(config.wave_speed.to_bits(), Ordering::Relaxed);
+        self.tw_wave_speed.store(
+            config.travelling_wave.wave_speed.to_bits(),
+            Ordering::Relaxed,
+        );
+        self.scale_mode.store(
+            Self::encode_scale_mode(config.travelling_wave.scale_mode),
+            Ordering::Relaxed,
+        );
+        self.wavelength_m.store(
+            config.travelling_wave.wavelength_m.to_bits(),
+            Ordering::Relaxed,
+        );
+        self.atten_d0_m
+            .store(config.distance_decay.d0_m.to_bits(), Ordering::Relaxed);
+        self.atten_exponent
+            .store(config.distance_decay.exponent.to_bits(), Ordering::Relaxed);
+        self.sequence.fetch_add(1, Ordering::Release);
+    }
+
+    fn load(&self) -> InstanceConfig {
+        loop {
+            let before = self.sequence.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let stimulus_type = match self.stimulus_type.load(Ordering::Relaxed) {
+                0 => haptic_protocol::StimulusType::Wave,
+                _ => haptic_protocol::StimulusType::TravellingWave,
+            };
+            let wave_speed = f32::from_bits(self.wave_speed.load(Ordering::Relaxed));
+            let tw_wave_speed = f32::from_bits(self.tw_wave_speed.load(Ordering::Relaxed));
+            let scale_mode = match self.scale_mode.load(Ordering::Relaxed) {
+                0 => haptic_protocol::SpatialScaleMode::Speed,
+                _ => haptic_protocol::SpatialScaleMode::Wavelength,
+            };
+            let wavelength_m = f32::from_bits(self.wavelength_m.load(Ordering::Relaxed));
+            let atten_d0_m = f32::from_bits(self.atten_d0_m.load(Ordering::Relaxed));
+            let atten_exponent = f32::from_bits(self.atten_exponent.load(Ordering::Relaxed));
+            if before == self.sequence.load(Ordering::Acquire) {
+                return InstanceConfig {
+                    stimulus_type,
+                    wave_speed,
+                    travelling_wave: haptic_protocol::TravellingWaveConfig {
+                        scale_mode,
+                        wave_speed: tw_wave_speed,
+                        wavelength_m,
+                    },
+                    distance_decay: haptic_protocol::DistanceDecay {
+                        d0_m: atten_d0_m,
+                        exponent: atten_exponent,
+                    },
+                };
+            }
+        }
+    }
+
+    fn encode_stimulus(stimulus_type: haptic_protocol::StimulusType) -> u32 {
+        match stimulus_type {
+            haptic_protocol::StimulusType::Wave => 0,
+            haptic_protocol::StimulusType::TravellingWave => 1,
+        }
+    }
+
+    fn encode_scale_mode(mode: haptic_protocol::SpatialScaleMode) -> u32 {
+        match mode {
+            haptic_protocol::SpatialScaleMode::Speed => 0,
+            haptic_protocol::SpatialScaleMode::Wavelength => 1,
+        }
     }
 }
 
@@ -318,8 +391,17 @@ mod tests {
     fn atomic_config_snapshot_roundtrips_as_one_value() {
         let snapshot = ConfigSnapshot::new(InstanceConfig::default());
         let expected = InstanceConfig {
-            stimulus_type: StimulusType::Standing,
+            stimulus_type: StimulusType::TravellingWave,
             wave_speed: 3.25,
+            travelling_wave: haptic_protocol::TravellingWaveConfig {
+                scale_mode: haptic_protocol::SpatialScaleMode::Wavelength,
+                wave_speed: 4.5,
+                wavelength_m: 0.075,
+            },
+            distance_decay: haptic_protocol::DistanceDecay {
+                d0_m: 0.8,
+                exponent: 2.0,
+            },
         };
         snapshot.store(expected);
         assert_eq!(snapshot.load(), expected);

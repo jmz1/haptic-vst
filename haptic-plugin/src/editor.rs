@@ -70,10 +70,53 @@ pub fn create(
                                 setter,
                             ));
                             ui.end_row();
+                            let tw = params.stimulus_type.value()
+                                == crate::StimulusTypeParam::TravellingWave;
+                            let speed_active = !tw
+                                || params.tw_scale_mode.value()
+                                    == crate::SpatialScaleModeParam::Speed;
                             ui.label("Wave speed:");
-                            ui.add(widgets::ParamSlider::for_param(&params.wave_speed, setter));
+                            ui.add_enabled(
+                                speed_active,
+                                widgets::ParamSlider::for_param(&params.wave_speed, setter),
+                            );
+                            ui.end_row();
+                            ui.label("TW scale:");
+                            ui.add_enabled(
+                                tw,
+                                widgets::ParamSlider::for_param(&params.tw_scale_mode, setter),
+                            );
+                            ui.end_row();
+                            ui.label("TW wavelength:");
+                            ui.add_enabled(
+                                tw && params.tw_scale_mode.value()
+                                    == crate::SpatialScaleModeParam::Wavelength,
+                                widgets::ParamSlider::for_param(&params.tw_wavelength, setter),
+                            );
+                            ui.end_row();
+                            ui.label("Attenuation knee:");
+                            ui.add(widgets::ParamSlider::for_param(&params.atten_d0, setter));
+                            ui.end_row();
+                            ui.label("Attenuation exponent:");
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.atten_exponent,
+                                setter,
+                            ));
                             ui.end_row();
                         });
+                    if params.stimulus_type.value() == crate::StimulusTypeParam::TravellingWave {
+                        let frequency = 100.0;
+                        match params.tw_scale_mode.value() {
+                            crate::SpatialScaleModeParam::Speed => ui.weak(format!(
+                                "TW reference at 100 Hz: λ = {:.4} m",
+                                params.wave_speed.value() / frequency
+                            )),
+                            crate::SpatialScaleModeParam::Wavelength => ui.weak(format!(
+                                "TW reference at 100 Hz: c = {:.2} m/s",
+                                params.tw_wavelength.value() * frequency
+                            )),
+                        };
+                    }
                 });
 
                 ui.separator();

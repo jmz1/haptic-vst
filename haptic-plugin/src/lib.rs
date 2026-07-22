@@ -1,4 +1,7 @@
-use haptic_protocol::{HapticCommand, InstanceConfig, MpeData, Parameter, StimulusType};
+use haptic_protocol::{
+    DistanceDecay, HapticCommand, InstanceConfig, MpeData, Parameter, SpatialScaleMode,
+    StimulusType, TravellingWaveConfig,
+};
 use nih_plug::prelude::*;
 use std::sync::Arc;
 
@@ -15,15 +18,32 @@ pub const BUILD_HASH: &str = env!("HAPTIC_BUILD_HASH");
 pub enum StimulusTypeParam {
     #[name = "Wave"]
     Wave,
-    #[name = "Standing Wave"]
-    Standing,
+    #[name = "Travelling Wave (TW)"]
+    TravellingWave,
 }
 
 impl From<StimulusTypeParam> for StimulusType {
     fn from(value: StimulusTypeParam) -> Self {
         match value {
             StimulusTypeParam::Wave => StimulusType::Wave,
-            StimulusTypeParam::Standing => StimulusType::Standing,
+            StimulusTypeParam::TravellingWave => StimulusType::TravellingWave,
+        }
+    }
+}
+
+#[derive(Enum, PartialEq, Clone, Copy)]
+pub enum SpatialScaleModeParam {
+    #[name = "Speed"]
+    Speed,
+    #[name = "Fixed wavelength"]
+    Wavelength,
+}
+
+impl From<SpatialScaleModeParam> for SpatialScaleMode {
+    fn from(value: SpatialScaleModeParam) -> Self {
+        match value {
+            SpatialScaleModeParam::Speed => SpatialScaleMode::Speed,
+            SpatialScaleModeParam::Wavelength => SpatialScaleMode::Wavelength,
         }
     }
 }
@@ -48,6 +68,10 @@ pub struct HapticPlugin {
     // Last parameter values pushed to the server (None = never sent)
     last_sent_wave_speed: Option<f32>,
     last_sent_stimulus_type: Option<StimulusTypeParam>,
+    last_sent_scale_mode: Option<SpatialScaleModeParam>,
+    last_sent_wavelength: Option<f32>,
+    last_sent_atten_d0: Option<f32>,
+    last_sent_atten_exponent: Option<f32>,
 }
 
 /// A process-unique, non-zero instance id (0 is the server's default-instance
@@ -75,6 +99,14 @@ pub struct HapticParams {
     pub wave_speed: FloatParam,
     #[id = "stim_type"]
     pub stimulus_type: EnumParam<StimulusTypeParam>,
+    #[id = "tw_scale_mode"]
+    pub tw_scale_mode: EnumParam<SpatialScaleModeParam>,
+    #[id = "tw_wavelength"]
+    pub tw_wavelength: FloatParam,
+    #[id = "atten_d0"]
+    pub atten_d0: FloatParam,
+    #[id = "atten_p"]
+    pub atten_exponent: FloatParam,
 }
 
 impl Default for HapticPlugin {
@@ -86,6 +118,15 @@ impl Default for HapticPlugin {
         let initial_config = InstanceConfig {
             stimulus_type: params.stimulus_type.value().into(),
             wave_speed: params.wave_speed.value(),
+            travelling_wave: TravellingWaveConfig {
+                scale_mode: params.tw_scale_mode.value().into(),
+                wave_speed: params.wave_speed.value(),
+                wavelength_m: params.tw_wavelength.value(),
+            },
+            distance_decay: DistanceDecay {
+                d0_m: params.atten_d0.value(),
+                exponent: params.atten_exponent.value(),
+            },
         };
         let ipc_client = Arc::new(IpcClient::spawn(instance_id, initial_config, diag.clone()));
         Self {
@@ -96,6 +137,10 @@ impl Default for HapticPlugin {
             mpe_state: [MpeData::default(); MIDI_CHANNELS],
             last_sent_wave_speed: None,
             last_sent_stimulus_type: None,
+            last_sent_scale_mode: None,
+            last_sent_wavelength: None,
+            last_sent_atten_d0: None,
+            last_sent_atten_exponent: None,
         }
     }
 }
@@ -119,6 +164,38 @@ impl Default for HapticParams {
             .with_unit(" m/s")
             .with_step_size(0.01),
             stimulus_type: EnumParam::new("Stimulus Type", StimulusTypeParam::Wave),
+            tw_scale_mode: EnumParam::new("TW Scale Mode", SpatialScaleModeParam::Speed),
+            tw_wavelength: FloatParam::new(
+                "TW Wavelength",
+                haptic_protocol::DEFAULT_WAVELENGTH_M,
+                FloatRange::Skewed {
+                    min: haptic_protocol::MIN_WAVELENGTH_M,
+                    max: haptic_protocol::MAX_WAVELENGTH_M,
+                    factor: FloatRange::skew_factor(-2.0),
+                },
+            )
+            .with_unit(" m")
+            .with_step_size(0.0001),
+            atten_d0: FloatParam::new(
+                "Attenuation Knee",
+                haptic_protocol::DEFAULT_ATTEN_D0_M,
+                FloatRange::Skewed {
+                    min: haptic_protocol::MIN_ATTEN_D0_M,
+                    max: haptic_protocol::MAX_ATTEN_D0_M,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_unit(" m")
+            .with_step_size(0.001),
+            atten_exponent: FloatParam::new(
+                "Attenuation Exponent",
+                haptic_protocol::DEFAULT_ATTEN_EXPONENT,
+                FloatRange::Linear {
+                    min: haptic_protocol::MIN_ATTEN_EXPONENT,
+                    max: haptic_protocol::MAX_ATTEN_EXPONENT,
+                },
+            )
+            .with_step_size(0.01),
         }
     }
 }
@@ -173,6 +250,10 @@ impl Plugin for HapticPlugin {
         // a fresh parameter push on the next process().
         self.last_sent_wave_speed = None;
         self.last_sent_stimulus_type = None;
+        self.last_sent_scale_mode = None;
+        self.last_sent_wavelength = None;
+        self.last_sent_atten_d0 = None;
+        self.last_sent_atten_exponent = None;
         true
     }
 
@@ -193,12 +274,29 @@ impl Plugin for HapticPlugin {
         // manager re-sends in Hello on the next reconnect.
         let wave_speed = self.params.wave_speed.value();
         let stimulus_type = self.params.stimulus_type.value();
+        let scale_mode = self.params.tw_scale_mode.value();
+        let wavelength = self.params.tw_wavelength.value();
+        let atten_d0 = self.params.atten_d0.value();
+        let atten_exponent = self.params.atten_exponent.value();
         if self.last_sent_wave_speed != Some(wave_speed)
             || self.last_sent_stimulus_type != Some(stimulus_type)
+            || self.last_sent_scale_mode != Some(scale_mode)
+            || self.last_sent_wavelength != Some(wavelength)
+            || self.last_sent_atten_d0 != Some(atten_d0)
+            || self.last_sent_atten_exponent != Some(atten_exponent)
         {
             client.set_config(InstanceConfig {
                 stimulus_type: stimulus_type.into(),
                 wave_speed,
+                travelling_wave: TravellingWaveConfig {
+                    scale_mode: scale_mode.into(),
+                    wave_speed,
+                    wavelength_m: wavelength,
+                },
+                distance_decay: DistanceDecay {
+                    d0_m: atten_d0,
+                    exponent: atten_exponent,
+                },
             });
         }
         if self.last_sent_wave_speed != Some(wave_speed)
@@ -220,6 +318,46 @@ impl Plugin for HapticPlugin {
                 .is_ok()
         {
             self.last_sent_stimulus_type = Some(stimulus_type);
+        }
+        if self.last_sent_scale_mode != Some(scale_mode)
+            && client
+                .send_command(HapticCommand::SetParameter {
+                    timestamp_us: base_timestamp,
+                    parameter: Parameter::TravellingWaveScaleMode(scale_mode.into()),
+                })
+                .is_ok()
+        {
+            self.last_sent_scale_mode = Some(scale_mode);
+        }
+        if self.last_sent_wavelength != Some(wavelength)
+            && client
+                .send_command(HapticCommand::SetParameter {
+                    timestamp_us: base_timestamp,
+                    parameter: Parameter::TravellingWaveWavelength(wavelength),
+                })
+                .is_ok()
+        {
+            self.last_sent_wavelength = Some(wavelength);
+        }
+        if self.last_sent_atten_d0 != Some(atten_d0)
+            && client
+                .send_command(HapticCommand::SetParameter {
+                    timestamp_us: base_timestamp,
+                    parameter: Parameter::AttenuationD0(atten_d0),
+                })
+                .is_ok()
+        {
+            self.last_sent_atten_d0 = Some(atten_d0);
+        }
+        if self.last_sent_atten_exponent != Some(atten_exponent)
+            && client
+                .send_command(HapticCommand::SetParameter {
+                    timestamp_us: base_timestamp,
+                    parameter: Parameter::AttenuationExponent(atten_exponent),
+                })
+                .is_ok()
+        {
+            self.last_sent_atten_exponent = Some(atten_exponent);
         }
 
         // Process MIDI events, merging each into the per-channel MPE cache.

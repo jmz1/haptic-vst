@@ -2,8 +2,9 @@ use crate::config::TransducerLayout;
 use crate::engine::VoiceSnapshot;
 use haptic_protocol::{
     encode_frame, FrameDecoder, FrameError, HapticCommand, InstanceConfig, MpeData, Parameter,
-    ServerStatus, MAX_FRAME_SIZE, MAX_WAVE_SPEED, MIDI_CHANNEL_COUNT, MIN_WAVE_SPEED,
-    PROTOCOL_VERSION,
+    ServerStatus, MAX_ATTEN_D0_M, MAX_ATTEN_EXPONENT, MAX_FRAME_SIZE, MAX_WAVELENGTH_M,
+    MAX_WAVE_SPEED, MIDI_CHANNEL_COUNT, MIN_ATTEN_D0_M, MIN_ATTEN_EXPONENT, MIN_WAVELENGTH_M,
+    MIN_WAVE_SPEED, PROTOCOL_VERSION,
 };
 use std::collections::{HashSet, VecDeque};
 use std::io::Read;
@@ -540,10 +541,32 @@ fn validate_mpe(mpe: &mut MpeData) -> Result<(), &'static str> {
 }
 
 fn validate_config(config: &mut InstanceConfig) -> Result<(), &'static str> {
-    if !config.wave_speed.is_finite() {
-        return Err("wave speed must be finite");
+    if !config.wave_speed.is_finite() || !config.travelling_wave.wave_speed.is_finite() {
+        return Err("wave speeds must be finite");
+    }
+    if !config.travelling_wave.wavelength_m.is_finite() {
+        return Err("wavelength must be finite");
+    }
+    if !config.distance_decay.d0_m.is_finite() || !config.distance_decay.exponent.is_finite() {
+        return Err("distance decay must be finite");
     }
     config.wave_speed = config.wave_speed.clamp(MIN_WAVE_SPEED, MAX_WAVE_SPEED);
+    config.travelling_wave.wave_speed = config
+        .travelling_wave
+        .wave_speed
+        .clamp(MIN_WAVE_SPEED, MAX_WAVE_SPEED);
+    config.travelling_wave.wavelength_m = config
+        .travelling_wave
+        .wavelength_m
+        .clamp(MIN_WAVELENGTH_M, MAX_WAVELENGTH_M);
+    config.distance_decay.d0_m = config
+        .distance_decay
+        .d0_m
+        .clamp(MIN_ATTEN_D0_M, MAX_ATTEN_D0_M);
+    config.distance_decay.exponent = config
+        .distance_decay
+        .exponent
+        .clamp(MIN_ATTEN_EXPONENT, MAX_ATTEN_EXPONENT);
     Ok(())
 }
 
@@ -602,6 +625,28 @@ fn validate_command(command: &mut HapticCommand) -> Result<(), &'static str> {
                 if *output >= 32 || *source >= 32 {
                     return Err("monitor route out of range");
                 }
+                Ok(())
+            }
+            Parameter::TravellingWaveScaleMode(_) => Ok(()),
+            Parameter::TravellingWaveWavelength(wavelength_m) => {
+                if !wavelength_m.is_finite() {
+                    return Err("wavelength must be finite");
+                }
+                *wavelength_m = wavelength_m.clamp(MIN_WAVELENGTH_M, MAX_WAVELENGTH_M);
+                Ok(())
+            }
+            Parameter::AttenuationD0(d0_m) => {
+                if !d0_m.is_finite() {
+                    return Err("attenuation d0 must be finite");
+                }
+                *d0_m = d0_m.clamp(MIN_ATTEN_D0_M, MAX_ATTEN_D0_M);
+                Ok(())
+            }
+            Parameter::AttenuationExponent(exponent) => {
+                if !exponent.is_finite() {
+                    return Err("attenuation exponent must be finite");
+                }
+                *exponent = exponent.clamp(MIN_ATTEN_EXPONENT, MAX_ATTEN_EXPONENT);
                 Ok(())
             }
         },
@@ -768,7 +813,10 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 instance_id: 42,
                 role: haptic_protocol::ClientRole::Observer,
-                config: haptic_protocol::InstanceConfig::default(),
+                config: haptic_protocol::InstanceConfig {
+                    stimulus_type: haptic_protocol::StimulusType::TravellingWave,
+                    ..haptic_protocol::InstanceConfig::default()
+                },
             },
             &mut frame,
         )
@@ -786,6 +834,23 @@ mod tests {
         )
         .unwrap();
         coalesced.extend_from_slice(&frame);
+        for parameter in [
+            Parameter::WaveSpeed(12.0),
+            Parameter::TravellingWaveScaleMode(haptic_protocol::SpatialScaleMode::Wavelength),
+            Parameter::TravellingWaveWavelength(0.125),
+            Parameter::AttenuationD0(0.75),
+            Parameter::AttenuationExponent(1.5),
+        ] {
+            encode_frame(
+                &HapticCommand::SetParameter {
+                    timestamp_us: 0,
+                    parameter,
+                },
+                &mut frame,
+            )
+            .unwrap();
+            coalesced.extend_from_slice(&frame);
+        }
         encode_frame(
             &HapticCommand::MpeUpdate {
                 timestamp_us: 0,
@@ -834,6 +899,43 @@ mod tests {
                 note: 60,
                 channel: 1,
                 ..
+            }
+        ));
+        assert!(matches!(
+            pop_with_timeout(&mut rx),
+            EngineCommand::SetParameter {
+                instance_id: 42,
+                parameter: Parameter::WaveSpeed(12.0)
+            }
+        ));
+        assert!(matches!(
+            pop_with_timeout(&mut rx),
+            EngineCommand::SetParameter {
+                instance_id: 42,
+                parameter: Parameter::TravellingWaveScaleMode(
+                    haptic_protocol::SpatialScaleMode::Wavelength
+                )
+            }
+        ));
+        assert!(matches!(
+            pop_with_timeout(&mut rx),
+            EngineCommand::SetParameter {
+                instance_id: 42,
+                parameter: Parameter::TravellingWaveWavelength(0.125)
+            }
+        ));
+        assert!(matches!(
+            pop_with_timeout(&mut rx),
+            EngineCommand::SetParameter {
+                instance_id: 42,
+                parameter: Parameter::AttenuationD0(0.75)
+            }
+        ));
+        assert!(matches!(
+            pop_with_timeout(&mut rx),
+            EngineCommand::SetParameter {
+                instance_id: 42,
+                parameter: Parameter::AttenuationExponent(1.5)
             }
         ));
         assert!(matches!(
@@ -990,6 +1092,7 @@ mod tests {
             config: InstanceConfig {
                 stimulus_type: haptic_protocol::StimulusType::Wave,
                 wave_speed: 20_000.0,
+                ..InstanceConfig::default()
             },
         };
         validate_command(&mut hello).unwrap();
@@ -1042,5 +1145,30 @@ mod tests {
             parameter: Parameter::WaveSpeed(f32::INFINITY),
         };
         assert!(validate_command(&mut bad_speed).is_err());
+
+        for parameter in [
+            Parameter::TravellingWaveWavelength(f32::NAN),
+            Parameter::AttenuationD0(f32::INFINITY),
+            Parameter::AttenuationExponent(f32::NEG_INFINITY),
+        ] {
+            let mut command = HapticCommand::SetParameter {
+                timestamp_us: 0,
+                parameter,
+            };
+            assert!(validate_command(&mut command).is_err());
+        }
+
+        let mut finite_extremes = HapticCommand::SetParameter {
+            timestamp_us: 0,
+            parameter: Parameter::TravellingWaveWavelength(1_000.0),
+        };
+        validate_command(&mut finite_extremes).unwrap();
+        assert!(matches!(
+            finite_extremes,
+            HapticCommand::SetParameter {
+                parameter: Parameter::TravellingWaveWavelength(MAX_WAVELENGTH_M),
+                ..
+            }
+        ));
     }
 }

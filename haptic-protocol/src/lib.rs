@@ -6,12 +6,22 @@ use serde::{Deserialize, Serialize};
 /// Bincode encodes enum variants by declaration order, so protocol changes
 /// are coordinated and versioned. A server must reject a client whose version
 /// does not exactly match this value before accepting any other command.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Shared numeric limits used by every producer and the server validator.
 pub const MIDI_CHANNEL_COUNT: u8 = 16;
 pub const MIN_WAVE_SPEED: f32 = 0.25;
 pub const MAX_WAVE_SPEED: f32 = 1000.0;
+pub const MIN_WAVELENGTH_M: f32 = 0.00125;
+pub const MAX_WAVELENGTH_M: f32 = 50.0;
+pub const MIN_ATTEN_D0_M: f32 = 0.01;
+pub const MAX_ATTEN_D0_M: f32 = 10.0;
+pub const MIN_ATTEN_EXPONENT: f32 = 0.0;
+pub const MAX_ATTEN_EXPONENT: f32 = 4.0;
+pub const DEFAULT_WAVE_SPEED: f32 = 20.0;
+pub const DEFAULT_WAVELENGTH_M: f32 = 0.2;
+pub const DEFAULT_ATTEN_D0_M: f32 = 0.5;
+pub const DEFAULT_ATTEN_EXPONENT: f32 = 1.0;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct MpeData {
@@ -34,7 +44,89 @@ impl Default for MpeData {
 pub enum StimulusType {
     #[default]
     Wave,
-    Standing,
+    TravellingWave,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SpatialScaleMode {
+    #[default]
+    Speed,
+    Wavelength,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct DistanceDecay {
+    pub d0_m: f32,
+    pub exponent: f32,
+}
+
+impl Default for DistanceDecay {
+    fn default() -> Self {
+        Self {
+            d0_m: DEFAULT_ATTEN_D0_M,
+            exponent: DEFAULT_ATTEN_EXPONENT,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct TravellingWaveConfig {
+    pub scale_mode: SpatialScaleMode,
+    pub wave_speed: f32,
+    pub wavelength_m: f32,
+}
+
+impl Default for TravellingWaveConfig {
+    fn default() -> Self {
+        Self {
+            scale_mode: SpatialScaleMode::Speed,
+            wave_speed: DEFAULT_WAVE_SPEED,
+            wavelength_m: DEFAULT_WAVELENGTH_M,
+        }
+    }
+}
+
+/// Shared radial distance gain used by the engine and geometric viewer.
+#[inline]
+pub fn distance_gain(distance_m: f32, decay: DistanceDecay) -> f32 {
+    let base = 1.0 + distance_m.max(0.0) / decay.d0_m.max(MIN_ATTEN_D0_M);
+    let exponent = decay.exponent.clamp(MIN_ATTEN_EXPONENT, MAX_ATTEN_EXPONENT);
+    if exponent == 0.0 {
+        1.0
+    } else if exponent == 1.0 {
+        1.0 / base
+    } else {
+        base.powf(-exponent)
+    }
+}
+
+#[inline]
+pub fn effective_wavelength(
+    frequency: f32,
+    wave_speed: f32,
+    mode: SpatialScaleMode,
+    wavelength_m: f32,
+) -> f32 {
+    match mode {
+        SpatialScaleMode::Speed => {
+            wave_speed.clamp(MIN_WAVE_SPEED, MAX_WAVE_SPEED) / frequency.max(f32::MIN_POSITIVE)
+        }
+        SpatialScaleMode::Wavelength => wavelength_m.clamp(MIN_WAVELENGTH_M, MAX_WAVELENGTH_M),
+    }
+}
+
+/// Relative complex radial field for an instantaneous travelling wave.
+/// The source oscillator is the zero-phase reference, so propagation appears
+/// as a negative spatial phase rotation.
+#[inline]
+pub fn travelling_wave_relative_phasor(
+    distance_m: f32,
+    wavelength_m: f32,
+    decay: DistanceDecay,
+) -> (f32, f32) {
+    let phase = std::f32::consts::TAU * distance_m.max(0.0) / wavelength_m.max(MIN_WAVELENGTH_M);
+    let gain = distance_gain(distance_m, decay);
+    (gain * phase.cos(), -gain * phase.sin())
 }
 
 /// Per-instance ("note type") configuration a controller registers with the
@@ -46,13 +138,17 @@ pub enum StimulusType {
 pub struct InstanceConfig {
     pub stimulus_type: StimulusType,
     pub wave_speed: f32,
+    pub travelling_wave: TravellingWaveConfig,
+    pub distance_decay: DistanceDecay,
 }
 
 impl Default for InstanceConfig {
     fn default() -> Self {
         Self {
             stimulus_type: StimulusType::Wave,
-            wave_speed: 20.0,
+            wave_speed: DEFAULT_WAVE_SPEED,
+            travelling_wave: TravellingWaveConfig::default(),
+            distance_decay: DistanceDecay::default(),
         }
     }
 }
@@ -70,7 +166,14 @@ pub enum Parameter {
     /// Connect physical device output `output` to logical transducer
     /// channel `source` — lets a stereo test device audition any of the
     /// 32 logical channels. Default routing is identity. Server-global.
-    MonitorRoute { output: u8, source: u8 },
+    MonitorRoute {
+        output: u8,
+        source: u8,
+    },
+    TravellingWaveScaleMode(SpatialScaleMode),
+    TravellingWaveWavelength(f32),
+    AttenuationD0(f32),
+    AttenuationExponent(f32),
 }
 
 /// How a connected client relates to the server. Controllers only *send*
@@ -86,14 +189,14 @@ pub enum ClientRole {
 }
 
 /// Maximum concurrently-visualised voices carried in an `ActiveVoices`
-/// status (wave and standing-stimulus pools combined).
-pub const MAX_ACTIVE_VOICES: usize = 12;
+/// status (wave and travelling-wave pools combined).
+pub const MAX_ACTIVE_VOICES: usize = 16;
 
 /// Compact per-voice state for visualisation. The viewer recomputes each
-/// transducer's propagation delay, relative phase, and local amplitude
-/// geometrically from `source_pos`, `wave_speed`, `frequency` and the known
-/// layout — so no per-transducer delay array is transmitted, and many voices
-/// fit one frame. `instance_id` + `note_type` let the viewer filter or sum.
+/// transducer's relative phase and local amplitude geometrically from the
+/// effective wavelength, decay, source position, and known layout — so no
+/// per-transducer array is transmitted, and many voices fit one frame.
+/// `instance_id` + `note_type` let the viewer filter or sum.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
 pub struct VoiceInfo {
     pub instance_id: u64,
@@ -102,7 +205,11 @@ pub struct VoiceInfo {
     pub note_type: StimulusType,
     pub frequency: f32,
     pub wave_speed: f32,
-    /// Effective (velocity-limited) source position the delay lines radiate from.
+    pub scale_mode: SpatialScaleMode,
+    pub wavelength_m: f32,
+    pub atten_d0_m: f32,
+    pub atten_exponent: f32,
+    /// Effective source position. Velocity-limited for Wave; direct for TW.
     pub source_pos: (f32, f32),
     /// Position MPE is asking the source to move to.
     pub requested_pos: (f32, f32),
@@ -145,6 +252,10 @@ pub enum HapticCommand {
     Panic, // Stop all
 }
 
+// The fixed ActiveVoices array deliberately keeps the wire schema bounded and
+// mirrors the allocation-free audio-thread snapshot. Boxing it would add a
+// per-status allocation and make the schema's ownership less explicit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ServerStatus {
     /// Confirms that the server accepted and registered the connection's
@@ -177,7 +288,7 @@ pub enum ServerStatus {
         device_channels: u16,
         routes: [u8; 32],
     },
-    /// All currently active delay-line (wave) voices, for phase
+    /// All currently active Wave and Travelling Wave voices, for phase
     /// visualisation. Replaces the old single-voice `VoiceState`: the viewer
     /// is the one observer of whole-server state, so it receives every voice
     /// (tagged with `instance_id` + `note_type` for filtering / summing) and
@@ -382,8 +493,17 @@ mod tests {
             instance_id: 0xDEAD_BEEF_1234_5678,
             role: ClientRole::Observer,
             config: InstanceConfig {
-                stimulus_type: StimulusType::Standing,
+                stimulus_type: StimulusType::TravellingWave,
                 wave_speed: 3.5,
+                travelling_wave: TravellingWaveConfig {
+                    scale_mode: SpatialScaleMode::Wavelength,
+                    wave_speed: 3.5,
+                    wavelength_m: 0.125,
+                },
+                distance_decay: DistanceDecay {
+                    d0_m: 0.75,
+                    exponent: 1.5,
+                },
             },
         };
         let mut buf = Vec::new();
@@ -400,8 +520,14 @@ mod tests {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(instance_id, 0xDEAD_BEEF_1234_5678);
                 assert_eq!(role, ClientRole::Observer);
-                assert_eq!(config.stimulus_type, StimulusType::Standing);
+                assert_eq!(config.stimulus_type, StimulusType::TravellingWave);
                 assert_eq!(config.wave_speed, 3.5);
+                assert_eq!(
+                    config.travelling_wave.scale_mode,
+                    SpatialScaleMode::Wavelength
+                );
+                assert_eq!(config.travelling_wave.wavelength_m, 0.125);
+                assert_eq!(config.distance_decay.d0_m, 0.75);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -443,5 +569,32 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_distance_decay_matches_legacy_wave_gain() {
+        let decay = DistanceDecay::default();
+        for distance in [0.0, 0.125, 0.5, 1.0, 2.25] {
+            let expected = 1.0 / (1.0 + 2.0 * distance);
+            assert!((distance_gain(distance, decay) - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn effective_wavelength_uses_selected_representation() {
+        assert!(
+            (effective_wavelength(100.0, 20.0, SpatialScaleMode::Speed, 1.0) - 0.2).abs() < 1e-6
+        );
+        assert!(
+            (effective_wavelength(50.0, 20.0, SpatialScaleMode::Wavelength, 0.125) - 0.125).abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn travelling_wave_phasor_has_expected_phase_and_gain() {
+        let (re, im) = travelling_wave_relative_phasor(0.125, 0.5, DistanceDecay::default());
+        assert!(re.abs() < 1e-6);
+        assert!((im + 0.8).abs() < 1e-6);
     }
 }

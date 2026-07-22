@@ -1,13 +1,17 @@
 use crate::config::TransducerLayout;
 use haptic_protocol::{
-    HapticCommand, InstanceConfig, MpeData, Parameter, StimulusType, VoiceInfo, MAX_ACTIVE_VOICES,
-    MAX_WAVE_SPEED, MIN_WAVE_SPEED,
+    distance_gain, effective_wavelength, DistanceDecay, HapticCommand, InstanceConfig, MpeData,
+    Parameter, SpatialScaleMode, StimulusType, TravellingWaveConfig, VoiceInfo, DEFAULT_ATTEN_D0_M,
+    DEFAULT_ATTEN_EXPONENT, DEFAULT_WAVE_SPEED, MAX_ACTIVE_VOICES, MAX_ATTEN_D0_M,
+    MAX_ATTEN_EXPONENT, MAX_WAVELENGTH_M, MAX_WAVE_SPEED, MIN_ATTEN_D0_M, MIN_ATTEN_EXPONENT,
+    MIN_WAVELENGTH_M, MIN_WAVE_SPEED,
 };
 
 // Constants from requirements
 pub const TRANSDUCER_COUNT: usize = 32;
 const MAX_WAVE_STIMULI: usize = 8;
-const MAX_STANDING_STIMULI: usize = 4;
+const MAX_TRAVELLING_WAVE_STIMULI: usize = 8;
+const _: () = assert!(MAX_ACTIVE_VOICES >= MAX_WAVE_STIMULI + MAX_TRAVELLING_WAVE_STIMULI);
 // Delay-line capacity in *internal-rate* samples (see RENDER_DECIMATION):
 // 16384 samples at 48 kHz / 32 = 1.5 kHz is ~10.9 s of propagation — 8.3 s
 // covers the full default table at the 0.25 m/s wave-speed floor, so the
@@ -63,7 +67,6 @@ const MPE_SMOOTHING_TAU: f32 = 0.015; // 15 ms
 const MPE_RAMP_MIN_S: f32 = 0.005;
 const MPE_RAMP_MAX_S: f32 = 0.05;
 
-const DEFAULT_WAVE_SPEED: f32 = 20.0; // m/s
 /// Maximum speed of the effective source position, as a fixed fraction of
 /// the stimulus's wave speed. Keeps the source comfortably subsonic relative
 /// to its own waves. With the scatter-write delay line (see `DelayLine`), an
@@ -83,7 +86,7 @@ const COMMAND_QUEUE_CAPACITY: usize = 1024;
 /// allocation on the audio thread.
 const MAX_INSTANCES: usize = 16;
 
-/// Per-block snapshot of every active wave voice, exported to the IPC thread
+/// Per-block snapshot of every active Wave/TW voice, exported to the IPC thread
 /// for phase visualisation. Fixed-size (no allocation on the audio thread);
 /// `count` entries of `voices` are valid. Each `VoiceInfo` is tagged with its
 /// owning `instance_id` so the viewer can filter or sum.
@@ -115,6 +118,7 @@ pub trait Stimulus: Send + Sync {
     fn set_wave_speed(&mut self, _wave_speed: f32) {
         // Default implementation does nothing (for stimuli that don't use wave speed)
     }
+    fn set_distance_decay(&mut self, _decay: DistanceDecay) {}
 }
 
 // Static allocation pool
@@ -225,11 +229,11 @@ fn steal_candidate<T: Stimulus + Default, const N: usize>(
 // Main engine with thread-safe command queue
 pub struct StimulusEngine {
     wave_pool: StimulusPool<WaveStimulus, MAX_WAVE_STIMULI>,
-    standing_pool: StimulusPool<StandingWaveStimulus, MAX_STANDING_STIMULI>,
+    travelling_wave_pool: StimulusPool<TravellingWaveStimulus, MAX_TRAVELLING_WAVE_STIMULI>,
 
     // Note -> slot ownership, parallel to each pool's slots
     wave_owners: [Option<VoiceOwner>; MAX_WAVE_STIMULI],
-    standing_owners: [Option<VoiceOwner>; MAX_STANDING_STIMULI],
+    travelling_wave_owners: [Option<VoiceOwner>; MAX_TRAVELLING_WAVE_STIMULI],
     next_seq: u64,
 
     // Per-instance note-type config, keyed by instance_id. Replaces the old
@@ -382,9 +386,9 @@ impl StimulusEngine {
 
         let engine = Self {
             wave_pool: StimulusPool::new(),
-            standing_pool: StimulusPool::new(),
+            travelling_wave_pool: StimulusPool::new(),
             wave_owners: [None; MAX_WAVE_STIMULI],
-            standing_owners: [None; MAX_STANDING_STIMULI],
+            travelling_wave_owners: [None; MAX_TRAVELLING_WAVE_STIMULI],
             next_seq: 0,
             instances: [None; MAX_INSTANCES],
             command_queue: consumer,
@@ -444,9 +448,11 @@ impl StimulusEngine {
                 self.wave_pool.get_mut(slot).note_off();
             }
         }
-        for slot in 0..MAX_STANDING_STIMULI {
-            if self.standing_owners[slot].is_some_and(|owner| owner.instance_id == instance_id) {
-                self.standing_pool.get_mut(slot).note_off();
+        for slot in 0..MAX_TRAVELLING_WAVE_STIMULI {
+            if self.travelling_wave_owners[slot]
+                .is_some_and(|owner| owner.instance_id == instance_id)
+            {
+                self.travelling_wave_pool.get_mut(slot).note_off();
             }
         }
         if let Some(slot) = self
@@ -483,21 +489,25 @@ impl StimulusEngine {
                 let stim = self.wave_pool.get_mut(slot);
                 stim.note_on(frequency, velocity, mpe);
                 stim.set_wave_speed(config.wave_speed);
+                stim.configure_distance_decay(config.distance_decay);
                 self.wave_owners[slot] = Some(owner);
             }
-            StimulusType::Standing => {
-                let slot = match self.standing_pool.allocate_slot() {
+            StimulusType::TravellingWave => {
+                let slot = match self.travelling_wave_pool.allocate_slot() {
                     Some(slot) => slot,
                     None => {
-                        let slot = steal_candidate(&self.standing_pool, &self.standing_owners);
-                        self.standing_pool.retrigger_slot(slot);
+                        let slot = steal_candidate(
+                            &self.travelling_wave_pool,
+                            &self.travelling_wave_owners,
+                        );
+                        self.travelling_wave_pool.retrigger_slot(slot);
                         slot
                     }
                 };
-                self.standing_pool
-                    .get_mut(slot)
-                    .note_on(frequency, velocity, mpe);
-                self.standing_owners[slot] = Some(owner);
+                let stim = self.travelling_wave_pool.get_mut(slot);
+                stim.note_on(frequency, velocity, mpe);
+                stim.configure(config.travelling_wave, config.distance_decay, true);
+                self.travelling_wave_owners[slot] = Some(owner);
             }
         }
     }
@@ -513,13 +523,13 @@ impl StimulusEngine {
                 }
             }
         }
-        for slot in 0..MAX_STANDING_STIMULI {
-            if let Some(owner) = self.standing_owners[slot] {
+        for slot in 0..MAX_TRAVELLING_WAVE_STIMULI {
+            if let Some(owner) = self.travelling_wave_owners[slot] {
                 if owner.instance_id == instance_id
                     && owner.channel == channel
                     && owner.note == note
                 {
-                    self.standing_pool.get_mut(slot).note_off();
+                    self.travelling_wave_pool.get_mut(slot).note_off();
                 }
             }
         }
@@ -535,10 +545,10 @@ impl StimulusEngine {
                 }
             }
         }
-        for slot in 0..MAX_STANDING_STIMULI {
-            if let Some(owner) = self.standing_owners[slot] {
+        for slot in 0..MAX_TRAVELLING_WAVE_STIMULI {
+            if let Some(owner) = self.travelling_wave_owners[slot] {
                 if owner.instance_id == instance_id && owner.channel == channel {
-                    self.standing_pool.get_mut(slot).mpe_update(mpe);
+                    self.travelling_wave_pool.get_mut(slot).mpe_update(mpe);
                 }
             }
         }
@@ -551,9 +561,33 @@ impl StimulusEngine {
                 self.wave_owners[slot] = None;
             }
         }
-        for slot in 0..MAX_STANDING_STIMULI {
-            if self.standing_owners[slot].is_some() && !self.standing_pool.slot_active(slot) {
-                self.standing_owners[slot] = None;
+        for slot in 0..MAX_TRAVELLING_WAVE_STIMULI {
+            if self.travelling_wave_owners[slot].is_some()
+                && !self.travelling_wave_pool.slot_active(slot)
+            {
+                self.travelling_wave_owners[slot] = None;
+            }
+        }
+    }
+
+    fn set_instance_decay(&mut self, instance_id: u64, d0_m: Option<f32>, exponent: Option<f32>) {
+        let mut decay = self.instance_config(instance_id).distance_decay;
+        if let Some(value) = d0_m {
+            decay.d0_m = value;
+        }
+        if let Some(value) = exponent {
+            decay.exponent = value;
+        }
+        for (slot, owner) in self.wave_owners.iter().enumerate() {
+            if owner.is_some_and(|owner| owner.instance_id == instance_id) {
+                self.wave_pool.get_mut(slot).set_distance_decay(decay);
+            }
+        }
+        for (slot, owner) in self.travelling_wave_owners.iter().enumerate() {
+            if owner.is_some_and(|owner| owner.instance_id == instance_id) {
+                self.travelling_wave_pool
+                    .get_mut(slot)
+                    .set_distance_decay(decay);
             }
         }
     }
@@ -600,6 +634,14 @@ impl StimulusEngine {
                 Parameter::WaveSpeed(speed) => {
                     if let Some(cfg) = self.instance_config_mut(instance_id) {
                         cfg.wave_speed = speed.clamp(MIN_WAVE_SPEED, MAX_WAVE_SPEED);
+                        cfg.travelling_wave.wave_speed = cfg.wave_speed;
+                    }
+                    for (slot, owner) in self.travelling_wave_owners.iter().enumerate() {
+                        if owner.is_some_and(|owner| owner.instance_id == instance_id) {
+                            self.travelling_wave_pool
+                                .get_mut(slot)
+                                .set_wave_speed(speed);
+                        }
                     }
                 }
                 Parameter::StimulusType(kind) => {
@@ -614,12 +656,49 @@ impl StimulusEngine {
                             source.min(TRANSDUCER_COUNT as u8 - 1);
                     }
                 }
+                Parameter::TravellingWaveScaleMode(mode) => {
+                    if let Some(cfg) = self.instance_config_mut(instance_id) {
+                        cfg.travelling_wave.scale_mode = mode;
+                    }
+                    for (slot, owner) in self.travelling_wave_owners.iter().enumerate() {
+                        if owner.is_some_and(|owner| owner.instance_id == instance_id) {
+                            self.travelling_wave_pool.get_mut(slot).set_scale_mode(mode);
+                        }
+                    }
+                }
+                Parameter::TravellingWaveWavelength(wavelength_m) => {
+                    let wavelength_m = wavelength_m.clamp(MIN_WAVELENGTH_M, MAX_WAVELENGTH_M);
+                    if let Some(cfg) = self.instance_config_mut(instance_id) {
+                        cfg.travelling_wave.wavelength_m = wavelength_m;
+                    }
+                    for (slot, owner) in self.travelling_wave_owners.iter().enumerate() {
+                        if owner.is_some_and(|owner| owner.instance_id == instance_id) {
+                            self.travelling_wave_pool
+                                .get_mut(slot)
+                                .set_wavelength(wavelength_m);
+                        }
+                    }
+                }
+                Parameter::AttenuationD0(d0_m) => {
+                    let d0_m = d0_m.clamp(MIN_ATTEN_D0_M, MAX_ATTEN_D0_M);
+                    if let Some(cfg) = self.instance_config_mut(instance_id) {
+                        cfg.distance_decay.d0_m = d0_m;
+                    }
+                    self.set_instance_decay(instance_id, Some(d0_m), None);
+                }
+                Parameter::AttenuationExponent(exponent) => {
+                    let exponent = exponent.clamp(MIN_ATTEN_EXPONENT, MAX_ATTEN_EXPONENT);
+                    if let Some(cfg) = self.instance_config_mut(instance_id) {
+                        cfg.distance_decay.exponent = exponent;
+                    }
+                    self.set_instance_decay(instance_id, None, Some(exponent));
+                }
             },
             EngineCommand::Panic => {
                 self.wave_pool.reset_all();
-                self.standing_pool.reset_all();
+                self.travelling_wave_pool.reset_all();
                 self.wave_owners = [None; MAX_WAVE_STIMULI];
-                self.standing_owners = [None; MAX_STANDING_STIMULI];
+                self.travelling_wave_owners = [None; MAX_TRAVELLING_WAVE_STIMULI];
             }
         }
     }
@@ -639,7 +718,7 @@ impl StimulusEngine {
     fn render_frame(&mut self, context: &ProcessContext<'_>, output: &mut [f32; TRANSDUCER_COUNT]) {
         output.fill(0.0);
         self.wave_pool.process_all(context, output);
-        self.standing_pool.process_all(context, output);
+        self.travelling_wave_pool.process_all(context, output);
 
         // Per-transducer gain, then safety limiting
         for (sample, &gain) in output.iter_mut().zip(self.layout.gains.iter()) {
@@ -750,28 +829,35 @@ impl StimulusEngine {
                 note_type: StimulusType::Wave,
                 frequency: stim.frequency,
                 wave_speed: stim.wave_speed,
+                scale_mode: SpatialScaleMode::Speed,
+                wavelength_m: stim.wave_speed / stim.frequency.max(f32::MIN_POSITIVE),
+                atten_d0_m: stim.decay_d0.current,
+                atten_exponent: stim.decay_exponent.current,
                 source_pos: stim.source_pos,
                 requested_pos: stim.requested_pos,
                 amplitude: stim.amplitude * stim.env_level * stim.mpe.value.pressure,
             };
             count += 1;
         }
-        for (slot, owner) in self.standing_owners.iter().enumerate() {
+        for (slot, owner) in self.travelling_wave_owners.iter().enumerate() {
             let Some(owner) = owner else { continue };
-            if !self.standing_pool.slot_active(slot) || count >= MAX_ACTIVE_VOICES {
+            if !self.travelling_wave_pool.slot_active(slot) || count >= MAX_ACTIVE_VOICES {
                 continue;
             }
-            let stim = &self.standing_pool.stimuli[slot];
-            let center = (self.layout.table_m.0 * 0.5, self.layout.table_m.1 * 0.5);
+            let stim = &self.travelling_wave_pool.stimuli[slot];
             voices[count] = VoiceInfo {
                 instance_id: owner.instance_id,
                 seq: owner.seq,
                 note: owner.note,
-                note_type: StimulusType::Standing,
+                note_type: StimulusType::TravellingWave,
                 frequency: stim.frequency,
-                wave_speed: 0.0,
-                source_pos: center,
-                requested_pos: center,
+                wave_speed: stim.frequency * stim.wavelength_m(),
+                scale_mode: stim.scale_mode,
+                wavelength_m: stim.wavelength_m(),
+                atten_d0_m: stim.decay_d0.current,
+                atten_exponent: stim.decay_exponent.current,
+                source_pos: stim.source_pos,
+                requested_pos: stim.source_pos,
                 amplitude: stim.amplitude * stim.env_level * stim.mpe.value.pressure,
             };
             count += 1;
@@ -971,6 +1057,47 @@ impl MpeInterp {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct ScalarRamp {
+    current: f32,
+    from: f32,
+    target: f32,
+    ramp_pos: f32,
+    ramp_len: f32,
+    since_update: f32,
+}
+
+impl ScalarRamp {
+    fn jump(&mut self, value: f32) {
+        self.current = value;
+        self.from = value;
+        self.target = value;
+        self.ramp_pos = 1.0;
+        self.ramp_len = 1.0;
+        self.since_update = 0.0;
+    }
+
+    fn set_target(&mut self, value: f32) {
+        self.from = self.current;
+        self.target = value;
+        self.ramp_len = self.since_update.clamp(MPE_RAMP_MIN_S, MPE_RAMP_MAX_S);
+        self.ramp_pos = 0.0;
+        self.since_update = 0.0;
+    }
+
+    fn step(&mut self, dt: f32) -> f32 {
+        self.since_update += dt;
+        self.ramp_pos += dt;
+        let t = if self.ramp_len > 0.0 {
+            (self.ramp_pos / self.ramp_len).min(1.0)
+        } else {
+            1.0
+        };
+        self.current = self.from + (self.target - self.from) * t;
+        self.current
+    }
+}
+
 // Delay line for wave propagation
 /// A propagation delay line for a *moving source, fixed listener*, using
 /// **scatter writes and a sequential read** (interpolating write / fixed
@@ -1106,6 +1233,8 @@ pub struct WaveStimulus {
     /// the slot's previous voice left off).
     snap_position: bool,
     wave_speed: f32, // Individual wave speed for this stimulus
+    decay_d0: ScalarRamp,
+    decay_exponent: ScalarRamp,
 
     // Envelope
     env_state: EnvelopeState,
@@ -1131,44 +1260,90 @@ enum EnvelopeState {
     Release,
 }
 
+#[inline]
+fn step_envelope(
+    state: &mut EnvelopeState,
+    level: &mut f32,
+    time: &mut f32,
+    release_start_level: f32,
+    dt: f32,
+) {
+    match state {
+        EnvelopeState::Idle => {}
+        EnvelopeState::Attack => {
+            *time += dt;
+            *level = (*time * 10.0).min(1.0);
+            if *level >= 1.0 {
+                *state = EnvelopeState::Sustain;
+            }
+        }
+        EnvelopeState::Sustain => *level = 1.0,
+        EnvelopeState::Release => {
+            *time += dt;
+            *level = release_start_level * (1.0 - *time * 2.0).max(0.0);
+            if *level <= 0.0 {
+                *state = EnvelopeState::Idle;
+            }
+        }
+    }
+}
+
+#[inline]
+fn begin_release(
+    state: &mut EnvelopeState,
+    level: f32,
+    time: &mut f32,
+    release_start_level: &mut f32,
+) {
+    if *state != EnvelopeState::Idle {
+        *state = EnvelopeState::Release;
+        *time = 0.0;
+        *release_start_level = level;
+    }
+}
+
+#[inline]
+fn mpe_source_position(mpe: MpeData, table_m: (f32, f32)) -> (f32, f32) {
+    (
+        (0.5 + 0.5 * mpe.pitch_bend.clamp(-1.0, 1.0)) * table_m.0,
+        mpe.timbre.clamp(0.0, 1.0) * table_m.1,
+    )
+}
+
+#[inline]
+fn advance_oscillator_phase(phase: &mut f32, frequency: f32, dt: f32) {
+    *phase += frequency * dt;
+    if *phase >= 1.0 {
+        *phase -= phase.floor();
+    }
+}
+
 impl Stimulus for WaveStimulus {
     fn process(&mut self, ctx: &ProcessContext<'_>) -> [f32; TRANSDUCER_COUNT] {
         let mut output = [0.0; TRANSDUCER_COUNT];
 
-        // Update envelope
-        match self.env_state {
-            EnvelopeState::Idle if self.tail_frames_remaining == 0 => return output,
-            EnvelopeState::Idle => {}
-            EnvelopeState::Attack => {
-                self.env_time += ctx.dt;
-                self.env_level = (self.env_time * 10.0).min(1.0); // 100ms attack
-                if self.env_level >= 1.0 {
-                    self.env_state = EnvelopeState::Sustain;
-                }
-            }
-            EnvelopeState::Sustain => {
-                self.env_level = 1.0;
-            }
-            EnvelopeState::Release => {
-                self.env_time += ctx.dt;
-                self.env_level = self.release_start_level * (1.0 - self.env_time * 2.0).max(0.0); // 500ms release
-                if self.env_level <= 0.0 {
-                    self.env_state = EnvelopeState::Idle;
-                }
-            }
+        if self.env_state == EnvelopeState::Idle && self.tail_frames_remaining == 0 {
+            return output;
         }
+        step_envelope(
+            &mut self.env_state,
+            &mut self.env_level,
+            &mut self.env_time,
+            self.release_start_level,
+            ctx.dt,
+        );
 
         // Ramp + smooth MPE toward the latest controller values
         let mpe = self.mpe.step(ctx.dt);
+        let decay = DistanceDecay {
+            d0_m: self.decay_d0.step(ctx.dt),
+            exponent: self.decay_exponent.step(ctx.dt),
+        };
 
         // Requested source position from MPE, spanning the whole table:
         // pitch bend -1..1 -> x across the width, timbre 0..1 -> y along
         // the length (bend 0 / timbre 0.5 is the table centre)
-        let (width, length) = ctx.table_m;
-        self.requested_pos = (
-            (0.5 + 0.5 * mpe.pitch_bend.clamp(-1.0, 1.0)) * width,
-            mpe.timbre.clamp(0.0, 1.0) * length,
-        );
+        self.requested_pos = mpe_source_position(mpe, ctx.table_m);
 
         // The effective source chases the requested position at no more than
         // SOURCE_SPEED_FRACTION of the wave speed, keeping arrival indices in
@@ -1215,7 +1390,7 @@ impl Stimulus for WaveStimulus {
             // carries its own emission-time attenuation into the delay line);
             // the sequential read is then raw. Doppler amplitude gain from
             // bunched arrivals rides on top of this geometric spreading loss.
-            let emitted = source / (1.0 + distance * 2.0);
+            let emitted = source * distance_gain(distance, decay);
             output[i] =
                 self.delay_lines[i].write_and_read(emitted, delay_samples, ctx.splat_kernel);
         }
@@ -1227,10 +1402,7 @@ impl Stimulus for WaveStimulus {
         }
 
         // Update phase
-        self.phase += self.frequency * ctx.dt;
-        if self.phase >= 1.0 {
-            self.phase -= 1.0;
-        }
+        advance_oscillator_phase(&mut self.phase, self.frequency, ctx.dt);
 
         output
     }
@@ -1254,14 +1426,17 @@ impl Stimulus for WaveStimulus {
         self.release_start_level = 0.0;
         self.tail_frames_remaining = 0;
         self.wave_speed = DEFAULT_WAVE_SPEED; // Overridden by set_wave_speed after note_on
+        self.decay_d0.jump(DEFAULT_ATTEN_D0_M);
+        self.decay_exponent.jump(DEFAULT_ATTEN_EXPONENT);
     }
 
     fn note_off(&mut self) {
-        if self.env_state != EnvelopeState::Idle {
-            self.env_state = EnvelopeState::Release;
-            self.env_time = 0.0;
-            self.release_start_level = self.env_level;
-        }
+        begin_release(
+            &mut self.env_state,
+            self.env_level,
+            &mut self.env_time,
+            &mut self.release_start_level,
+        );
     }
 
     fn mpe_update(&mut self, mpe: MpeData) {
@@ -1281,19 +1456,42 @@ impl Stimulus for WaveStimulus {
         self.release_start_level = 0.0;
         self.tail_frames_remaining = 0;
         self.wave_speed = DEFAULT_WAVE_SPEED;
+        self.decay_d0.jump(DEFAULT_ATTEN_D0_M);
+        self.decay_exponent.jump(DEFAULT_ATTEN_EXPONENT);
     }
 
     fn set_wave_speed(&mut self, wave_speed: f32) {
         self.wave_speed = wave_speed;
     }
+
+    fn set_distance_decay(&mut self, decay: DistanceDecay) {
+        self.decay_d0.set_target(decay.d0_m);
+        self.decay_exponent.set_target(decay.exponent);
+    }
 }
 
-// StandingWaveStimulus - simpler, no propagation delay
+impl WaveStimulus {
+    fn configure_distance_decay(&mut self, decay: DistanceDecay) {
+        self.decay_d0.jump(decay.d0_m);
+        self.decay_exponent.jump(decay.exponent);
+    }
+}
+
+/// Instantaneous radial travelling wave. Unlike `WaveStimulus`, this owns no
+/// delay lines: position and spatial-scale changes alter the field on the next
+/// internal render frame without propagation history, Doppler, or a tail.
 #[derive(Default)]
-pub struct StandingWaveStimulus {
+pub struct TravellingWaveStimulus {
     frequency: f32,
     phase: f32,
     amplitude: f32,
+    source_pos: (f32, f32),
+    scale_mode: SpatialScaleMode,
+    wave_speed: f32,
+    configured_wavelength_m: f32,
+    wavenumber: ScalarRamp,
+    decay_d0: ScalarRamp,
+    decay_exponent: ScalarRamp,
     env_state: EnvelopeState,
     env_level: f32,
     env_time: f32,
@@ -1301,46 +1499,85 @@ pub struct StandingWaveStimulus {
     mpe: MpeInterp,
 }
 
-impl Stimulus for StandingWaveStimulus {
+impl TravellingWaveStimulus {
+    fn target_wavenumber(&self) -> f32 {
+        let wavelength = effective_wavelength(
+            self.frequency,
+            self.wave_speed,
+            self.scale_mode,
+            self.configured_wavelength_m,
+        );
+        std::f32::consts::TAU / wavelength.max(MIN_WAVELENGTH_M)
+    }
+
+    fn configure(&mut self, config: TravellingWaveConfig, decay: DistanceDecay, immediate: bool) {
+        self.scale_mode = config.scale_mode;
+        self.wave_speed = config.wave_speed.clamp(MIN_WAVE_SPEED, MAX_WAVE_SPEED);
+        self.configured_wavelength_m = config
+            .wavelength_m
+            .clamp(MIN_WAVELENGTH_M, MAX_WAVELENGTH_M);
+        let k = self.target_wavenumber();
+        if immediate {
+            self.wavenumber.jump(k);
+            self.decay_d0.jump(decay.d0_m);
+            self.decay_exponent.jump(decay.exponent);
+        } else {
+            self.wavenumber.set_target(k);
+            self.decay_d0.set_target(decay.d0_m);
+            self.decay_exponent.set_target(decay.exponent);
+        }
+    }
+
+    fn set_scale_mode(&mut self, mode: SpatialScaleMode) {
+        self.scale_mode = mode;
+        self.wavenumber.set_target(self.target_wavenumber());
+    }
+
+    fn set_wavelength(&mut self, wavelength_m: f32) {
+        self.configured_wavelength_m = wavelength_m.clamp(MIN_WAVELENGTH_M, MAX_WAVELENGTH_M);
+        if self.scale_mode == SpatialScaleMode::Wavelength {
+            self.wavenumber.set_target(self.target_wavenumber());
+        }
+    }
+
+    fn wavelength_m(&self) -> f32 {
+        std::f32::consts::TAU / self.wavenumber.current.max(f32::MIN_POSITIVE)
+    }
+}
+
+impl Stimulus for TravellingWaveStimulus {
     fn process(&mut self, ctx: &ProcessContext<'_>) -> [f32; TRANSDUCER_COUNT] {
         let mut output = [0.0; TRANSDUCER_COUNT];
 
-        // Update envelope (same as WaveStimulus)
-        match self.env_state {
-            EnvelopeState::Idle => return output,
-            EnvelopeState::Attack => {
-                self.env_time += ctx.dt;
-                self.env_level = (self.env_time * 10.0).min(1.0);
-                if self.env_level >= 1.0 {
-                    self.env_state = EnvelopeState::Sustain;
-                }
-            }
-            EnvelopeState::Sustain => {
-                self.env_level = 1.0;
-            }
-            EnvelopeState::Release => {
-                self.env_time += ctx.dt;
-                self.env_level = self.release_start_level * (1.0 - self.env_time * 2.0).max(0.0);
-                if self.env_level <= 0.0 {
-                    self.env_state = EnvelopeState::Idle;
-                }
-            }
+        if self.env_state == EnvelopeState::Idle {
+            return output;
         }
+        step_envelope(
+            &mut self.env_state,
+            &mut self.env_level,
+            &mut self.env_time,
+            self.release_start_level,
+            ctx.dt,
+        );
 
         let mpe = self.mpe.step(ctx.dt);
+        self.source_pos = mpe_source_position(mpe, ctx.table_m);
+        let k = self.wavenumber.step(ctx.dt);
+        let decay = DistanceDecay {
+            d0_m: self.decay_d0.step(ctx.dt),
+            exponent: self.decay_exponent.step(ctx.dt),
+        };
 
-        let source = (self.phase * 2.0 * std::f32::consts::PI).sin()
-            * self.amplitude
-            * self.env_level
-            * mpe.pressure;
-
-        // Simple spatial distribution without delay
-        output.fill(source); // All transducers in phase
-
-        self.phase += self.frequency * ctx.dt;
-        if self.phase >= 1.0 {
-            self.phase -= 1.0;
+        let gain = self.amplitude * self.env_level * mpe.pressure;
+        let theta = self.phase * std::f32::consts::TAU;
+        for (sample, &pos) in output.iter_mut().zip(ctx.transducer_positions.iter()) {
+            let dx = pos.0 - self.source_pos.0;
+            let dy = pos.1 - self.source_pos.1;
+            let distance = (dx * dx + dy * dy).sqrt();
+            *sample = gain * distance_gain(distance, decay) * (theta - k * distance).sin();
         }
+
+        advance_oscillator_phase(&mut self.phase, self.frequency, ctx.dt);
 
         output
     }
@@ -1357,17 +1594,24 @@ impl Stimulus for StandingWaveStimulus {
         self.frequency = frequency;
         self.amplitude = velocity as f32 / 127.0;
         self.mpe.note_on(mpe);
+        self.wave_speed = DEFAULT_WAVE_SPEED;
+        self.configured_wavelength_m = haptic_protocol::DEFAULT_WAVELENGTH_M;
+        self.scale_mode = SpatialScaleMode::Speed;
+        self.wavenumber.jump(self.target_wavenumber());
+        self.decay_d0.jump(DEFAULT_ATTEN_D0_M);
+        self.decay_exponent.jump(DEFAULT_ATTEN_EXPONENT);
         self.env_state = EnvelopeState::Attack;
         self.env_time = 0.0;
         self.release_start_level = 0.0;
     }
 
     fn note_off(&mut self) {
-        if self.env_state != EnvelopeState::Idle {
-            self.env_state = EnvelopeState::Release;
-            self.env_time = 0.0;
-            self.release_start_level = self.env_level;
-        }
+        begin_release(
+            &mut self.env_state,
+            self.env_level,
+            &mut self.env_time,
+            &mut self.release_start_level,
+        );
     }
 
     fn mpe_update(&mut self, mpe: MpeData) {
@@ -1381,6 +1625,25 @@ impl Stimulus for StandingWaveStimulus {
         self.env_time = 0.0;
         self.release_start_level = 0.0;
         self.mpe = MpeInterp::default();
+        self.source_pos = (0.0, 0.0);
+        self.wave_speed = DEFAULT_WAVE_SPEED;
+        self.configured_wavelength_m = haptic_protocol::DEFAULT_WAVELENGTH_M;
+        self.scale_mode = SpatialScaleMode::Speed;
+        self.wavenumber.jump(1.0);
+        self.decay_d0.jump(DEFAULT_ATTEN_D0_M);
+        self.decay_exponent.jump(DEFAULT_ATTEN_EXPONENT);
+    }
+
+    fn set_wave_speed(&mut self, wave_speed: f32) {
+        self.wave_speed = wave_speed.clamp(MIN_WAVE_SPEED, MAX_WAVE_SPEED);
+        if self.scale_mode == SpatialScaleMode::Speed {
+            self.wavenumber.set_target(self.target_wavenumber());
+        }
+    }
+
+    fn set_distance_decay(&mut self, decay: DistanceDecay) {
+        self.decay_d0.set_target(decay.d0_m);
+        self.decay_exponent.set_target(decay.exponent);
     }
 }
 
@@ -1416,6 +1679,10 @@ mod tests {
 
     fn active_wave_voices(engine: &StimulusEngine) -> usize {
         engine.wave_owners.iter().flatten().count()
+    }
+
+    fn active_travelling_wave_voices(engine: &StimulusEngine) -> usize {
+        engine.travelling_wave_owners.iter().flatten().count()
     }
 
     #[test]
@@ -1737,7 +2004,7 @@ mod tests {
             &mut producer,
             EngineCommand::SetParameter {
                 instance_id: 7,
-                parameter: Parameter::StimulusType(StimulusType::Standing),
+                parameter: Parameter::StimulusType(StimulusType::TravellingWave),
             },
         );
         send(
@@ -1759,9 +2026,9 @@ mod tests {
         );
         run_samples(&mut engine, 64);
 
-        // The instance's config drove note allocation into the standing pool.
+        // The instance's config drove note allocation into the TW pool.
         assert_eq!(active_wave_voices(&engine), 0);
-        assert_eq!(engine.standing_owners.iter().flatten().count(), 1);
+        assert_eq!(engine.travelling_wave_owners.iter().flatten().count(), 1);
         assert_eq!(engine.instance_config(7).wave_speed, 250.0);
 
         send(
@@ -1803,6 +2070,7 @@ mod tests {
                 config: InstanceConfig {
                     stimulus_type: StimulusType::Wave,
                     wave_speed: 5.0,
+                    ..InstanceConfig::default()
                 },
             },
         );
@@ -1813,6 +2081,7 @@ mod tests {
                 config: InstanceConfig {
                     stimulus_type: StimulusType::Wave,
                     wave_speed: 300.0,
+                    ..InstanceConfig::default()
                 },
             },
         );
@@ -1969,7 +2238,7 @@ mod tests {
             table_m: (1.0, 2.0),
             splat_kernel: &kernel,
         };
-        let mut stimulus = StandingWaveStimulus::default();
+        let mut stimulus = TravellingWaveStimulus::default();
         stimulus.note_on(40.0, 127, full_mpe());
         for _ in 0..50 {
             stimulus.process(&context);
@@ -1979,6 +2248,201 @@ mod tests {
         stimulus.process(&context);
         assert!(stimulus.env_level <= before);
         assert!(stimulus.env_level > before * 0.99);
+    }
+
+    #[test]
+    fn travelling_wave_matches_closed_form_radial_field() {
+        let kernel = design_splat_kernel();
+        let positions = TransducerLayout::default().positions;
+        let context = ProcessContext {
+            sample_rate: 1_500.0,
+            dt: 1.0 / 1_500.0,
+            transducer_positions: &positions,
+            table_m: (1.0, 2.0),
+            splat_kernel: &kernel,
+        };
+        let mut stimulus = TravellingWaveStimulus::default();
+        stimulus.note_on(100.0, 127, full_mpe());
+        stimulus.configure(
+            TravellingWaveConfig {
+                scale_mode: SpatialScaleMode::Wavelength,
+                wave_speed: 20.0,
+                wavelength_m: 0.5,
+            },
+            DistanceDecay::default(),
+            true,
+        );
+        stimulus.env_state = EnvelopeState::Sustain;
+        stimulus.phase = 0.25;
+        let output = stimulus.process(&context);
+        for (sample, &(x, y)) in output.iter().zip(positions.iter()) {
+            let dx = x - 0.5;
+            let dy = y - 1.0;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let expected = distance_gain(distance, DistanceDecay::default())
+                * (std::f32::consts::FRAC_PI_2 - std::f32::consts::TAU * distance / 0.5).sin();
+            assert!((sample - expected).abs() < 1e-5, "{sample} != {expected}");
+        }
+    }
+
+    #[test]
+    fn fixed_wavelength_field_is_frequency_independent_at_equal_phase() {
+        let kernel = design_splat_kernel();
+        let positions = [(0.75, 1.0); TRANSDUCER_COUNT];
+        let context = ProcessContext {
+            sample_rate: 1_500.0,
+            dt: 1.0 / 1_500.0,
+            transducer_positions: &positions,
+            table_m: (1.0, 2.0),
+            splat_kernel: &kernel,
+        };
+        let make = |frequency| {
+            let mut stimulus = TravellingWaveStimulus::default();
+            stimulus.note_on(frequency, 127, full_mpe());
+            stimulus.configure(
+                TravellingWaveConfig {
+                    scale_mode: SpatialScaleMode::Wavelength,
+                    wave_speed: 20.0,
+                    wavelength_m: 0.4,
+                },
+                DistanceDecay::default(),
+                true,
+            );
+            stimulus.env_state = EnvelopeState::Sustain;
+            stimulus.phase = 0.125;
+            stimulus
+        };
+        let mut low = make(50.0);
+        let mut high = make(150.0);
+        assert!((low.process(&context)[0] - high.process(&context)[0]).abs() < 1e-6);
+        assert!((low.frequency * low.wavelength_m() - 20.0).abs() < 1e-5);
+        assert!((high.frequency * high.wavelength_m() - 60.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn travelling_wave_scale_changes_ramp_without_retrigger_or_tail() {
+        let kernel = design_splat_kernel();
+        let positions = [(0.75, 1.0); TRANSDUCER_COUNT];
+        let context = ProcessContext {
+            sample_rate: 1_500.0,
+            dt: 1.0 / 1_500.0,
+            transducer_positions: &positions,
+            table_m: (1.0, 2.0),
+            splat_kernel: &kernel,
+        };
+        let mut stimulus = TravellingWaveStimulus::default();
+        stimulus.note_on(100.0, 127, full_mpe());
+        stimulus.configure(
+            TravellingWaveConfig::default(),
+            DistanceDecay::default(),
+            true,
+        );
+        for _ in 0..100 {
+            stimulus.process(&context);
+        }
+        let old_k = stimulus.wavenumber.current;
+        stimulus.set_wave_speed(10.0);
+        assert_eq!(stimulus.wavenumber.current, old_k);
+        for _ in 0..10 {
+            stimulus.process(&context);
+        }
+        assert!(stimulus.wavenumber.current > old_k);
+        assert!(stimulus.wavenumber.current < stimulus.wavenumber.target);
+
+        stimulus.note_off();
+        for _ in 0..800 {
+            stimulus.process(&context);
+        }
+        assert!(
+            !stimulus.is_active(),
+            "TW release must not retain a propagation tail"
+        );
+    }
+
+    #[test]
+    fn travelling_wave_source_follows_smoothed_mpe_without_velocity_chase() {
+        let kernel = design_splat_kernel();
+        let positions = [(0.0, 0.0); TRANSDUCER_COUNT];
+        let context = ProcessContext {
+            sample_rate: 1_500.0,
+            dt: 1.0 / 1_500.0,
+            transducer_positions: &positions,
+            table_m: (1.0, 2.0),
+            splat_kernel: &kernel,
+        };
+        let mut stimulus = TravellingWaveStimulus::default();
+        stimulus.note_on(100.0, 127, full_mpe());
+        stimulus.configure(
+            TravellingWaveConfig::default(),
+            DistanceDecay::default(),
+            true,
+        );
+        stimulus.process(&context);
+        stimulus.mpe_update(MpeData {
+            pressure: 1.0,
+            pitch_bend: 1.0,
+            timbre: 1.0,
+        });
+        stimulus.process(&context);
+        let smoothed = stimulus.mpe.value;
+        let expected = (0.5 + 0.5 * smoothed.pitch_bend, 2.0 * smoothed.timbre);
+        assert!((stimulus.source_pos.0 - expected.0).abs() < 1e-6);
+        assert!((stimulus.source_pos.1 - expected.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn travelling_wave_pool_is_bounded_steals_and_disconnects_cleanly() {
+        let (mut engine, mut producer, _, _) = StimulusEngine::new(TransducerLayout::default());
+        send(
+            &mut producer,
+            EngineCommand::RegisterInstance {
+                instance_id: 77,
+                config: InstanceConfig {
+                    stimulus_type: StimulusType::TravellingWave,
+                    ..InstanceConfig::default()
+                },
+            },
+        );
+        for note in 40..=48 {
+            send(
+                &mut producer,
+                EngineCommand::NoteOn {
+                    instance_id: 77,
+                    note,
+                    velocity: 100,
+                    channel: note - 40,
+                    mpe: full_mpe(),
+                },
+            );
+        }
+        let peak = run_samples(&mut engine, 512);
+        assert!(peak.is_finite() && peak <= 1.0);
+        assert_eq!(
+            active_travelling_wave_voices(&engine),
+            MAX_TRAVELLING_WAVE_STIMULI
+        );
+        let notes: Vec<u8> = engine
+            .travelling_wave_owners
+            .iter()
+            .flatten()
+            .map(|owner| owner.note)
+            .collect();
+        assert!(notes.contains(&48));
+        assert!(!notes.contains(&40), "oldest TW voice should be stolen");
+
+        send(
+            &mut producer,
+            EngineCommand::DisconnectInstance { instance_id: 77 },
+        );
+        run_samples(&mut engine, 1);
+        assert!(engine
+            .travelling_wave_pool
+            .stimuli
+            .iter()
+            .filter(|stimulus| stimulus.is_active())
+            .all(|stimulus| stimulus.is_releasing()));
+        run_samples(&mut engine, SAMPLE_RATE as usize);
+        assert_eq!(active_travelling_wave_voices(&engine), 0);
     }
 
     #[test]
@@ -2271,7 +2735,7 @@ mod tests {
     }
 
     #[test]
-    fn active_voice_snapshots_include_standing_stimuli() {
+    fn active_voice_snapshots_include_travelling_wave_stimuli() {
         let (mut engine, mut producer, _, mut snapshots) =
             StimulusEngine::new(TransducerLayout::default());
         send(
@@ -2279,8 +2743,9 @@ mod tests {
             EngineCommand::RegisterInstance {
                 instance_id: 55,
                 config: InstanceConfig {
-                    stimulus_type: StimulusType::Standing,
+                    stimulus_type: StimulusType::TravellingWave,
                     wave_speed: 20.0,
+                    ..InstanceConfig::default()
                 },
             },
         );
@@ -2301,7 +2766,7 @@ mod tests {
         let snapshot = snapshots.pop().unwrap();
         assert_eq!(snapshot.count, 1);
         assert_eq!(snapshot.voices[0].instance_id, 55);
-        assert_eq!(snapshot.voices[0].note_type, StimulusType::Standing);
+        assert_eq!(snapshot.voices[0].note_type, StimulusType::TravellingWave);
     }
 
     #[test]
@@ -2534,9 +2999,29 @@ mod tests {
             );
         }
         run_samples(&mut engine, 256);
+        send(
+            &mut producer,
+            EngineCommand::SetParameter {
+                instance_id: 0,
+                parameter: Parameter::StimulusType(StimulusType::TravellingWave),
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::NoteOn {
+                instance_id: 0,
+                note: 72,
+                velocity: 100,
+                channel: 8,
+                mpe: full_mpe(),
+            },
+        );
+        run_samples(&mut engine, 256);
+        assert_eq!(active_travelling_wave_voices(&engine), 1);
         send(&mut producer, EngineCommand::Panic);
         let peak = run_samples(&mut engine, 256);
         assert_eq!(peak, 0.0);
         assert_eq!(active_wave_voices(&engine), 0);
+        assert_eq!(active_travelling_wave_voices(&engine), 0);
     }
 }

@@ -4,6 +4,21 @@
 
 ## Status update (2026-07-20, post-implementation)
 
+- **Travelling Wave (`tw`/`TW`) implemented (2026-07-22).** Protocol v3 replaces
+  the old in-phase placeholder's enum/VST slot with `TravellingWave`; `Wave`
+  and `TravellingWave` are now the only runtime stimulus types. TW is an
+  allocation-free, eight-voice instantaneous radial phasor pool with the same
+  configurable distance decay as Wave and no delay lines, history, Doppler,
+  source-speed cap, or tail. Speed/fixed-wavelength scale, wavelength, `d0`,
+  and exponent are stable VST parameters and live-update held TW voices using
+  wavenumber/decay ramps. The plugin reconnect snapshot is sequence-checked,
+  snapshots carry effective scale/decay for up to 16 voices, and the viewer
+  and scripted client support `tw`. Closed-form 32-channel, fixed-wavelength,
+  automation, lifecycle, frame-budget, and socket tests cover the model. A
+  release headless 48 kHz/32-channel smoke test completed with p99 131 us and
+  max 253 us. See
+  [`docs/travelling-wave-implementation-plan.md`](docs/travelling-wave-implementation-plan.md).
+
 - **Pre-Phase-E hardening tranche 1 complete (2026-07-21).** Added protocol
   versioning and a mandatory one-shot `Hello`; the server rejects incompatible,
   pre-handshake, duplicate-ID, and non-finite traffic, while finite normalized
@@ -15,7 +30,7 @@
   clear), layout reload no longer deallocates on the callback, low-speed release
   tails drain, short delays retain relative phase, attack-time note-off is
   continuous, velocity is linear for non-MPE input, and device output is bounded
-  after reconstruction. Standing voices now appear in snapshots; the viewer is
+  after reconstruction. Every then-current voice appeared in snapshots; the viewer is
   explicitly labelled as a phase-aligned geometric preview. Audio selection
   still falls back to the default device but prefers 48 kHz wherever supported.
   See `docs/code-review-remediation-plan.md` for completed and remaining work.
@@ -64,13 +79,12 @@
 - **Delay line switched to scatter-write / sequential-read (2026-07-21).** The delay line was fixed-write / interpolated-read — physically the moving-*listener* model (delay evaluated at reception time), and the reason the source needed a velocity cap to stop the read tap overtaking the write head. For a moving source and fixed listener the correct arrangement is **interpolating writes, fixed reads**: each emitted sample is scattered (2-tap linear, accumulating) into its emission-time arrival slot `n + τᵢ(n)` and a sequential read pointer consumes arrivals. This removes the read-backwards failure mode outright and adds the physically correct Doppler *amplitude* gain (bunched arrivals on approach) the old single-tap read couldn't produce. `SOURCE_SPEED_FRACTION` lowered 0.8 → 0.5 so the scatter arrival index stays monotonic and gap-free (`da/dn ∈ [0.5, 1.5]`) with no special-casing. Distance attenuation moved to the write. Verified: all engine tests pass, a new `scatter_delay_line_shifts_pitch_with_source_motion` unit test pins Doppler direction + amplitude gain, and the c=1 orbit capture shows a clean ~6 s periodic pitch *and* amplitude swing (RMS ~2.4×), bounded output, zero non-finite samples. Design doc §3–§6 updated. Two-rate render, polyphase sinc, MPE smoothing, snapshots, viewer untouched.
 - **Scatter deposit made bandlimited; output headroom trimmed (2026-07-21).** Live testing of the scatter-write line at low wave speed (c=2 m/s, 4 s orbit) surfaced two artifacts, both diagnosed from `orbit_capture` samples: (1) **warble** — the 2-tap linear deposit's gain varies with the fractional arrival phase, so a sweeping delay amplitude-modulates the output into granulation spurs (~−20 dB); (2) **popping** — the (real) Doppler bunching gain stacking on the near-field `1/(1+2d)` gain railed the ±1 clamp on close passes. Fixes: the deposit is now a **windowed-sinc splat** (`SPLAT_TAPS=8`, Kaiser β=9, 128 phases, unit-sum per phase — flat in-band gain < 0.1 dB across phases), cutting granulation spurs ~20 dB in both Doppler directions (isolated A/B: spreading −20→−41 dB, bunching −35→−56 dB; stationary at the −138 dB f32 floor) while keeping the full Doppler amplitude behaviour; and the default per-transducer gain is trimmed to 0.5 (`DEFAULT_TRANSDUCER_GAIN`, −6 dB), sized for the worst-case 2× bunching of an advancing source at the 0.5·c limit. Re-capture: peak 1.03→0.61, railed samples 1586→0. New unit test `splat_kernel_has_unit_dc_and_flat_in_band_gain_across_phases`; config default-gain tests updated. Design doc §3/§6 updated.
 - **Design docs started (2026-07-20).** `docs/doppler-delay-line-design.md` documents the delay-line Doppler source (emergent-Doppler model, stability layers, two-rate architecture, failure-mode history). `docs/syllabary-protocol.md` is a **draft** of the expressive note-type protocol on top of MPE (syllable vocabulary, four-layer control model bounded by Push 3 / Live 12 MPE, per-instance syllable selection, handshake + namespaced-parameter migration plan, configurable attenuation `d0`/`p` as the first namespaced params). Nothing from the draft is implemented; its migration step 1 (handshake + `instance_id`) also fixes a real latent bug — voice identity `(channel, note)` collides across concurrent plugin instances.
-- **Next:** execute the pre-Phase-E hardening work in
-  [`docs/code-review-remediation-plan.md`](docs/code-review-remediation-plan.md), starting
-  with versioned handshakes, connection-owned voice cleanup, numeric validation,
-  and 48 kHz-preferred device configuration. The client/server ownership rework
-  below is complete, but its lifecycle and protocol-hardening follow-ups must land
-  before Phase E (real standing-wave spatial structure, SpatialSweep, phasor-model
-  experiment offline first).
+- **Next:** finish the remaining structural hardening in
+  [`docs/code-review-remediation-plan.md`](docs/code-review-remediation-plan.md),
+  especially splitting the server monolith, formal callback allocation
+  instrumentation, bounded per-client decode work, and stable protocol
+  discriminants/capability negotiation. Physical boundary modes and reflected
+  propagation remain outside the Travelling Wave stimulus.
 
 ## Architecture direction: multi-instance controllers, per-instance note-type config, observer viewer (design intent, 2026-07-21)
 

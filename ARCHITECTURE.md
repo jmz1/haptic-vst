@@ -77,16 +77,21 @@ The system converts MIDI notes into spatial haptic stimuli with wave propagation
   partial writes resume at the saved cursor; temporary backpressure is not a disconnect.
   Terminal failure or sustained backlog enters the same retried per-instance cleanup path as
   a read-side closure, preventing observer-owned test notes from sticking.
-- **Parameters**: Stimulus type (wave/standing) and wave speed are DAW-automatable plugin
-  parameters, pushed to the server as `SetParameter` commands on change. Velocity maps to
-  amplitude only.
+- **Parameters**: stimulus type (`Wave`/`TravellingWave`), wave speed, TW
+  scale mode/wavelength, and shared distance-decay knee/exponent are stable
+  DAW-automatable parameters pushed as `SetParameter` commands. Wave speed is
+  latched for delay-line Wave voices but live/ramped for TW; decay is live for
+  new Wave emissions and direct TW output. Velocity maps to amplitude only.
 - **Server engine**: The IPC thread pushes `EngineCommand`s into an `rtrb` SPSC ring
   buffer. The `StimulusEngine` is owned by the cpal audio callback (no locks on the audio
   path) and drains the queue once per callback. A `(channel, note) → pool slot` ownership
   map keyed by `(instance_id, channel, note)` routes note-off and MPE updates to the owning stimulus and implements voice stealing
   (oldest-in-release first, else oldest). MIDI notes map to the 20–200 Hz haptic band
   (equal temperament transposed so middle C ≈ 65 Hz); MPE values are one-pole smoothed
-  inside each stimulus (~15 ms).
+  inside each stimulus (~15 ms). The engine has two fixed eight-voice pools:
+  `WaveStimulus` uses scatter-write delay lines and `TravellingWaveStimulus`
+  evaluates an instantaneous radial phasor without propagation history,
+  Doppler, source-speed limiting, or a delay tail.
 - **Health**: the audio callback records timing into lock-free histogram stats, reported
   every 5 s by a monitor thread; `--test-tone` plays a channel-cycling burst pattern for
   interface bring-up.
@@ -294,6 +299,7 @@ pub struct HapticPlugin {
     mpe_state: [MpeData; 16],                 // per-channel MPE merge cache
     last_sent_wave_speed: Option<f32>,        // parameter push tracking
     last_sent_stimulus_type: Option<StimulusTypeParam>,
+    // TW scale/wavelength and shared decay have equivalent tracking fields
 }
 
 impl Plugin for HapticPlugin {
@@ -500,7 +506,7 @@ FloatParam::new("Wave Speed", 100.0, range)
 pub struct StimulusEngine {
     // State transitions controlled by types
     wave_pool: StimulusPool<WaveStimulus, MAX_WAVE_STIMULI>,
-    standing_pool: StimulusPool<StandingWaveStimulus, MAX_STANDING_STIMULI>,
+    travelling_wave_pool: StimulusPool<TravellingWaveStimulus, 8>,
 }
 ```
 

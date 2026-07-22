@@ -50,7 +50,7 @@ Expression is the scarce resource: **three continuous per-note dimensions, total
 flowchart LR
     subgraph live["Ableton Live 12"]
         CLIP1["MIDI clip<br/>notes + expression lanes"] --> INST1["plugin instance<br/>track A · syllable: doppler-source<br/>patch params automated"]
-        CLIP2["MIDI clip"] --> INST2["plugin instance<br/>track B · syllable: standing-wave"]
+        CLIP2["MIDI clip"] --> INST2["plugin instance<br/>track B · syllable: travelling-wave"]
         AUDIO["audio track"] --> EF["envelope follower (M4L)"] -->|"param modulation"| INST1
     end
     INST1 -->|"socket · instance_id 1"| SRV["haptic-server<br/>syllabary dispatch"]
@@ -60,12 +60,16 @@ flowchart LR
 
 ## 4. The syllabary (stub)
 
-Planned initial vocabulary. Only `doppler-source` exists today (as `WaveStimulus`); `standing-wave` exists as a non-spatial placeholder. The rest are reserved names from the Static Allocation design and the research track.
+Initial vocabulary. `doppler-source` exists as `WaveStimulus`, and
+`travelling-wave` now occupies the former second stimulus-type slot. The
+runtime vocabulary contains only `doppler-source` (`Wave`) and
+`travelling-wave` (`TravellingWave`). The remaining rows are longer-term
+research names, not runtime stimulus types.
 
 | SyllableId | Model | State | One-line character |
 |---|---|---|---|
 | `doppler-source` | moving point source through per-transducer delay lines | **implemented** | a thing moving on the table |
-| `standing-wave` | modal spatial pattern, node/antinode structure | placeholder | the whole table ringing in a shape |
+| `travelling-wave` | instantaneous radial phasor around a movable source | **implemented** ([implementation record](travelling-wave-implementation-plan.md)) | wave-like spatial phase with no propagation history |
 | `spatial-sweep` | source translating along an authored path | planned | a gesture crossing the body |
 | `chaotic-network` | coupled-oscillator network excited by input energy | planned | textural, self-organising activity |
 | `impact` | one-shot transient with spatial origin | tentative | a discrete touch/tap event |
@@ -89,11 +93,14 @@ The motivating case, including the two attenuation parameters from the delay-lin
 Two tentative judgements worth recording:
 
 - **d₀ and p are patch-layer, not expression-layer — by scarcity, not by nature.** With only three continuous dimensions and position rightly claiming two of them, attenuation shape can't have a per-note stream in the default binding. But the *binding* abstraction keeps the door open: an alternative binding (say, `radiance`) could map pressure → d₀ — pressing harder spreads the energy footprint wider instead of louder — trading intensity control away. This is exactly why bindings are per-syllable data rather than hardcoded: the protocol shouldn't have an opinion about which three parameters deserve fingers.
-- **Latch vs. live is a per-parameter physical question, not a policy.** `wave_speed` must latch at note-on: the delay lines' entire read geometry is scaled by c, and changing it under a sounding voice re-pitches every tap discontinuously (and the source-speed limit 0.8·c changes meaning mid-flight). `atten_d0`/`atten_p` only shape per-transducer gain — safe to vary live under a sounding note, and much more useful that way (automatable swells of spatial focus). Each schema entry therefore carries its apply semantics explicitly.
+- **Latch vs. live is a per-parameter physical question, not a policy.** `wave_speed` must latch at note-on for `Wave`: its delay geometry and 0.5·c source-speed limit are emission-history state. The same parameter is live for `TravellingWave` because its wavenumber is instantaneous and ramped. `atten_d0`/`atten_p` are live for both, although already-scheduled Wave energy retains its emission-time gain. Each schema entry therefore carries its apply semantics explicitly.
 
 ### 4.2 Binding sketches for later syllables (tentative, to be revised when each is designed)
 
-- `standing-wave`: note → mode selection (which spatial mode of the table); pressure → excitation level; bend → node-line translation; timbre → mode morphing/mix. Patch: damping, mode table.
+- `travelling-wave`: note → oscillator frequency; pressure → intensity; bend/timbre →
+  source position, matching `doppler-source`. Patch: speed/fixed-wavelength
+  mode, wave speed, wavelength, `atten_d0`, and `atten_p`. Spatial-scale and
+  attenuation parameters apply live; there is no delay-line history or Doppler.
 - `spatial-sweep`: note → path selection from a patch-defined path bank; velocity → traversal rate; pressure → intensity; bend → path offset/scrub; timbre → path width. Patch: path definitions (config, not wire), rate scaling.
 - `chaotic-network`: pressure → injected energy; bend/timbre → coupling-space coordinates. Patch: topology, damping, chaos parameter.
 - `impact`: everything articulation + identity (velocity → force, note → nominal position cell); expression streams largely unused — honest one-shots.
@@ -133,13 +140,13 @@ sequenceDiagram
 
 Message-level changes, in intended migration order:
 
-1. **Handshake + versioning** (`ClientHello`/`ServerHello`). Assigns `instance_id`; keys voices by `(instance, channel, note)`. The `SyllableDescriptor` list makes the server the source of truth for the syllabary — parameter ids, ranges, layer assignments, apply semantics, default bindings — so plugin and viewer UIs enumerate capabilities instead of hardcoding them. Fixes the multi-instance collision on its own merits.
-2. **`syllable` field on `NoteOn`**, replacing the global `Parameter::StimulusType` mode switch (which is instance state in the wrong place — it currently affects *other clients'* notes). `StimulusType` maps onto the first two `SyllableId`s during migration.
-3. **Namespaced parameters**: `SetParam { syllable: SyllableId, param: ParamId, value: f32 }` alongside (then replacing) the flat `Parameter` enum, scoped per instance. First real cargo: `atten_d0`, `atten_p` for `doppler-source`, plumbed to the engine's attenuation. `WaveSpeed` migrates in with latch-at-note-on semantics; `MonitorRoute` stays a global, non-syllabic message.
+1. **Handshake + versioning** is partly implemented: protocol v3 has exact-version `Hello`/`HelloAccepted`, client-issued `instance_id`, and voices keyed by `(instance, channel, note)`. Server-issued identity, capability negotiation, and the `SyllableDescriptor` list remain future work.
+2. **`syllable` field on `NoteOn`**, replacing today's per-instance `Parameter::StimulusType` selection when per-note syllables are needed. `StimulusType` currently maps the two implemented models onto the initial `SyllableId`s.
+3. **Namespaced parameters**: `SetParam { syllable: SyllableId, param: ParamId, value: f32 }` alongside (then replacing) the flat, per-instance `Parameter` enum. The first cargo (`atten_d0`, `atten_p`, TW scale/wavelength) is implemented in that flat enum; stable numeric IDs/namespacing remain before third-party extension. `MonitorRoute` stays a global, non-syllabic message.
 4. **Bindings on the wire**: `SetBinding { syllable, dimension, param }` for reassigning expression dimensions per syllable (config-file selectable first; wire message when a UI wants it).
 5. **Reactive modulation sources**: `ModValue { source_id, value }` — a low-rate (~100 Hz, MPE-update-like) stream published by a client doing audio analysis, with server-side routes `ModRoute { source_id, syllable, param, depth }`. Deliberately deferred: layer-4 (patch automation via M4L envelope follower → VST3 param → `SetParam`) already delivers hybrid reactive behaviour with zero protocol work, and should be the first experiment. `ModValue` earns its place only if per-utterance reactive depth or sub-automation latency proves necessary.
 
-Everything continuous that arrives via `SetParam` or `ModValue` passes through the same smoothing discipline the MPE path already earned (`MpeInterp`: measured-spacing ramp + one-pole cascade) — stepped patch automation would otherwise reintroduce exactly the sideband-comb artefact documented in the delay-line doc.
+Continuous patch values use measured-spacing scalar ramps; MPE additionally uses its two-pole controller smoother. Future `SetParam`/`ModValue` routes must retain that discipline — stepped automation would otherwise reintroduce the sideband-comb artefact documented in the delay-line doc.
 
 ## 7. Composing workflow this enables (the point of all of it)
 

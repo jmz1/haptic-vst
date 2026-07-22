@@ -32,9 +32,11 @@ The 32-channel-device search and default-device fallback remain intentional. Aud
   source envelope ends, scatter lookahead preserves relative short delays,
   release begins at the current envelope level, non-MPE velocity is linear,
   and final device-rate samples are hard-clamped after reconstruction.
-- Milestone 4 partially implemented: standing voices are included in snapshots,
-  an explicit empty snapshot clears observers, and the viewer labels its field
-  as a phase-aligned geometric preview rather than exact interference.
+- Milestone 4 partially implemented: Wave and Travelling Wave voices are
+  included in snapshots, an explicit empty snapshot clears observers, and the
+  viewer labels its field as a phase-aligned geometric preview rather than
+  exact interference. Protocol v3 carries each voice's effective wavelength
+  and decay so the TW relative field matches the engine model.
 - Milestone 5 partially implemented: a second live server is refused, stale
   sockets are removed selectively, idle controllers detect a stopped server,
   failed viewer handshakes retry, observer status writes are bounded and
@@ -115,8 +117,13 @@ Exit criterion: transport work is bounded per client, partial I/O is correct, an
 3. Move shared numeric limits/schema metadata into the protocol or a dedicated shared model crate so plugin, viewer, and server cannot drift.
 4. Define stable protocol discriminants and negotiated capabilities before adding syllable descriptors. Raise or redesign the 4 KiB frame budget if descriptors require it.
 5. Reconcile dynamic server descriptors with VST3's stable host-parameter IDs. Choose a stable parameter superset, fixed generic slots, or separate plugin classes rather than attempting to add host parameters after connection.
-6. Define unified voice/status capacity across wave, standing-wave, sweep, and future stimulus types.
-7. Prototype standing-wave/phasor models offline before admitting them to the real-time engine.
+6. Define unified voice/status capacity across `Wave`, `TravellingWave`, and
+   any later stimulus types. ✅ *(16 slots with a compile-time pool-capacity
+   assertion and serialized frame-budget test)*
+7. Remove the old in-phase placeholder while adding `TravellingWave`; pin its
+   instantaneous radial phasor model with closed-form offline tests before
+   admitting it to the real-time engine. ✅ See
+   `docs/travelling-wave-implementation-plan.md`.
 
 Exit criterion: adding a stimulus does not require extending one monolithic file, changing unstable wire enum ordering, or inventing new lifecycle semantics.
 
