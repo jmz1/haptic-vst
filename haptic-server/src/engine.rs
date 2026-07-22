@@ -57,7 +57,8 @@ const SPLAT_LEN: usize = SPLAT_TAPS * SPLAT_PHASES;
 const MIN_HAPTIC_FREQ: f32 = 20.0;
 const MAX_HAPTIC_FREQ: f32 = 200.0;
 
-// One-pole smoothing time constant for incoming MPE dimensions
+// One-pole smoothing time constant for pressure and TW MPE dimensions. Wave XY
+// motion uses MotionController2d instead of this callback-spacing ramp.
 const MPE_SMOOTHING_TAU: f32 = 0.015; // 15 ms
 
 /// Incoming MPE updates arrive as discrete steps (a controller's send rate,
@@ -65,9 +66,28 @@ const MPE_SMOOTHING_TAU: f32 = 0.015; // 15 ms
 /// new target is linearly ramped over roughly the measured update spacing,
 /// clamped to this range (seconds), before the one-pole above — otherwise
 /// the block-rate staircase frequency-modulates the delay lines into an
-/// audible sideband comb around the carrier.
+/// audible sideband comb around the carrier. Wave pressure and TW retain this
+/// general interpolation; Wave XY targets use the stateful controller below.
 const MPE_RAMP_MIN_S: f32 = 0.005;
 const MPE_RAMP_MAX_S: f32 = 0.05;
+
+/// Wave source motion is a critically damped third-order system in the XY
+/// plane. Controller targets may arrive only at audio callback boundaries,
+/// but persistent position/velocity/acceleration state advances at the internal
+/// render rate, so callback batching changes only the latest destination rather
+/// than resetting a positional ramp. The 1.5 Hz bandwidth is nine times the
+/// default orbit rate while the three-pole response strongly rejects 60-120 Hz
+/// delivery jitter.
+const MOTION_NATURAL_FREQUENCY_HZ: f32 = 1.5;
+
+/// Time in which the acceleration limit could take a stationary source to the
+/// causal speed ceiling. Expressing the limit relative to wave speed preserves
+/// comparable motion semantics across Wave configurations.
+const MOTION_SPEED_RISE_TIME_S: f32 = 0.5;
+
+/// Time in which bounded jerk may move acceleration from zero to its limit.
+/// This keeps acceleration continuous when a callback replaces the XY target.
+const MOTION_ACCELERATION_RISE_TIME_S: f32 = 0.05;
 
 /// Maximum speed of the effective source position, as a fixed fraction of
 /// the stimulus's wave speed. Keeps the source comfortably subsonic relative
@@ -993,6 +1013,74 @@ fn lerp_mpe(a: &MpeData, b: &MpeData, t: f32) -> MpeData {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct MotionController2d {
+    position: (f32, f32),
+    velocity: (f32, f32),
+    acceleration: (f32, f32),
+    jerk: (f32, f32),
+    target: (f32, f32),
+}
+
+#[inline]
+fn limit_vector(vector: (f32, f32), max_length: f32) -> (f32, f32) {
+    let length_sq = vector.0 * vector.0 + vector.1 * vector.1;
+    let max_length = max_length.max(0.0);
+    if length_sq > max_length * max_length && length_sq > 0.0 {
+        let scale = max_length / length_sq.sqrt();
+        (vector.0 * scale, vector.1 * scale)
+    } else {
+        vector
+    }
+}
+
+impl MotionController2d {
+    fn jump(&mut self, position: (f32, f32)) {
+        self.position = position;
+        self.velocity = (0.0, 0.0);
+        self.acceleration = (0.0, 0.0);
+        self.jerk = (0.0, 0.0);
+        self.target = position;
+    }
+
+    fn set_target(&mut self, target: (f32, f32)) {
+        self.target = target;
+    }
+
+    fn step(&mut self, dt: f32, max_speed: f32) -> (f32, f32) {
+        let omega = std::f32::consts::TAU * MOTION_NATURAL_FREQUENCY_HZ;
+        let omega_sq = omega * omega;
+        let error = (
+            self.target.0 - self.position.0,
+            self.target.1 - self.position.1,
+        );
+        // x''' + 3ωx'' + 3ω²x' + ω³x = ω³target has three coincident
+        // real poles at -ω: no overshoot in the linear regime and another
+        // 20 dB/decade of callback-jitter rejection over a second-order path.
+        let commanded_jerk = (
+            omega * omega_sq * error.0
+                - 3.0 * omega_sq * self.velocity.0
+                - 3.0 * omega * self.acceleration.0,
+            omega * omega_sq * error.1
+                - 3.0 * omega_sq * self.velocity.1
+                - 3.0 * omega * self.acceleration.1,
+        );
+        let max_acceleration = max_speed / MOTION_SPEED_RISE_TIME_S;
+        let max_jerk = max_acceleration / MOTION_ACCELERATION_RISE_TIME_S;
+        self.jerk = limit_vector(commanded_jerk, max_jerk);
+
+        self.acceleration.0 += self.jerk.0 * dt;
+        self.acceleration.1 += self.jerk.1 * dt;
+        self.acceleration = limit_vector(self.acceleration, max_acceleration);
+        self.velocity.0 += self.acceleration.0 * dt;
+        self.velocity.1 += self.acceleration.1 * dt;
+        self.velocity = limit_vector(self.velocity, max_speed);
+        self.position.0 += self.velocity.0 * dt;
+        self.position.1 += self.velocity.1 * dt;
+        self.position
+    }
+}
+
 /// Turns discrete MPE updates into a smooth per-sample trajectory: each new
 /// target is reached by a linear ramp over roughly the update spacing
 /// (MPE_RAMP_MIN_S..MPE_RAMP_MAX_S), and the ramp output is one-pole
@@ -1224,15 +1312,17 @@ pub struct WaveStimulus {
     frequency: f32,
     phase: f32,
     amplitude: f32,
-    /// Effective source position: chases `requested_pos` at no more than
-    /// SOURCE_SPEED_FRACTION of the wave speed.
+    /// Effective source position produced by the persistent XY motion
+    /// controller. Kept as an explicit field for snapshots and hot-path reads.
     source_pos: (f32, f32),
-    /// Position requested by (smoothed) MPE.
+    /// Latest raw position requested by MPE.
     requested_pos: (f32, f32),
-    /// Snap `source_pos` to the requested position on the next process
-    /// call (set at note-on so a new note doesn't sweep in from wherever
-    /// the slot's previous voice left off).
-    snap_position: bool,
+    /// Latest complete controller sample. Repeated callback-boundary updates
+    /// intentionally overwrite this target without mutating motion state.
+    spatial_mpe_target: MpeData,
+    motion: MotionController2d,
+    /// Note-on initializes the controller when table dimensions are available.
+    motion_needs_jump: bool,
     wave_speed: f32, // Individual wave speed for this stimulus
     decay_d0: ScalarRamp,
     decay_exponent: ScalarRamp,
@@ -1248,7 +1338,7 @@ pub struct WaveStimulus {
     /// in flight in the per-transducer delay lines.
     tail_frames_remaining: usize,
 
-    // Discrete controller updates -> smooth per-sample MPE trajectory
+    // Pressure smoothing; spatial MPE bypasses this state for Wave.
     mpe: MpeInterp,
 }
 
@@ -1334,36 +1424,33 @@ impl Stimulus for WaveStimulus {
             ctx.dt,
         );
 
-        // Ramp + smooth MPE toward the latest controller values
+        // Pressure retains the general MPE ramp/smoother. Wave position uses
+        // the persistent XY motion controller below instead of these smoothed
+        // pitch/timbre dimensions.
         let mpe = self.mpe.step(ctx.dt);
         let decay = DistanceDecay {
             d0_m: self.decay_d0.step(ctx.dt),
             exponent: self.decay_exponent.step(ctx.dt),
         };
 
-        // Requested source position from MPE, spanning the whole table:
+        // Latest requested source position from MPE, spanning the whole table:
         // pitch bend -1..1 -> x across the width, timbre 0..1 -> y along
         // the length (bend 0 / timbre 0.5 is the table centre)
-        self.requested_pos = mpe_source_position(mpe, ctx.table_m);
+        self.requested_pos = mpe_source_position(self.spatial_mpe_target, ctx.table_m);
 
-        // The effective source chases the requested position at no more than
-        // SOURCE_SPEED_FRACTION of the wave speed, keeping arrival indices in
-        // the scatter-write delay lines monotonic and gap-free (see DelayLine)
-        if self.snap_position {
-            self.snap_position = false;
+        // Advance one coherent source in the XY plane. Vector velocity is
+        // bounded to SOURCE_SPEED_FRACTION*c, which automatically bounds every
+        // transducer's radial velocity and keeps scatter arrivals monotonic.
+        if self.motion_needs_jump {
+            self.motion_needs_jump = false;
+            self.motion.jump(self.requested_pos);
             self.source_pos = self.requested_pos;
         } else {
-            let dx = self.requested_pos.0 - self.source_pos.0;
-            let dy = self.requested_pos.1 - self.source_pos.1;
-            let dist = (dx * dx + dy * dy).sqrt();
-            let max_step = SOURCE_SPEED_FRACTION * self.wave_speed * ctx.dt;
-            if dist <= max_step {
-                self.source_pos = self.requested_pos;
-            } else {
-                let scale = max_step / dist;
-                self.source_pos.0 += dx * scale;
-                self.source_pos.1 += dy * scale;
-            }
+            self.motion.set_target(self.requested_pos);
+            self.source_pos = self.motion.step(
+                ctx.dt,
+                SOURCE_SPEED_FRACTION * self.wave_speed.max(MIN_WAVE_SPEED),
+            );
         }
 
         // Generate source signal
@@ -1421,7 +1508,8 @@ impl Stimulus for WaveStimulus {
         self.frequency = frequency;
         self.amplitude = velocity as f32 / 127.0;
         self.mpe.note_on(mpe);
-        self.snap_position = true;
+        self.spatial_mpe_target = mpe;
+        self.motion_needs_jump = true;
         self.env_state = EnvelopeState::Attack;
         self.env_time = 0.0;
         self.release_start_level = 0.0;
@@ -1441,6 +1529,7 @@ impl Stimulus for WaveStimulus {
     }
 
     fn mpe_update(&mut self, mpe: MpeData) {
+        self.spatial_mpe_target = mpe;
         self.mpe.update(mpe);
     }
 
@@ -1449,7 +1538,11 @@ impl Stimulus for WaveStimulus {
             line.reset();
         }
         self.phase = 0.0;
-        self.snap_position = true;
+        self.source_pos = (0.0, 0.0);
+        self.requested_pos = (0.0, 0.0);
+        self.spatial_mpe_target = MpeData::default();
+        self.motion = MotionController2d::default();
+        self.motion_needs_jump = true;
         self.mpe = MpeInterp::default();
         self.env_state = EnvelopeState::Idle;
         self.env_level = 0.0;
@@ -1925,11 +2018,10 @@ mod tests {
     }
 
     #[test]
-    fn source_position_is_velocity_limited() {
+    fn source_motion_is_vector_acceleration_and_velocity_limited() {
         // Note-on at the table origin, then request a jump to the far
-        // corner: the effective source must snap at note-on, then travel
-        // at no more than SOURCE_SPEED_FRACTION x wave speed, eventually
-        // converging on the requested position.
+        // corner: the effective source must snap at note-on, then accelerate
+        // in the XY plane within both vector bounds before converging.
         let origin = MpeData {
             pressure: 1.0,
             pitch_bend: -1.0,
@@ -1971,32 +2063,129 @@ mod tests {
         run_samples(&mut engine, (window_s * SAMPLE_RATE) as usize);
         let pos = engine.wave_pool.stimuli[0].source_pos;
         let travelled = (pos.0 * pos.0 + pos.1 * pos.1).sqrt();
-        let limit = SOURCE_SPEED_FRACTION * DEFAULT_WAVE_SPEED * window_s;
+        let max_speed = SOURCE_SPEED_FRACTION * DEFAULT_WAVE_SPEED;
+        let max_acceleration = max_speed / MOTION_SPEED_RISE_TIME_S;
+        let max_jerk = max_acceleration / MOTION_ACCELERATION_RISE_TIME_S;
+        let jerk_limited_distance = max_jerk * window_s * window_s * window_s / 6.0;
         assert!(
-            travelled <= limit * 1.01,
-            "moved {travelled} m, limit {limit} m"
+            travelled <= jerk_limited_distance * 1.02,
+            "moved {travelled} m, jerk limit {jerk_limited_distance} m"
         );
-        // The requested position is ~2.24 m away, well beyond the limit, so
-        // a limited source should be pinned at (close to) full speed
         assert!(
-            travelled >= limit * 0.9,
-            "moved only {travelled} m of the allowed {limit} m"
+            travelled >= jerk_limited_distance * 0.9,
+            "jerk-limited source moved only {travelled} m"
         );
-        // The requested target is most of the way to the far corner (the
-        // ramp + two-pole MPE smoothing takes ~100 ms to fully converge)
+        let motion = engine.wave_pool.stimuli[0].motion;
+        let speed =
+            (motion.velocity.0 * motion.velocity.0 + motion.velocity.1 * motion.velocity.1).sqrt();
+        let acceleration = (motion.acceleration.0 * motion.acceleration.0
+            + motion.acceleration.1 * motion.acceleration.1)
+            .sqrt();
+        let jerk = (motion.jerk.0 * motion.jerk.0 + motion.jerk.1 * motion.jerk.1).sqrt();
+        assert!(speed <= max_speed * 1.001, "speed {speed} > {max_speed}");
+        assert!(
+            acceleration <= max_acceleration * 1.001,
+            "acceleration {acceleration} > {max_acceleration}"
+        );
+        assert!(jerk <= max_jerk * 1.001, "jerk {jerk} > {max_jerk}");
+
+        // Requested position is the latest complete controller target, not a
+        // callback-spacing-dependent ramp state.
         let req = engine.wave_pool.stimuli[0].requested_pos;
         assert!(
-            req.0 > 0.75 && req.1 > 1.5,
-            "requested position should be well on its way, at {req:?}"
+            (req.0 - 1.0).abs() < 1e-6 && (req.1 - 2.0).abs() < 1e-6,
+            "requested position should be the latest target, at {req:?}"
         );
 
         // Given enough time, the effective source converges on the target
-        run_samples(&mut engine, (0.3 * SAMPLE_RATE) as usize);
+        run_samples(&mut engine, (1.2 * SAMPLE_RATE) as usize);
         let pos = engine.wave_pool.stimuli[0].source_pos;
         assert!(
             (pos.0 - 1.0).abs() < 1e-2 && (pos.1 - 2.0).abs() < 1e-2,
             "source should converge, at {pos:?}"
         );
+    }
+
+    #[test]
+    fn xy_motion_target_updates_do_not_reset_controller_state() {
+        let mut motion = MotionController2d::default();
+        motion.jump((0.0, 0.0));
+        motion.set_target((1.0, 0.0));
+        for _ in 0..30 {
+            motion.step(1.0 / 1_500.0, 0.5);
+        }
+        let position = motion.position;
+        let velocity = motion.velocity;
+
+        // These model multiple MPE commands drained at one callback boundary:
+        // only the destination changes; no ramp or motion state is reset.
+        motion.set_target((0.0, 1.0));
+        motion.set_target((1.0, 1.0));
+        assert_eq!(motion.position, position);
+        assert_eq!(motion.velocity, velocity);
+        assert_eq!(motion.target, (1.0, 1.0));
+
+        let before_velocity = motion.velocity;
+        motion.step(1.0 / 1_500.0, 0.5);
+        let delta_v = (
+            motion.velocity.0 - before_velocity.0,
+            motion.velocity.1 - before_velocity.1,
+        );
+        let applied_acceleration = (delta_v.0 * delta_v.0 + delta_v.1 * delta_v.1).sqrt() * 1_500.0;
+        let max_acceleration = 0.5 / MOTION_SPEED_RISE_TIME_S;
+        assert!(
+            applied_acceleration <= max_acceleration * 1.001,
+            "vector acceleration {applied_acceleration} exceeds limit"
+        );
+        let speed =
+            (motion.velocity.0 * motion.velocity.0 + motion.velocity.1 * motion.velocity.1).sqrt();
+        assert!(speed <= 0.5 * 1.001, "vector speed {speed} exceeds limit");
+        let jerk = (motion.jerk.0 * motion.jerk.0 + motion.jerk.1 * motion.jerk.1).sqrt();
+        let max_jerk = max_acceleration / MOTION_ACCELERATION_RISE_TIME_S;
+        assert!(jerk <= max_jerk * 1.001, "vector jerk {jerk} exceeds limit");
+    }
+
+    #[test]
+    fn callback_partition_does_not_materially_change_xy_motion() {
+        fn orbit_trace(callback_internal_frames: usize) -> Vec<(f32, f32)> {
+            let sample_rate = 1_500.0f32;
+            let dt = 1.0 / sample_rate;
+            let total_frames = 8 * sample_rate as usize;
+            let update_frames = (0.008 * sample_rate) as usize; // 12 internal frames
+            let mut next_update = 0usize;
+            let mut phase = 0.0f32;
+            let mut motion = MotionController2d::default();
+            motion.jump((0.5, 1.0));
+            let mut trace = Vec::with_capacity(total_frames);
+
+            for block_start in (0..total_frames).step_by(callback_internal_frames) {
+                while block_start >= next_update {
+                    phase += std::f32::consts::TAU * update_frames as f32 / sample_rate / 6.0;
+                    motion.set_target((0.5 + 0.35 * phase.cos(), 1.0 + 0.35 * phase.sin()));
+                    next_update += update_frames;
+                }
+                for _ in 0..callback_internal_frames.min(total_frames - block_start) {
+                    trace.push(motion.step(dt, 0.5));
+                }
+            }
+            trace
+        }
+
+        let small = orbit_trace(2); // 64 device frames at 48 kHz
+        let large = orbit_trace(16); // 512 device frames at 48 kHz
+        let settle = 2 * 1_500;
+        let mut sum_sq = 0.0f32;
+        let mut peak = 0.0f32;
+        for (a, b) in small[settle..].iter().zip(&large[settle..]) {
+            let dx = a.0 - b.0;
+            let dy = a.1 - b.1;
+            let distance = (dx * dx + dy * dy).sqrt();
+            sum_sq += distance * distance;
+            peak = peak.max(distance);
+        }
+        let rms = (sum_sq / (small.len() - settle) as f32).sqrt();
+        assert!(rms < 0.002, "partition-dependent position RMS {rms} m");
+        assert!(peak < 0.004, "partition-dependent position peak {peak} m");
     }
 
     #[test]
@@ -2892,7 +3081,9 @@ mod tests {
     /// Optional env: HAPTIC_CAPTURE_WAVE_SPEED (1.0), HAPTIC_CAPTURE_SECS
     /// (13), HAPTIC_CAPTURE_SR (48000), HAPTIC_CAPTURE_BLOCK (512),
     /// HAPTIC_CAPTURE_ORBIT_PERIOD (6), HAPTIC_CAPTURE_NOTE (36 / Ableton C1),
-    /// HAPTIC_CAPTURE_MPE_MS (8).
+    /// HAPTIC_CAPTURE_MPE_MS (8), HAPTIC_CAPTURE_RADIUS_M (35% of the shorter
+    /// table side), HAPTIC_CAPTURE_VELOCITY (100), HAPTIC_CAPTURE_PRESSURE
+    /// (1), HAPTIC_CAPTURE_ATTEN_D0 (0.5), HAPTIC_CAPTURE_ATTEN_EXPONENT (1).
     #[test]
     #[ignore]
     fn orbit_capture_writes_debug_buffers() {
@@ -2904,8 +3095,8 @@ mod tests {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(default)
         };
-        let out_dir =
-            std::env::var("HAPTIC_CAPTURE_OUT").unwrap_or_else(|_| "target/orbit-capture".into());
+        let out_dir = std::env::var("HAPTIC_CAPTURE_OUT")
+            .unwrap_or_else(|_| format!("{}/../target/orbit-capture", env!("CARGO_MANIFEST_DIR")));
         let wave_speed = env_f32("HAPTIC_CAPTURE_WAVE_SPEED", 1.0);
         let secs = env_f32("HAPTIC_CAPTURE_SECS", 13.0);
         let sample_rate = env_f32("HAPTIC_CAPTURE_SR", 48000.0);
@@ -2913,6 +3104,10 @@ mod tests {
         let orbit_period = env_f32("HAPTIC_CAPTURE_ORBIT_PERIOD", 6.0);
         let note = env_f32("HAPTIC_CAPTURE_NOTE", DEFAULT_TEST_NOTE as f32) as u8;
         let mpe_interval = env_f32("HAPTIC_CAPTURE_MPE_MS", 8.0) as f64 / 1000.0;
+        let velocity = env_f32("HAPTIC_CAPTURE_VELOCITY", 100.0).clamp(0.0, 127.0) as u8;
+        let pressure = env_f32("HAPTIC_CAPTURE_PRESSURE", 1.0).clamp(0.0, 1.0);
+        let attenuation_d0 = env_f32("HAPTIC_CAPTURE_ATTEN_D0", DEFAULT_ATTEN_D0_M);
+        let attenuation_exponent = env_f32("HAPTIC_CAPTURE_ATTEN_EXPONENT", DEFAULT_ATTEN_EXPONENT);
 
         let layout = TransducerLayout::default();
         let (width, length) = layout.table_m;
@@ -2929,13 +3124,27 @@ mod tests {
         );
         send(
             &mut producer,
+            EngineCommand::SetParameter {
+                instance_id: 0,
+                parameter: Parameter::AttenuationD0(attenuation_d0),
+            },
+        );
+        send(
+            &mut producer,
+            EngineCommand::SetParameter {
+                instance_id: 0,
+                parameter: Parameter::AttenuationExponent(attenuation_exponent),
+            },
+        );
+        send(
+            &mut producer,
             EngineCommand::NoteOn {
                 instance_id: 0,
                 note,
-                velocity: 100,
+                velocity,
                 channel: 15,
                 mpe: MpeData {
-                    pressure: 1.0,
+                    pressure,
                     pitch_bend: 0.0,
                     timbre: 0.5,
                 },
@@ -2948,9 +3157,11 @@ mod tests {
 
         let mut next_mpe = 0.0f64;
         let mut orbit_phase = 0.0f32;
-        let radius = 0.35 * width.min(length);
+        let radius = env_f32("HAPTIC_CAPTURE_RADIUS_M", 0.35 * width.min(length))
+            .clamp(0.0, 0.5 * width.min(length));
         let mut data = vec![0.0f32; block * TRANSDUCER_COUNT];
         let mut levels = [0.0f32; TRANSDUCER_COUNT];
+        let mut motion_maxima = (0.0f32, 0.0f32, 0.0f32, 0.0f32); // error, speed, acceleration, jerk
         let total_blocks = (secs as f64 * sample_rate as f64 / block as f64) as usize;
         for b in 0..total_blocks {
             let t = b as f64 * block as f64 / sample_rate as f64;
@@ -2964,7 +3175,7 @@ mod tests {
                         instance_id: 0,
                         channel: 15,
                         mpe: MpeData {
-                            pressure: 1.0,
+                            pressure,
                             pitch_bend: (2.0 * sx / width - 1.0).clamp(-1.0, 1.0),
                             timbre: (sy / length).clamp(0.0, 1.0),
                         },
@@ -2973,6 +3184,15 @@ mod tests {
                 next_mpe += mpe_interval;
             }
             engine.process_block(&mut data, TRANSDUCER_COUNT, sample_rate, &mut levels);
+            let motion = engine.wave_pool.stimuli[0].motion;
+            let magnitude = |v: (f32, f32)| (v.0 * v.0 + v.1 * v.1).sqrt();
+            motion_maxima.0 = motion_maxima.0.max(magnitude((
+                motion.target.0 - motion.position.0,
+                motion.target.1 - motion.position.1,
+            )));
+            motion_maxima.1 = motion_maxima.1.max(magnitude(motion.velocity));
+            motion_maxima.2 = motion_maxima.2.max(magnitude(motion.acceleration));
+            motion_maxima.3 = motion_maxima.3.max(magnitude(motion.jerk));
             let bytes: Vec<u8> = data.iter().flat_map(|s| s.to_le_bytes()).collect();
             file.write_all(&bytes).unwrap();
         }
@@ -2982,6 +3202,10 @@ mod tests {
             total_blocks,
             total_blocks * block / sample_rate as usize,
             path
+        );
+        eprintln!(
+            "motion maxima: error={} m, speed={} m/s, acceleration={} m/s^2, jerk={} m/s^3",
+            motion_maxima.0, motion_maxima.1, motion_maxima.2, motion_maxima.3
         );
     }
 

@@ -37,8 +37,9 @@ The current Wave voice combines:
 - a standard-MIDI-frequency sinusoidal oscillator clamped to 20–200 Hz;
 - attack, sustain, and release envelope state;
 - velocity and smoothed MPE pressure amplitude;
-- MPE-controlled requested source position;
-- a wave-speed-limited effective source position;
+- a latest-value MPE target in the XY plane;
+- a persistent third-order XY motion controller with bounded jerk,
+  acceleration, and wave-speed-relative velocity;
 - configurable distance decay; and
 - 32 independent fractional arrival buffers, one per transducer.
 
@@ -53,13 +54,14 @@ speed changes to make this latching visible.
 MIDI/MPE
    │
    ▼
-measured-spacing ramp + two controller smoothers
+latest complete controller value
    │
-   ├── pressure ───────────────┐
-   └── requested position      │
+   ├── pressure ramp/smoother ─┐
+   └── raw XY target           │
              │                 │
              ▼                 │
-    speed-limited source       │
+  1.5 kHz third-order motion   │
+  (bounded jerk/accel/speed)   │
              │                 ▼
 oscillator × envelope × velocity/pressure
              │
@@ -110,19 +112,34 @@ pointer and turn a long physical delay into a false short one.
 ## Source motion and causality
 
 The plugin/viewer sends discrete MPE updates, usually quantised to client and
-audio-block cadence. Applying those positions as steps produces block-rate
-frequency sidebands. Wave therefore uses three layers of motion control:
+audio-block cadence. Wave treats these as samples of a deliberately
+lower-bandwidth spatial control: multiple updates drained at one callback
+boundary simply replace the latest XY target and never reset motion state.
 
-1. Incoming targets ramp over their measured update spacing.
-2. Two cascaded approximately 15 ms one-pole smoothers remove remaining corners
-   while keeping gesture latency modest.
-3. The effective source chases the smoothed request at no more than half the
-   configured wave speed.
+Each voice owns persistent two-dimensional position, velocity, acceleration,
+and jerk state. At every internal render frame a three-pole critically damped
+controller advances that state toward the latest target. Its natural frequency
+is 1.5 Hz: nine times the default orbit frequency, retaining about 98% of its
+radius while rejecting callback/update images. The controller bounds vector
+jerk and acceleration, then limits Euclidean velocity to half the configured
+wave speed. Limits apply to vector magnitude rather than independently per
+axis, so diagonal motion cannot exceed the causal speed ceiling.
+
+The approximately 0.32-second low-frequency motion lag is intentional. The
+requested-position ring remains the latest controller target; the effective
+source cross shows the filtered physical source. Pressure continues through
+the general MPE amplitude ramp and smoother independently of XY motion.
 
 The final limit is a causality/stability condition for scatter scheduling, not
 merely aesthetic smoothing. With radial speed bounded by `0.5*c`, the arrival
 index advances within approximately `[0.5, 1.5]` cells per emission. Successive
 arrivals remain monotonic and do not leave pathological gaps or reverse order.
+
+Because every transducer distance derives from the one controlled XY position,
+`|d_i/dt| <= |velocity| <= 0.5*c` for all 32 outputs. Per-channel motion
+controllers would not preserve a coherent point source or this automatic
+radial bound. The before/after frequency-domain evidence is in
+[`wave-orbit-dsp-analysis.md`](wave-orbit-dsp-analysis.md).
 
 The viewer shows the requested position as a ring and the effective source as a
 cross, joined while the source is catching up.
@@ -207,9 +224,9 @@ Several completed investigations established the current design:
 - Delay capacity expressed at the device rate was too short for a 1×2 m table
   at low wave speeds. Internal-rate delay storage turns capacity into a
   physical-time margin large enough for realistic layouts.
-- Directly stepping block-rate MPE targets creates an FM sideband comb. Measured
-  spacing ramps plus smoothing make trajectory quality much less dependent on
-  client send cadence.
+- Directly stepping block-rate MPE targets creates an FM sideband comb. A
+  persistent, low-bandwidth XY controller must advance on the synthesis clock;
+  callback inputs update its destination rather than its state or ramp timing.
 - Discarding a voice when its envelope ends loses physically emitted release
   energy. Source and tail activity must be tracked separately.
 
@@ -224,6 +241,10 @@ capture in the engine is the deeper evidence tool when this path changes.
 - The internal render rate is derived from the device rate rather than fixed at
   a universal rate with a general resampler. Device selection prefers 48 kHz to
   keep the tested operating point stable.
+- The current eight-tap, 128-phase scatter table leaves measurable moving-delay
+  images even when the control trajectory is clean. Sixteen taps and 1024
+  phases are a promising measured configuration, subject to callback-cost and
+  kernel-ownership work documented in the orbit DSP analysis.
 - Multiple Wave voices sum before the final bound; there is no perceptual
   loudness normalization or automatic polyphonic headroom policy.
 - MPE pitch bend is spatial x, so note frequency is latched. Continuous pitch

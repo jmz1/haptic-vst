@@ -237,6 +237,32 @@ at least:
 - expected Doppler direction and amplitude behaviour; and
 - reconstruction images and in-band sidebands.
 
+A reproducible default capture and dependency-free FFT analysis can be run from
+the workspace root with:
+
+```bash
+HAPTIC_CAPTURE_OUT="$PWD/target/dsp-capture/default" \
+  cargo test -p haptic-server --release \
+  orbit_capture_writes_debug_buffers -- --ignored --nocapture
+
+rustc --edition 2021 -O tools/analyze_f32_capture.rs \
+  -o target/analyze-f32-capture
+target/analyze-f32-capture \
+  target/dsp-capture/default/orbit_c1_sr48000.f32 48000 32 2 262144
+```
+
+The capture harness accepts Wave speed, duration, sample rate, callback size,
+orbit period, note, MPE interval, orbit radius, velocity, pressure, and both
+distance-decay parameters through the `HAPTIC_CAPTURE_*` variables listed in
+its source comment. Use a distinct output directory for every sweep point.
+The analyzer reports per-channel time-domain statistics, aggregate band energy,
+and strongest spectral bins. Its dB bands are relative to total spectral
+energy across all logical channels.
+
+The current default-orbit baseline, physical bounds, callback-cadence sweep,
+and scatter-kernel experiments are recorded in
+[`docs/wave-orbit-dsp-analysis.md`](docs/wave-orbit-dsp-analysis.md).
+
 Numerical baselines are evidence for a scenario, not universal performance
 promises. Record a new baseline beside the relevant design change when the
 model intentionally changes.

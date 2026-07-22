@@ -91,12 +91,16 @@ Viewer orbit positions and DAW control updates arrive at discrete cadences.
 Applying targets directly at callback boundaries produced an FM sideband comb
 at the update rate and made sound depend on buffer size/client cadence.
 
-**Carry forward:** ramp targets over measured arrival spacing, then apply the
-minimum additional smoothing needed by the model. Spatial phase parameters
-should ramp in their canonical domain—wavenumber for TW—rather than stepping
-derived controls.
+**Carry forward:** callback timing is an unsuitable definition of spatial
+motion. Wave treats the newest callback value as the destination of a
+persistent third-order XY controller advanced on the internal synthesis clock;
+it never resets motion state for multiple queued updates. Keep vector motion
+coherent before deriving per-output distances, and bound vector rather than
+per-axis velocity. Other spatial phase parameters should ramp in their
+canonical domain—wavenumber for TW—rather than stepping derived controls.
 
-**Protected by:** MPE cadence/smoothing tests and orbit capture analysis.
+**Protected by:** vector motion-bound, callback-partition, MPE smoothing, and
+orbit capture analysis.
 
 ## Source lifetime and propagation-tail lifetime are different
 

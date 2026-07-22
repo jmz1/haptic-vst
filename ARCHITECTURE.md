@@ -252,8 +252,12 @@ been consumed. Disconnect follows release semantics rather than leaving a
 sustained owner, while Panic resets all pools and ownership immediately.
 
 Both stimuli share concrete fixed-state components for envelope behaviour,
-controller smoothing, oscillator phase, and distance decay. They deliberately
-do not share propagation semantics. See [`docs/wave.md`](docs/wave.md) and
+pressure smoothing, oscillator phase, and distance decay. Wave additionally
+owns one persistent third-order XY motion controller per voice. It advances at
+the internal render rate and bounds vector jerk, acceleration, and velocity
+before the engine derives all 32 propagation distances from that one coherent
+source position. The stimuli deliberately do not share propagation semantics.
+See [`docs/wave.md`](docs/wave.md) and
 [`docs/travelling-wave.md`](docs/travelling-wave.md).
 
 ## Render path and output routing
